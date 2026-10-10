@@ -2,13 +2,11 @@
 
 import ast
 import copy
-import csv
 import hashlib
 import io
 import json
 import os
 import re
-import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,9 +15,7 @@ from urllib.error import HTTPError
 
 from openpyxl import Workbook, load_workbook
 
-from research_platform.project import find_project_root, validate_configs
-from research_platform.fx import cross_rate, generate_currency_states
-from research_platform.demo import run_fx_demo, sha256
+from research_platform.project import find_project_root, read_json
 from research_platform.ai import AIError, OpenAIProvider, aggregate_usage, response_usage
 from research_platform.evidence import SourceStore, download, parse_number
 from research_platform.initiation import (REVIEW_TOPICS, SECTIONS, _rounding_bound,
@@ -66,92 +62,40 @@ class HistoricalParsingTests(unittest.TestCase):
             parse_number("1.234,50", "dot_decimal")
 
 
-class CurrencyTests(unittest.TestCase):
-    def setUp(self):
-        self.states = generate_currency_states(seed=42)
-
-    def test_inverse_quotes(self):
-        for state in self.states:
-            for base in state:
-                for quote in state:
-                    self.assertAlmostEqual(
-                        cross_rate(state, base, quote) * cross_rate(state, quote, base), 1.0)
-
-    def test_triangular_consistency(self):
-        for state in self.states:
-            self.assertAlmostEqual(
-                cross_rate(state, "EUR", "USD") * cross_rate(state, "USD", "CHF"),
-                cross_rate(state, "EUR", "CHF"))
-
-    def test_repeated_seed_and_changed_seed(self):
-        self.assertEqual(self.states, generate_currency_states(42))
-        self.assertNotEqual(self.states, generate_currency_states(43))
-
-    def test_invalid_levels_rejected(self):
-        for state in ({"USD": 1, "EUR": 0}, {"USD": 1, "EUR": float("nan")}, {"USD": 2}):
-            with self.assertRaises(ValueError):
-                cross_rate(state, "USD", "USD")
-
-
 class ProjectTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        shutil.copytree(PROJECT / "configs", self.root / "configs")
-        shutil.copytree(PROJECT / "src", self.root / "src", ignore=shutil.ignore_patterns("__pycache__"))
-        shutil.copy(PROJECT / "pyproject.toml", self.root / "pyproject.toml")
+        self.package = self.root / "src" / "research_platform"
+        self.package.mkdir(parents=True)
+        (self.package / "__init__.py").write_bytes(
+            (PROJECT / "src" / "research_platform" / "__init__.py").read_bytes())
+        (self.root / "pyproject.toml").write_bytes((PROJECT / "pyproject.toml").read_bytes())
 
     def tearDown(self):
         self.temporary.cleanup()
 
-    def test_root_from_subdirectory(self):
-        self.assertEqual(find_project_root(self.root / "configs" / "companies"), self.root)
+    def test_root_from_subdirectory_without_company_configs(self):
+        self.assertFalse((self.root / "configs").exists())
+        self.assertEqual(find_project_root(self.package), self.root)
 
-    def test_company_templates_are_not_exposures(self):
-        _, companies = validate_configs(self.root)
-        self.assertTrue(all(company["exposure_mappings"] == [] for company in companies))
-
-    def test_unknown_research_topic_rejected(self):
-        path = self.root / "configs" / "companies" / "nestle.json"
-        value = json.loads(path.read_text(encoding="utf-8"))
-        value["research_topics"].append("not_configured")
-        path.write_text(json.dumps(value), encoding="utf-8")
+    def test_unrelated_pyproject_is_not_a_project_root(self):
+        (self.package / "__init__.py").unlink()
         with self.assertRaises(ValueError):
-            validate_configs(self.root)
+            find_project_root(self.root)
 
-    def test_runs_repeat_values_without_overwriting(self):
-        first = run_fx_demo(self.root, 42)
-        before = {file.name: file.read_bytes() for file in first.iterdir()}
-        second = run_fx_demo(self.root, 42)
-        self.assertNotEqual(first, second)
-        self.assertEqual(before, {file.name: file.read_bytes() for file in first.iterdir()})
-        for name in ("inputs.json", "currency_levels.csv", "cross_rates.csv", "fictional_company_translation.csv"):
-            self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
+    def test_read_run_record(self):
+        path = self.root / "record.json"
+        path.write_text('{"status": "incomplete"}', encoding="utf-8")
+        self.assertEqual(read_json(path), {"status": "incomplete"})
 
-    def test_shared_scenario_used_for_both_company_examples(self):
-        directory = run_fx_demo(self.root)
-        with (directory / "currency_levels.csv").open(newline="", encoding="utf-8") as handle:
-            levels = list(csv.DictReader(handle))
-        with (directory / "fictional_company_translation.csv").open(newline="", encoding="utf-8") as handle:
-            translations = list(csv.DictReader(handle))
-        self.assertEqual(len(translations), 10)
-        for scenario_id in range(1, 6):
-            state = {r["currency"]: float(r["currency_units_per_USD"])
-                     for r in levels if int(r["scenario_id"]) == scenario_id}
-            rows = [r for r in translations if int(r["scenario_id"]) == scenario_id]
-            self.assertEqual(len(rows), 2)
-            by_currency = {r["reporting_currency"]: float(r["translated_amount"]) for r in rows}
-            self.assertAlmostEqual(by_currency["CHF"] / by_currency["USD"], state["CHF"])
-            self.assertAlmostEqual(by_currency["USD"], 100 / state["EUR"])
-
-    def test_manifest_freezes_inputs_and_hashes(self):
-        directory = run_fx_demo(self.root, seed=7)
-        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["seed"], 7)
-        self.assertTrue(manifest["synthetic"])
-        self.assertTrue(manifest["source_sha256"])
-        for name, expected in manifest["sha256"].items():
-            self.assertEqual(sha256(directory / name), expected)
+    def test_read_run_record_rejects_nonobjects(self):
+        path = self.root / "record.json"
+        for value in ("[]", "null", "42"):
+            with self.subTest(value=value):
+                path.write_text(value, encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    read_json(path)
 
 
 class SyntheticCompany:
@@ -476,7 +420,8 @@ class InitiationTests(unittest.TestCase):
             archived = record["sources"][0]
             self.assertEqual(archived["sha256"], hashlib.sha256(Path(archived["path"]).read_bytes()).hexdigest())
             self.assertTrue(archived["fetched_at"])
-            self.assertEqual(record["workbook_sha256"], sha256(directory / "model.xlsx"))
+            self.assertEqual(record["workbook_sha256"],
+                             hashlib.sha256((directory / "model.xlsx").read_bytes()).hexdigest())
             book = load_workbook(directory / "model.xlsx", data_only=False)
             try:
                 revenue_row = next(row for row in book["income_statement"] if row[0].value == "revenue")
@@ -1596,7 +1541,8 @@ class EvidenceTests(unittest.TestCase):
             row = next(row for row in company.rows if row["id"] == "revenue")
             reference = row["observations"][0]["reference"]
             self.assertEqual(store.resolve(reference), 1000)
-            self.assertEqual(source["sha256"], sha256(Path(source["path"])))
+            self.assertEqual(source["sha256"],
+                             hashlib.sha256(Path(source["path"]).read_bytes()).hexdigest())
             preview = store.catalog(max_units=1)[0]
             self.assertTrue(preview["catalog_truncated"])
             self.assertEqual(len(preview["units"]), 1)

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "probabilistic-dcf-setup"
 version = "0.1.0"
-description = "Local AI-driven historical company initiation and a synthetic shared-FX demonstration"
+description = "Local AI-driven historical company initiation with source checks and Excel models"
 requires-python = ">=3.11"
 dependencies = ["openpyxl==3.1.5", "pypdf[crypto]==6.20.0"]
 

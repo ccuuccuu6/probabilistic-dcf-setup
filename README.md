@@ -125,10 +125,10 @@ AI still chooses the semantic mapping, scale/sign and proposed relationships.
 Python reading a real number prevents invented numeric literals, but does not by
 itself prove that number belongs to the right company, row or period. Source and
 structure reviews address that remaining risk; their agreement is not a guarantee.
-The first real Nestlé run remains unverified because the last generation test
-returned HTTP 429. This sequence includes the independently reconstructed facts,
-coverage inventory and stronger reconciliations added after the original walkthrough;
-it does not describe a new successful live run.
+The connection test has passed, but the first full AI-driven Nestlé run remains
+unverified. This sequence includes the independently reconstructed facts, coverage
+inventory and stronger reconciliations added after the original walkthrough;
+it does not describe a successful live company run.
 
 ## API settings and first test
 
@@ -325,10 +325,11 @@ The reusable workflow, real API adapter, bounded source reader, numerical checks
 formula-based Excel export, per-stage usage and $20 estimated-cost stop are implemented.
 The previous fixed `nestle.py` extractor and its
 `--sources` command have been removed. Company-specific definitions now belong in
-cited run data. The Nestlé config remains an identity/topic example for setup and
-the synthetic FX demonstration; it is not a prerequisite for initiation.
+cited run data. The unused synthetic FX modules, their command and both starter
+JSON configs have now been removed. Initiation discovers its company and reporting
+structure from the query; no company config or demonstration is required.
 
-**76 offline tests pass.** They exercise two unrelated fictional companies with
+**70 offline tests pass.** They exercise two unrelated fictional companies with
 different layouts/currencies, extraction batches, reviewer search/read navigation,
 autonomous correction, accounting and precision failures, missing citations, review
 omissions, budget exhaustion, immutable runs, source hashes and empty forecast cells.
@@ -347,16 +348,26 @@ review, unknown/stale usage, per-stage totals, no-progress stops and successful 
 beyond the former call/navigation/draft ceilings. These use scripted reviewers;
 they demonstrate gates, not live AI skill. Setup doctor also passes. No paid calls
 were made for this step, and a real Excel application was not used in these tests;
-new workbooks request recalculation when opened there.
+new workbooks request recalculation when opened there. The lower test count reflects
+removal of obsolete FX/configuration tests; the initiation, accounting, evidence,
+Excel and spending checks remain. Project-root checks now work without a configs
+folder, and `doctor` checks Python and installed dependencies without reading credentials.
 
-The user-supplied key is stored locally; a live, non-generating model lookup verified
-authentication and access to `gpt-6.1-sol`. The small Responses generation test returned
-HTTP 429 without usable token usage or a recognized detailed error code. A restricted
-network attempt had failed before this lookup/test. No successful live generation
-or full AI company initiation has been verified. Token cost for the failed attempt
-is unknown, not recorded as zero. Check the account's rate limits/quota/billing and
-retry `api-check` before the first company run; the response did not identify which
-limit applied. No earlier company or FX run was changed.
+A subsequent dependency audit found no further unused maintained modules. Removed
+the unreferenced package `__version__` constant (the version belongs in pyproject.toml)
+and stale generated `src/probabilistic_dcf_setup.egg-info/`, whose file index still
+listed deleted extractors/demos. Installed package metadata in `.venv` remains
+available; `doctor` and four focused project tests passed after removal. The tests
+required execution outside the sandbox because Windows denied access to temporary
+test directories; temporary folders left inside the workspace were removed.
+No research outputs were changed.
+
+The user's terminal screenshot on 10 October 2026 confirms a successful `api-check`
+with `gpt-6.1-sol`: 61 input tokens, 13 output tokens, 74 total, and estimated cost
+$0.000252. It verifies API access and structured output, not web search or company
+research accuracy. This supersedes the earlier HTTP 429 as the latest connection
+result; the earlier failed attempt's cost remains unknown. No successful full AI
+company initiation has been verified. No earlier company or FX run was changed.
 
 The prior fixed Nestlé reference remains intact:
 [model.xlsx](outputs/nestle_2024_2025_20261010T180411Z_c133cf62/model.xlsx).
@@ -405,8 +416,7 @@ reusable engine with explicit limits, not demonstrated universal company coverag
 
 ## Next milestone
 
-First resolve the generation endpoint's HTTP 429 and obtain a successful `api-check`
-with reported usage. Then, with API/model settings stored locally, run the generic process for Nestlé's
+The connection test has passed. With API/model settings stored locally, run the generic process for Nestlé's
 2024–2025 accounts and compare it with the preserved originals/reference. Record
 wrong mappings, omitted lines, reviewer failures, costs and runtime; improve the
 generic workflow from those findings. Then repeat with an unrelated real company
@@ -427,30 +437,37 @@ proposed answers to blind reviewers or downgrading financial judgment merely to 
 price. The removed request caps no longer impose an artificial row-count bottleneck;
 the $20 stopping threshold does not guarantee every company will complete within it.
 
+Keep further cleanup tied to actual unused code. The six remaining Python modules
+have active responsibilities; deleting or merging them solely to lower the file
+count would not establish maintainability or improve the next research milestone.
+
 Keep the scope historical. Forecast drivers and distributions, a separate DCF,
 news maintenance and measured forward performance follow this accepted evidence
 foundation. The complete research cycle remains in PROJECT_BRIEF.txt.
 
 ## Files and local setup
 
-The three new modules replace one Nestlé-only module; each has an implemented role:
+The maintained files support historical initiation directly:
 
 | Location | Purpose |
 |---|---|
 | `src/research_platform/initiation.py` | Reusable research, extraction, review, revision, numerical validation and workbook workflow |
 | `src/research_platform/ai.py` | Private settings loader, provider connection, reported token usage and dated cost estimates |
 | `src/research_platform/evidence.py` | Original sources, document search/read and numeric parsing |
-| `src/research_platform/project.py` | Project discovery and existing setup validation |
-| `src/research_platform/fx.py`, `demo.py` | Synthetic currency demonstration |
+| `src/research_platform/project.py` | Find the project root and read saved JSON run records |
 | `src/research_platform/__main__.py`, `__init__.py` | Terminal commands and package identity |
-| `configs/companies/nestle.json`, `configs/shared_factors.json` | Existing setup identity/topics and FX conventions |
-| `tests/test_setup.py` | Workflow, source, adapter, financial, setup and FX checks |
+| `tests/test_setup.py` | Workflow, source, adapter, financial, workbook, budget and setup checks |
 | `pyproject.toml`, `.gitignore` | Dependencies and exclusions |
 | `PROJECT_BRIEF.txt`, `AGENTS.md`, `README.md` | Ambition, working rules, progress |
 
 No services, database, company-specific code folder or new documentation file was
 added. `outputs/` and research data stay out of Git; back them up separately.
 `.venv/`, caches and `*.egg-info/` are generated Python support files.
+The obsolete source-tree egg-info directory was removed; an installation/build can
+recreate it. Likewise, `__pycache__/` can be deleted but Python regenerates it.
+Neither is a second financial model or a manually maintained research input. Keep
+the installed environment and its `.dist-info` metadata, Git history, tests and
+private `.env`. `.git/COMMIT_EDITMSG` is Git's commit-message scratch file, not project code.
 The sole new local settings file, `.env`, is also ignored by Git; it is not code or a
 model input archive, and it is unnecessary for offline tests.
 
@@ -463,7 +480,19 @@ dependencies are reused; the API connection uses Python's standard library.
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-`demo-fx` remains available; running it creates a separate synthetic output folder.
+Only `doctor`, `api-check` and `initiate` remain as commands. The removed `fx.py`
+generated artificial currency levels/cross rates; `demo.py` wrote their CSV examples.
+The removed `configs/shared_factors.json` and `configs/companies/nestle.json` served
+that starter setup, not the autonomous research workflow. Real FX treatment remains
+a future economic requirement in PROJECT_BRIEF.txt, not unused executable scaffolding.
+
+Four preserved `outputs/run_<id>/` folders are old synthetic FX demonstrations.
+Their `currency_levels.csv` contains invented currency states; `cross_rates.csv`
+contains ratios between them; `fictional_company_translation.csv` applies those
+rates to invented company amounts. `inputs.json` records the demonstration inputs
+and `manifest.json` records file hashes and run metadata. These historical artifacts
+are not read by initiation. All earlier outputs remain intact under the project's
+run-preservation rule; no new output folder or paid API call was created for cleanup.
 
 ## Decisions
 
@@ -475,11 +504,13 @@ dependencies are reused; the API connection uses Python's standard library.
 | 10 October 2026 | Confirmed and implemented | AI discovers companies, sources and reporting structures; separate reviews and deterministic gates drive bounded autonomous revision. This supersedes the earlier deferral of historical AI orchestration. |
 | 10 October 2026 | Implemented boundary | Three cohesive modules separate API access, evidence and initiation. Private API/model settings now load from ignored `.env`, with environment overrides; secrets are excluded from run snapshots. |
 | 10 October 2026 | Provisional model choice | Start with GPT-6.1 Sol for all roles to establish a correctness baseline. Compare Luna extraction later; Astra requires an observed benefit. Report usage and estimated cost on each call. |
-| 10 October 2026 | Verified access; generation unresolved | The key authenticated for a model lookup; a small Responses test returned HTTP 429 without usable usage. No successful live historical initiation or measured company-run cost is claimed. |
+| 10 October 2026 | Connection verified; research accuracy pending | The user's terminal screenshot confirms a successful Sol api-check: 74 tokens and estimated $0.000252. The earlier HTTP 429 is no longer the latest connection result. No successful full live historical initiation or measured company-run cost is claimed. |
 | 10 October 2026 | Explicit limitation | No zero-error promise. Unsupported or unresolved cases terminate incomplete; accepted results still require empirical evaluation of real-world accuracy. |
 | 10 October 2026 | Confirmed and implemented | The user authorized stronger independent checks: blind source reconstruction with recorded facts before semantic comparison, evidence-first coverage inventory, isolated verdicts, and stronger cash/segment/accounting reconciliations. Every revision reruns gates; no majority approval. Implemented within existing files. |
-| 10 October 2026 | Verified offline; live evaluation pending | 76 offline tests and setup doctor pass, including accounting/reviewer isolation, generated formula arithmetic, stage accounting, exact/crossed dollar thresholds, missing usage and progress beyond the removed call ceilings. No paid run or real Excel recalculation was performed for this step. Separate contexts and repeated agreement do not establish statistically independent errors or a confidence percentage. |
+| 10 October 2026 | Verified offline; live evaluation pending | 70 offline tests and setup doctor pass after removing obsolete FX/config checks; accounting/reviewer isolation, generated formula arithmetic, stage accounting, dollar thresholds and progress beyond removed call ceilings remain covered. No paid run or real Excel recalculation was performed for this cleanup. Separate contexts and repeated agreement do not establish statistically independent errors or a confidence percentage. |
 | 10 October 2026 | Confirmed and implemented | The user approved working historical Excel formulas and a familiar financial layout. Formulas derive from Python's equation definitions; reported evidence and recorded reviews remain independent, forecasts blank, workbook edits local. No extra project files or older-run changes. |
 | 10 October 2026 | Confirmed and implemented | Replace every request/draft-count ceiling with a $20 cumulative estimated-cost stop (lower thresholds allowed). Include all stages and charged failures, stop on unknown costs, preserve no-progress/data checks, and report total and per-stage tokens/USD during and after the run. Last-request overshoot remains possible; this is not an invoice guarantee. |
 | 10 October 2026 | Confirmed model choice for this step | Keep Sol for every role: no current AI task is demonstrably low-stakes enough for a confident Luna substitution. Simple mechanical work already runs in Python; revisit model choices using measured stage costs and accuracy. |
+| 10 October 2026 | Confirmed and implemented | Remove obsolete fx.py/demo.py, starter configs and demo command to reduce clutter. Keep project discovery, current initiation and all saved runs. Real FX research waits for an implemented economic need; its design principles remain in the brief. |
+| 10 October 2026 | Verified cleanup | A follow-up source/dependency audit found no additional obsolete active modules. Removed unused duplicate version metadata and the stale generated source-tree egg-info directory; the installed package and doctor still work. Retain necessary support files and saved runs rather than reducing file count for its own sake. |
 | 10 October 2026 | Unresolved | Measured unattended accuracy/cost and optimal model mix, additional document/sector support and later production-baseline promotion rules. |

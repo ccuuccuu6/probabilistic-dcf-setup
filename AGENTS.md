@@ -1,6 +1,6 @@
 # Project intent
 
-Build a reusable probabilistic fundamental forecasting and valuation system, starting with Nestlé. Python performs calculations; Excel provides an inspectable review interface. The package contains the setup/FX demonstration and a generic AI-driven historical initiation workflow. API/model settings load from private local `.env` or environment variables; live company-initiation accuracy has not been verified. It contains no forecast or DCF engine.
+Build a reusable probabilistic fundamental forecasting and valuation system, starting with Nestlé. Python performs calculations; Excel provides an inspectable review interface. The package contains a generic AI-driven historical initiation workflow; the obsolete synthetic FX demonstration and setup configs have been removed. API/model settings load from private local `.env` or environment variables; live company-initiation accuracy has not been verified. It contains no forecast or DCF engine.
 
 # Required project context and continuity
 
@@ -48,4 +48,4 @@ python -m research_platform doctor
 python -m unittest discover -s tests -v
 ```
 
-After configuring the environment slots described in README, `initiate "Nestlé S.A., NESN, SIX, Switzerland" --years 2024 2025` performs live research and creates a new run. Other company queries use the same function. This command uses paid AI calls and is not part of the offline test suite. The former Nestlé-only `--sources` command has been removed with its extractor; preserved runs remain inspectable. `demo-fx` remains available but need not create another project run during historical-model work. Keep checks focused on meaningful financial identities, source extraction, review gates and reproducibility. State what remains unimplemented instead of implying the full platform is ready.
+After configuring the environment slots described in README, `initiate "Nestlé S.A., NESN, SIX, Switzerland" --years 2024 2025` performs live research and creates a new run. Other company queries use the same function. This command uses paid AI calls and is not part of the offline test suite. The former Nestlé-only `--sources` command and synthetic `demo-fx` command have been removed; preserved runs remain inspectable. Do not restore unused demonstration code or prerequisite company configs. Keep checks focused on meaningful financial identities, source extraction, review gates and reproducibility. State what remains unimplemented instead of implying the full platform is ready.

@@ -371,9 +371,9 @@ Code and storage:
   initiation results, separate from reusable API, source and workflow code. Do not
   force company differences into one generic formula. Unsupported economics or
   missing disclosures remain explicit gaps rather than invented template inputs.
-- Initiation must not require a pre-existing company configuration. Existing configs/
-  contains setup identities/topics; discovered identity and reporting definitions
-  are frozen in the run. A later maintained baseline needs explicit versioning and
+- Initiation must not require a pre-existing company configuration. The obsolete
+  setup configs and synthetic FX demo were removed to keep the active code focused.
+  Discovered identity and reporting definitions are frozen in the run. A later maintained baseline needs explicit versioning and
   promotion rules. Evolving estimates and observations are not editable equations.
 - A proposed later local_store/research.sqlite design holds source identity/availability, extracted
   facts, distribution versions and company mappings in distinct records. Original
@@ -423,7 +423,8 @@ FX mechanics:
   inventory/contract lags and balance-sheet effects. Convert a commodity into its
   purchase currency once, apply timing, then translate statements without double counting.
   Commodity types, grades and maturities require distinct definitions.
-- The present single-period demo proves arithmetic only, not these accounting schedules.
+- These are requirements for future economic modelling. The removed single-period
+  synthetic demo did not implement these accounting schedules; saved demo runs remain historical examples.
 
 Evidence updates:
 - Preserve source content hashes, publication/receipt times and exact fact passages;
