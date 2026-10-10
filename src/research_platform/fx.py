@@ -38,3 +38,11 @@ def cross_rate(levels: Mapping[str, float], base: str, quote: str) -> float:
     validate_levels(levels)
     return levels[quote] / levels[base]
 
+
+def translate_amount(
+    amount: float, local_currency: str, reporting_currency: str,
+    currency_state: Mapping[str, float],
+) -> float:
+    """Translate at one scenario rate; not an average/closing FX rate policy."""
+    return amount * cross_rate(currency_state, local_currency, reporting_currency)
+

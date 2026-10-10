@@ -1,24 +1,44 @@
 """Run a synthetic shared-FX demonstration and freeze its input/output files."""
 
+import csv
+import hashlib
+import json
 import platform
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
 from research_platform import __version__
-from research_platform.data.project import create_local_paths, validate_configs
-from research_platform.factors.fx import SYNTHETIC_LEVELS, cross_rate, generate_currency_states
-from research_platform.models.translation import translate_amount
-from research_platform.reporting.files import sha256, write_csv, write_json
+from research_platform.project import validate_configs
+from research_platform.fx import SYNTHETIC_LEVELS, cross_rate, generate_currency_states, translate_amount
+
+
+def write_json(path: Path, value: object) -> None:
+    """Exclusive writes make accidental replacement fail visibly."""
+    with path.open("x", encoding="utf-8", newline="\n") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+
+
+def write_csv(path: Path, rows: list[dict]) -> None:
+    if not rows:
+        raise ValueError("Cannot infer columns from an empty table.")
+    with path.open("x", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def run_fx_demo(root: Path, seed: int = 42) -> Path:
     """Create a fresh run directory; never write over a prior run."""
     factors, companies = validate_configs(root)
-    paths = create_local_paths(root)
     run_id = "run_" + uuid4().hex
-    directory = paths["outputs"] / run_id
-    directory.mkdir(exist_ok=False)
+    directory = root / "outputs" / run_id
+    directory.mkdir(parents=True, exist_ok=False)
     examples = [
         {"company_id": "fictional_company_a", "reporting_currency": "CHF",
          "local_currency": "EUR", "local_amount": 100.0},

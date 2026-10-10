@@ -2,6 +2,16 @@
 
 Build a reusable probabilistic fundamental forecasting and valuation system, starting with Nestlé. Python will perform calculations; Excel will provide an inspectable review interface. The current package is a setup scaffold and synthetic FX demonstration only.
 
+# Required project context and continuity
+
+Read [PROJECT_BRIEF.txt](PROJECT_BRIEF.txt) as required context for the whole project, together with this file and [README.md](README.md). README contains the current state, next milestone and dated decisions; the brief contains the research cycle and architecture principles. Preserve the user's latest instructions and verify status against the workspace.
+
+Before implementing a substantial task, explain the ultimate ambition and complete research cycle, Nestlé's role in proving reuse, the verified implementation, the next milestone's contribution, and any decisions that risk undermining the ambition. Identify the reusable and company-specific parts and the observable completion criteria.
+
+After meaningful work, update README's current-state, next-milestone and decision sections with verification and limitations. Distinguish confirmed decisions, proposals and unresolved questions. Deliver small, complete steps without losing the wider research cycle or silently changing model structure.
+
+Keep the layout as clean and minimal as possible. Use these three project documents for now; keep status, roadmap and decisions in README rather than adding separate handoff files. Prefer a small number of cohesive Python modules over nested packages. Before adding any file or directory, including documentation, explain why existing locations are insufficient and create it only when the implemented step needs it. Avoid placeholder companies, unused settings, empty future directories and duplicate editable assumptions. Explain generated artifacts and preserve earlier runs. Simplicity must preserve economic correctness, evidence provenance and reuse.
+
 # Standing collaboration requirement
 
 Tell the user explicitly when a proposed step weakens this vision or is unlikely to help it work. Explain the concrete issue and propose a practical alternative. Do not silently implement a design that defeats the intended economics, auditability, or reuse.

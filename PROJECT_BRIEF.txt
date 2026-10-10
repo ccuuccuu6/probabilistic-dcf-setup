@@ -1,0 +1,346 @@
+PROBABILISTIC FUNDAMENTAL RESEARCH PLATFORM
+Project ambition and handoff for Codex in VS Code
+Consolidated: 10 October 2026
+
+READ THIS BEFORE CHOOSING OR IMPLEMENTING A MAJOR TASK
+
+Read this brief together with AGENTS.md and README.md. Current progress, next steps
+and dated decisions are maintained in README.md. Preserve the user's latest instructions. This brief consolidates
+the original system ambition and subsequent decisions; it is not a claim that the
+described platform has already been implemented.
+
+1. THE DESTINATION
+
+Build an AI-powered, repeatable fundamental investment research system that can
+cover many companies and eventually multiple sectors. It should collect evidence,
+build and maintain economically coherent company models, generate defensible joint
+forecast distributions, estimate fundamental value, investigate what current prices
+require, assess catalysts, and improve its methods using recorded forward results.
+
+Nestlé is the first implementation case. Success means proving an end-to-end
+process that can be reused for another company without duplicating the research
+engine. The architecture should support a shared engine, sector templates and
+company configurations, while allowing real differences in business economics.
+
+The user wants speed, substantial AI involvement and continuous improvement. Those
+are product goals. They do not establish that a relationship is predictive or that
+a probability is calibrated. Make the process fast through reuse, targeted updates
+and numerical computation, then measure whether its forecasts improve.
+
+The system should help answer:
+- What could happen to this company's operating performance and cash flows?
+- Which drivers, dependencies and uncertainties matter, and what supports them?
+- What is the resulting range of estimated fundamental value?
+- Which operating cases are consistent with today's price under stated assumptions?
+- Where does our independent view differ from those cases or dated consensus?
+- What evidence or event could resolve that disagreement, and over what horizon?
+- What changed since the last run, why, and which research deserves attention next?
+- Do the forecasts improve on simpler alternatives as real outcomes arrive?
+
+Portfolio sizing, exit rules and broker orders are outside the current scope.
+Do not quietly expand into portfolio management or live execution.
+
+2. THE COMPLETE RESEARCH CYCLE
+
+A. Collect and preserve original sources and their availability history.
+B. Extract verifiable observations and qualitative claims, keeping interpretation
+   separate from reported facts. Reconcile material accounting inputs.
+C. Map evidence to shared economic factors and company-specific transmission.
+D. Maintain versioned model equations and reasoned distribution specifications.
+E. Generate coherent numerical paths and calculate financial and valuation outputs.
+F. Explain the output and its changes, with an inspectable path back to evidence.
+G. Record forecasts before their outcomes become public and evaluate them later.
+H. Use weaknesses, sensitivity and forecast errors to propose and test improvements.
+
+Two activities must stay distinct:
+- Routine updates: incorporate new evidence through an existing, documented model
+  and update method, then recalculate affected outputs.
+- Research and improvement: discover or challenge relationships, propose alternative
+  models/distributions and compare them with an incumbent before promotion.
+
+AI should progressively support onboarding, extraction, reconciliation proposals,
+model construction, distribution design, evidence interpretation, relationship
+discovery, review and explanation. Numerical code owns accounting, parameter fitting,
+sampling, valuation, solver calculations and scoring. Do not call an LLM once per
+simulation path or use prose reasoning as the arithmetic engine.
+
+Research tasks should identify an economic mechanism, observable target, expected
+lag, necessary data, competing explanation, baseline, cost and a way to reject the
+hypothesis. Focus on material, uncertain assumptions where better evidence could
+change the conclusion. More documents, agents or complexity are not success metrics.
+
+3. REUSE EVIDENCE; MODEL COMPANY EFFECTS EXPLICITLY
+
+Store common research once. Coffee, FX and later macro or commodity research can
+inform multiple companies through the same underlying evidence and scenario state.
+Different firms need different exposures, products, purchasing and reporting
+currencies, hedges, contract timing, inventory lags and pricing responses.
+
+For example, a coffee-price change may affect Nestlé and Keurig Dr Pepper, but its
+magnitude and timing must follow each company's supported exposure mapping. Topic
+relevance does not prove a quantified exposure. Undisclosed details remain explicit
+estimates or data gaps. Keurig Dr Pepper is an example of possible future reuse,
+not a completed model or a fixed promise about the next company. Its unused
+configuration placeholder was removed during the 10 October 2026 cleanup.
+
+FX is a shared factor used wherever relevant. Separate translation, transaction,
+hedging and balance-sheet effects. Derive cross rates coherently from a common
+currency state. Avoid counting the same FX effect twice when translating a commodity
+cost and then translating the company's financial statements.
+
+One shared scenario ID represents the same economic future across linked factors,
+periods and companies within the same run. Company-specific residual risks can remain.
+This consistency supports research comparison; it does not add portfolio sizing.
+
+4. PROBABILITIES AND ECONOMICS
+
+Keep observed facts, distribution specifications and actual sampled numerical paths
+as different objects. A specification records what is uncertain, its support,
+parameters, dependencies, persistence, evidence and version. The model consumes
+numerical paths and derives dependent financial rows through accounting equations.
+
+Do not independently randomize sales, costs, margins and profit. Do not ask AI to
+invent precise probabilities for every spreadsheet cell. Start with a small set of
+material drivers and preserve common shocks, parameter uncertainty and time lags.
+Distinguish estimated, pooled, external and judgmental inputs. Qualitative evidence
+without a credible likelihood may justify scenario sensitivity rather than a precise
+posterior. Uncertainty can increase when new evidence challenges an existing model.
+
+Respect each company's reporting definitions, fiscal periods, currency conventions
+and observed disclosure frequency. A sector template must not force economically
+different companies into identical equations. Missing observations are not zeros;
+undisclosed historical quarters must not be manufactured and treated as reported.
+
+5. DISTINCT OUTPUTS AND THEIR LIMITATIONS
+
+Fundamental forecasts:
+Joint distributions for observable operating results, cash flows and relevant KPIs.
+These can be evaluated against subsequently disclosed outcomes.
+
+Estimated fundamental value:
+Uncertainty about value under explicit operating, reinvestment, discount, terminal
+and equity-bridge assumptions. Preserve the distinction between future operating
+shocks and uncertainty about conditional expected cash flows. Check that numerical
+simulation error is not mistaken for economic uncertainty.
+
+Reverse valuation:
+Operating cases that reproduce the observed price under stated other assumptions.
+Growth, margins, reinvestment and discount policy must remain consistent with the
+forward valuation. A price does not uniquely identify the market's beliefs. Keep our
+independent forecasts separate from price-fitted cases.
+
+Catalyst analysis:
+Events with observable disclosures, disputed drivers and explicit timing. Explore
+what information they reveal and how candidate market expectations might change.
+Separate an expectation revision from an actual traded-price response; include
+no-information outcomes and unsupported assumptions visibly.
+
+Forward performance:
+A record of issued predictions, resolved outcomes, baselines, calibration and errors.
+Keep fundamental accuracy, disclosure prediction and market response distinct.
+
+Later conditional extensions:
+Horizon-specific traded-price distributions and instrument payoff comparisons were
+part of the earlier roadmap. They require their own market-response assumptions,
+quote/contract conventions and evidence. A DCF value histogram is not an option-expiry
+price distribution. Preserve these ambitions without making them immediate work.
+
+6. WHAT MUST BE AUDITABLE AND REPRODUCIBLE
+
+Preserve source identity, units, definitions, period, publication time, receipt time,
+revisions and exact evidence references. Keep assumptions, equations, code and run
+versions. Save actual samples, AI outputs and environment information when needed
+for replay; a random seed or repeated prompt alone is insufficient.
+
+Each run must use a coherent frozen input snapshot. Repeated reports of the same
+event must not become independent evidence. Revisions must not erase earlier inputs.
+Older jobs must not replace newer valid results. Failures should preserve the last
+valid output with a clear status. Local hashes help traceability but do not by
+themselves prove a tamper-resistant, pre-event forecasting record.
+
+Separate ingestion frequency, assumption revision frequency and recalculation
+frequency. Frequent FX observations need not trigger full AI research for every
+company. Cache valid extraction, batch appropriate updates and recalculate affected
+dependencies. Speed must be measured alongside correctness, freshness and cost.
+
+7. LEARN THROUGH FORWARD EVIDENCE
+
+A full historical replay of the evolving AI process is impractical as the primary
+validation method. Use prospective evidence for the overall process, while retaining
+historical component estimation, numerical validation and diagnostic checks with
+their limitations explicit. Record forecasts before outcomes become public.
+
+Define the target, reporting vintage, horizon and resolution rule before issuance.
+Compare with simple baselines using the same available information. Assess distribution
+scores, interval coverage and width as appropriate. Repeated daily forecasts of one
+result are not independent outcomes. Source restatements must not rewrite the
+original score. Share-price performance alone does not validate every DCF assumption.
+
+Register candidate mechanisms and evaluation rules before new results. Retain failed
+candidates and uncertainty about performance. Do not promote whichever of many
+models recently looked best without accounting for that selection. Verified software
+or accounting bugs can follow a targeted correction path; new predictive claims
+need evidence. Research agents must not silently rewrite production models or history.
+
+8. CURRENT DECISIONS SUPERSEDE OLDER SETUP PROPOSALS
+
+- First company: Nestlé, replacing Diageo. Lack of access to the desired Nielsen
+  data influenced the change. Begin with evidence that can actually be obtained.
+- Calculation authority: Python. Excel is the review and audit interface. Any
+  future Excel input/edit workflow needs an explicit validated import contract;
+  avoid two competing calculation engines.
+- Development: the existing Windows VS Code project and its virtual environment.
+- Code organization: one shared repository initially, with company configurations
+  and reusable modules. Keep secrets and raw research/output stores out of Git.
+- Build locally first. SQLite is a proposed initial evidence registry, not an
+  installed capability. A shared database, object storage and cloud execution can
+  follow concrete concurrency, durability or coverage needs.
+- The older playbook's Django, PostgreSQL, worker and deployment choices are earlier
+  proposals. Do not re-scaffold the project or require them merely because they
+  appear in that document. Preserve the economic and provenance principles.
+
+9. CURRENT STATUS — INSPECT THE WORKSPACE AGAIN ON ARRIVAL
+
+README.md owns current implementation status, verification and open issues. Inspect
+the workspace again rather than treating this brief as a live status report.
+Git's initial setup checkpoint is commit 12a43be; do not infer current remote state
+or privacy from local references. Never invent the user's Git identity.
+
+10. DELIVER SMALL COMPLETE STEPS THAT SERVE THE WHOLE SYSTEM
+
+Recommended implementation sequence (execution guidance, not a fixed user mandate):
+1. Finish and verify the local setup and code-history checkpoint.
+2. Define Nestlé's reporting periods, financial rows and metric definitions.
+3. Preserve a small official-source bundle and implement source/fact/version records.
+4. Reconcile history and a compact deterministic financial/cash-flow/valuation model.
+5. Export an inspectable Excel review with source-linked assumptions and checks.
+6. Add defensible uncertainty to selected drivers, with shared coherent factor paths.
+7. Record provisional forecasts as soon as meaningful targets and resolution rules
+   exist; add reverse valuation alongside or afterward. Its completion must not
+   delay the first useful forecast record.
+8. Make evidence updates repeatable, explainable and versioned; demonstrate a second
+   company can reuse the evidence and factor engine with limited adapter changes.
+9. Extend catalyst analysis, AI research and candidate evaluation as the required
+   inputs and forward outcomes become available; automate stable stages progressively.
+
+These steps refine the existing milestones rather than restart the project. Dates,
+provider selections and arbitrary performance targets are not fixed here. Do not
+delay issuing useful provisional forecasts until every optional component exists.
+Record early forecasts and their limitations before beginning performance claims.
+
+The deterministic model is a necessary foundation for valid scenario arithmetic.
+It is not the final product. Avoid months of bespoke Nestlé detail before proving
+the research-to-assumption-to-output cycle and the ability to reuse it elsewhere.
+
+11. THE FOREST-FOR-THE-TREES CHECK
+
+Before a substantial task, state briefly:
+- Which capability of the finished system does this advance?
+- What concrete research or modelling problem does it solve now?
+- Which part should be reusable, and which genuinely belongs to this company?
+- What observable output will show that the step works?
+- What material limitation or risk of drifting from the ambition remains?
+
+After the task, report what changed, what was verified, what remains provisional and
+the next useful milestone. Judge progress by traceable evidence, coherent financials,
+useful explanations, reusable economics and eventually measured forecast quality.
+Do not substitute folder counts, agent counts or attractive charts for these outcomes.
+
+Standing user instruction: explicitly challenge decisions that undermine the vision
+or are unlikely to make the system work, with a concrete alternative. Do not silently
+comply with false precision, needless infrastructure or unsupported company assumptions.
+Explain simply; the user has financial modelling experience and is new to VS Code.
+
+12. KEEP THIS CONTEXT DURABLE
+
+Make this brief a required reference in AGENTS.md while preserving its economic rules.
+Maintain short current-state, next-milestone and dated-decision sections in README.md.
+Record implemented capabilities, verification, open issues and material choices with
+their reasons. Update those sections after meaningful work so continuity does not
+rely on chat memory. Label confirmed decisions, proposals and unresolved questions.
+The user's 10 October 2026 cleanup instruction supersedes the earlier separate
+documentation files. Use README.md, AGENTS.md and this brief for now; add another
+document, code module or runtime directory only when an implemented capability
+requires it and existing locations cannot sensibly hold it.
+
+At a fresh session, read these documents and inspect the actual workspace. Summarize
+the destination, current state and next milestone before major implementation. Do not
+ask the user to reapprove settled choices; surface only consequential ambiguities.
+Do not claim a downloaded brief has reached the Windows repository until it is placed
+there and read. This file does not automatically transfer the previous conversation.
+
+Source basis: the existing starter project documents, the original Probabilistic DCF
+Implementation Playbook of 8 October 2026, and the user's subsequent project choices.
+This brief retains the broad vision while distinguishing later roadmap proposals,
+current decisions and verified implementation.
+
+13. IMPLEMENTATION BOUNDARIES
+
+Consolidated from the former architecture document during the 10 October 2026
+cleanup. These are implementation principles and proposals, not built capabilities.
+
+Code and storage:
+- The present flat Python package contains project/configuration checks, shared FX
+  arithmetic and the synthetic demo. No financial-model package is needed yet.
+- When implementing Nestlé's model, start with src/research_platform/nestle.py.
+  Separate reusable equations when real complexity or reuse warrants it. Do not
+  force company differences into one generic formula or build sector templates
+  before a second use establishes the common economics.
+- Keep company identity and structural definitions in configs/. Evolving estimates,
+  observations and distribution parameters do not belong in configuration or equations.
+- Proposed local_store/research.sqlite holds source identity/availability, extracted
+  facts, distribution versions and company mappings in distinct records. Original
+  documents belong in local_store/raw_sources/. Use one storage-access boundary;
+  financial equations must not query storage directly. Create these only when needed.
+- Distribution records identify driver, shared/company scope, units, period coverage,
+  family/representation, parameters and support, dependency/persistence specification,
+  evidence, estimation method, judgment/calibration status, version and availability.
+  A company exposure is separate from the distribution of a shared factor.
+- Select explicit versions using a coherent snapshot and information cutoff, validate
+  definitions/currencies/periods, then freeze inputs. Missing material assumptions
+  remain gaps or errors; do not invent defaults or fetch newer inputs during a run.
+- Sampling code supplies joint numerical driver paths to equations in memory.
+  Financial equations receive historical starting values, mappings and paths; they
+  neither draw random values for dependent financial rows nor read editable Excel cells.
+- Preserve input snapshots, actual samples, financial outputs, checks, code/environment
+  provenance and the future review workbook under outputs/<run_id>/. Shared samples
+  are stored once per run. Retain array axes, units, scenario IDs and period labels.
+  For example, FX can be indexed as fx[scenario, period, currency].
+- Frozen run exports preserve history, rather than providing another editable assumption
+  store. Replay from frozen inputs/samples, not today's database. A random seed or
+  source hash alone cannot recreate unavailable code, data or environment versions.
+- Excel will show material source-linked assumptions, calculations and checks. It is
+  a review interface; importing future edits requires an explicit validation contract.
+- Keep database/run artifacts out of Git and back them up separately. Production
+  storage requires appropriate migrations, transactions and concurrency controls;
+  shared infrastructure follows demonstrated need rather than a predetermined stack.
+
+FX mechanics:
+- Store base_currency, quote_currency and quote_per_base explicitly. Define q_C as
+  currency C units per USD, so units of B per A equal q_B / q_A. The computational
+  reference does not change the company's reporting currency.
+- Observed quotes need compatible timestamps and conventions. Keep original quotes
+  and flag conflicts; never silently alter observations to make them reconcile.
+- Derive daily cross rates before appropriate period aggregation. A ratio of two
+  period-average currency levels is generally not the average of their daily cross rates.
+- Use period-average rates only when appropriate for flows, closing rates for relevant
+  balance-sheet claims, and explicitly dated rates for present valuation conversion.
+  Reconcile the company's disclosed FX bridge and align currency and discount policy.
+- Distinguish transaction, translation, hedging, purchasing/functional currencies,
+  inventory/contract lags and balance-sheet effects. Convert a commodity into its
+  purchase currency once, apply timing, then translate statements without double counting.
+  Commodity types, grades and maturities require distinct definitions.
+- The present single-period demo proves arithmetic only, not these accounting schedules.
+
+Evidence updates:
+- Preserve source content hashes, publication/receipt times and exact fact passages;
+  missing publication times remain unknown. Link repeated reports of the same event.
+- Route validated facts to affected factors and assumptions, propose a versioned
+  change with its mechanism/limitations, apply the documented update rule and save
+  a new checked run. Advance current results only if expected input versions still match.
+- Cache extraction by document/parser version, batch observations and separate
+  collection, assumption revision and calculation frequencies. Invoke AI when evidence
+  needs interpretation rather than once per tick, company or simulation path.
+- Start manually. Scheduling follows idempotent reruns, versioned inputs and preservation
+  of the last valid result on failure. Research into alternative equations stays separate
+  from routine updates; additional complexity must earn its place through measured benefit.

@@ -7,10 +7,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from research_platform.data.project import find_project_root, validate_configs
-from research_platform.factors.fx import cross_rate, generate_currency_states
-from research_platform.reporting.files import sha256
-from research_platform.workflows.demo import run_fx_demo
+from research_platform.project import find_project_root, validate_configs
+from research_platform.fx import cross_rate, generate_currency_states
+from research_platform.demo import run_fx_demo, sha256
 
 
 PROJECT = Path(__file__).resolve().parents[1]

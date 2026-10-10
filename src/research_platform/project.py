@@ -70,15 +70,4 @@ def validate_configs(root: Path) -> tuple[dict, list[dict]]:
     return factors, companies
 
 
-def create_local_paths(root: Path) -> dict[str, Path]:
-    """Create only Git-ignored local runtime directories; no database is created."""
-    paths = {
-        "raw_sources": root / "local_store" / "raw_sources",
-        "research": root / "local_store" / "research",
-        "assumption_versions": root / "local_store" / "assumption_versions",
-        "outputs": root / "outputs",
-    }
-    for path in paths.values():
-        path.mkdir(parents=True, exist_ok=True)
-    return paths
 

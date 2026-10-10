@@ -1,137 +1,101 @@
-# Probabilistic DCF — first project setup
+# Research platform — starting with Nestlé
 
-Start here. This project establishes one reusable Python workspace for many companies, with shared research such as coffee and FX. Nestlé is the first planned financial model. Keurig Dr Pepper is a future company configuration placeholder.
+A small Python setup and **synthetic FX demonstration**, not a company forecast.
 
-This is a setup package, not a completed financial model or data platform. It contains no live market data, calibrated probabilities, investment forecasts or AI API integration. It does not change anything on your computer until you download and run it.
+Use this README for commands, current progress and decisions.
+[PROJECT_BRIEF.txt](PROJECT_BRIEF.txt) holds the full ambition and research principles.
+[AGENTS.md](AGENTS.md) tells coding assistants how to work. These are the only project documents to maintain.
 
-## 1. What sits where
+## Run it
 
-| Component | Initial location | Purpose |
-|---|---|---|
-| Project code | Your computer, edited in VS Code | Equations, validation, shared factor calculations and workflows |
-| Code history | One private GitHub repository | Preserve changes to code, definitions and documentation |
-| Research data | Git-ignored `local_store/` on your computer | Future original documents, observations and assumption versions |
-| Run results | Git-ignored `outputs/` on your computer | Frozen scenario data, manifests and later Excel review workbooks |
-| Execution | Your computer | Python runs when you issue a command |
-
-GitHub stores code history. It does not automatically run the application or back up the ignored research data. Before accumulating valuable real research, establish a separate data backup. Later, move structured data into PostgreSQL, original documents and arrays into object storage, and execution onto a cloud worker. That migration needs implementation; it is not included in this starter.
-
-## 2. Install the two prerequisites
-
-These instructions assume Windows and VS Code desktop. You do not need Docker, a cloud account or an API key for this step.
-
-1. Install Python from [python.org's Windows downloads](https://www.python.org/downloads/windows/). A standard 64-bit Python 3.13 installation is a reasonable starting choice; the setup code supports Python 3.11 or newer. Avoid the embeddable distribution for this project.
-2. In VS Code, open Extensions with `Ctrl+Shift+X`, search for **Python**, and install the extension published by **Microsoft**. The editor extension and Python itself are separate installations.
-3. Open **Terminal → New Terminal**. Use PowerShell for the commands below. Check:
+From the project folder in PowerShell, using the existing environment:
 
 ```powershell
-py --version
-git --version
+.\.venv\Scripts\python.exe -m research_platform doctor
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m research_platform demo-fx
 ```
 
-`py` should print Python 3.11 or newer. If Python was just installed, restart VS Code and try again. If `python --version` works but `py` does not, use `python` instead of `py` in the environment-creation command below.
+`doctor` checks the setup without creating placeholder directories.
+Tests check FX identities, validation and reproducibility.
+Each `demo-fx` command saves five files in a new `outputs/run_.../` folder:
+inputs, currency levels, cross rates, fictional-company translations and a manifest.
+Open the CSVs in Excel. Saved runs are intentionally kept separate.
 
-If Git is missing, follow [VS Code's Git setup instructions](https://code.visualstudio.com/docs/sourcecontrol/overview) and restart VS Code. Signing into GitHub is separate from installing Git.
-
-## 3. Put the project in one folder
-
-Download and extract the ZIP. In File Explorer, move the extracted project folder to your usual coding location, for example your user folder's `Projects` directory. You may rename it to `probabilistic-dcf`.
-
-In VS Code choose **File → Open Folder** and select the folder containing `pyproject.toml`, `README.md`, `configs/` and `src/`. Open the folder, not the ZIP and not only an individual Python file.
-
-If you have already created an empty GitHub repository for this project, use `Ctrl+Shift+P` → **Git: Clone** to clone it first, then copy the extracted project's contents into that checkout. Do not overwrite an existing populated project. If you have only signed into GitHub, use the new-project route in step 7.
-
-## 4. Create the project's Python environment
-
-With the project folder open, choose **Terminal → New Terminal**. The terminal should be in the folder containing `pyproject.toml`. Run these commands one at a time:
+For a fresh checkout only, create the environment and install the package first:
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\python.exe -m research_platform doctor
 ```
 
-What each does:
+Select `.venv\Scripts\python.exe` as the Python interpreter in VS Code.
+Python 3.11 or newer is required. No API keys or runtime dependencies are needed.
+Reinstall after changing package metadata or dependencies, not after ordinary code edits.
 
-| Command | Meaning |
+## Where things belong
+
+| Location | Purpose |
 |---|---|
-| `py -m venv .venv` | Creates a private Python environment for this project |
-| `python.exe -m pip install -e .` | Registers the code in that environment so it can be imported; `-e` means edits remain visible |
-| `python.exe -m research_platform doctor` | Checks configuration and creates the local data/output directories |
+| `src/research_platform/project.py` | Find the project and validate configuration |
+| `src/research_platform/fx.py` | Synthetic currency states, cross rates and translation |
+| `src/research_platform/demo.py` | Run the demonstration and save its files |
+| `src/research_platform/__main__.py` | The two terminal commands |
+| `src/research_platform/__init__.py` | Package identity and version |
+| `configs/` | Nestlé identity and shared-topic definitions; no real exposures |
+| `tests/test_setup.py` | Checks for the implemented behavior |
+| `outputs/` | Generated, preserved runs; ignored by Git |
+| `pyproject.toml`, `.gitignore` | Package setup and files excluded from Git |
 
-The full `.venv` Python path deliberately avoids PowerShell activation-policy issues. No `Activate.ps1` or execution-policy change is required. The install may download build tools; the setup commands themselves make no external API calls.
+`.venv/`, `__pycache__/` and `*.egg-info/` are generated Python installation/cache files.
+`.git/` is Git's history. These are not additional modelling work to maintain.
+Keep them out of manual cleanup; obsolete caches from moved modules are removed as part of the refactor.
 
-Now press `Ctrl+Shift+P`, choose **Python: Select Interpreter**, and select the interpreter inside this project's `.venv`. If it is missing from the list, choose **Enter interpreter path** and select `.venv\Scripts\python.exe`.
+**When modelling begins:** introduce `src/research_platform/nestle.py` for Nestlé's equations.
+The proposed research store is `local_store/research.sqlite`, with original documents under
+`local_store/raw_sources/`. Versioned distribution assumptions would be loaded once,
+sampled into coherent driver paths, and passed into the model. Save those inputs,
+actual samples and results with the run. None of these future capabilities is created yet.
+The brief contains the detailed input and FX rules. Split code into more modules only when actual complexity requires it.
 
-## 5. Run the small FX demonstration
+## Current state — 10 October 2026
 
-```powershell
-.\.venv\Scripts\python.exe -m research_platform demo-fx
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
-```
+Implemented: configuration validation, five shared synthetic currency states,
+translation for two fictional companies, CSV/JSON exports and manifests with input/output/source hashes.
+Nestlé configuration is still an identity/topic template with empty exposures.
 
-The demonstration generates five synthetic currency scenarios, derives consistent cross rates, and applies the same scenario to two fictional companies with different reporting currencies. It saves CSVs and a manifest to a new folder under `outputs/`. Open the CSVs in Excel to inspect the numbers.
+Verified after cleanup using the existing Windows editable installation and Python 3.13.16:
+doctor, all ten tests and the demo pass. Tests used the approved temporary-folder access.
+The three earlier runs are preserved: all 15 original file hashes are unchanged.
+The verification run is `outputs/run_6ba4ccf58b144a469f96b37fc42ec1d5/`; its numerical
+CSVs match the earlier seed-42 run exactly, and its output/source hashes validate.
+Original source files for the earlier runs remain in Git commit `12a43be`.
+Documentation links and original economic rules were checked; unused data directories stay absent.
+Local hashes aid provenance but are not a tamper-proof forecast ledger.
 
-This only demonstrates shared inputs, currency conventions and reproducible exports. It is not a Nestlé model, a fitted FX forecasting process or the final Excel review interface. Its fictional exposures and arbitrary sampling ranges must never be used as company estimates. The production numerical model will use NumPy when we add large arrays; this small setup demo uses Python's standard library.
+Not implemented: real company history/model, evidence database, live ingestion, AI integration,
+calibrated distributions, Excel review workbook, reverse valuation, catalysts or forward evaluation.
+Source coverage, exposure estimates and a backup for future ignored research data remain unresolved.
+These local changes are uncommitted; live remote state and repository privacy have not been checked.
 
-## 6. Understand the folders
+## Next milestone
 
-| Path | What belongs here |
-|---|---|
-| `src/research_platform/data/` | Code for loading, validating and later persisting records |
-| `src/research_platform/factors/` | Shared calculations such as FX and, later, commodity factors |
-| `src/research_platform/models/` | Financial calculations; currently only the fictional translation example |
-| `src/research_platform/reporting/` | Output writers; currently CSV and JSON, with Excel exports to add later |
-| `src/research_platform/workflows/` | The order in which loading, calculations and saving happen |
-| `configs/companies/` | Company identity and structural configuration; not a duplicate research database |
-| `configs/shared_factors.json` | Shared topic definitions and conventions; not live forecasts |
-| `tests/` | Small checks that protect numerical and operational behavior |
-| `docs/` | Architecture and the next build steps |
-| `local_store/` | Local research data; created by `doctor`, ignored by Git |
-| `outputs/` | Saved runs and exports; ignored by Git |
-| `.venv/` | Installed Python environment; ignored by Git |
-| `pyproject.toml` | Project metadata and, later, dependency declarations |
-| `.gitignore` | Tells Git which generated/private files to exclude |
-| `.env.example` | Example future configuration names; no credentials |
-| `AGENTS.md` | Instructions for coding assistants, including challenging drift from the investment vision |
+Define Nestlé's reporting specification from official sources:
+periods, disclosure frequencies, segment vintages, financial rows, units and metric definitions.
+Every row must be reported, calculated, estimated or explicitly missing, with a source reference or gap.
+Identify the sales/profit, cash-flow and equity-value reconciliation bridges.
+Do not manufacture undisclosed quarters or treat reported free cash flow as automatically identical to valuation cash flow.
 
-We will extend `models/` with Nestlé's financial equations, put large-scale assumption sampling in a dedicated module, and extend `reporting/` with Excel exports. Avoid creating many empty services now.
+Then build a small source/fact/version registry, reconcile history and implement one deterministic case.
+The full sequence is in brief section 10. Record useful provisional forecasts as soon as
+targets, reporting vintages, horizons, resolution rules, baselines and frozen inputs/output exist;
+reverse valuation and complete automation must not delay them.
 
-The folder called `data` inside `src` contains **code that handles data**. `local_store` contains **the data itself**. That distinction lets us change storage without rewriting the financial equations.
+## Decisions
 
-## 7. Save the code in GitHub
-
-If this is a new project, open the Source Control view (`Ctrl+Shift+G`) and select **Initialize Repository**. Review the listed files; `.venv/`, `local_store/`, `outputs/` and `.env` should not appear. Stage the project files, enter `Initial research platform setup`, and commit. If Git asks for your name/email, provide the identity you want attached to your commits.
-
-Use **Publish to GitHub**, select **Private**, and choose a repository name such as `probabilistic-dcf`. If you cloned an existing repository, commit and use **Sync Changes** or **Push** instead of creating another repository. Review the files before each commit. A private repository is still not a place for API keys or restricted source datasets.
-
-All companies should initially share this one repository. Company configuration differs; shared financial functions, research infrastructure and FX calculations are reused.
-
-## 8. Your everyday workflow
-
-Open this project folder in VS Code, edit files, run the checks relevant to the change, review the results, then commit and push code changes. The virtual environment does not need recreating each time. Re-run `pip install -e .` when package metadata or dependencies change.
-
-When we add new dependencies, record and pin the approved environment before research runs that need reproducibility. Saving only a random seed is insufficient: preserve actual input versions, generated samples, code version and package versions too.
-
-| Problem | First check |
-|---|---|
-| `py` is not recognized | Restart VS Code after Python installation; try `python --version` |
-| `.venv\Scripts\python.exe` cannot be found | Check you opened the correct folder and created `.venv` there |
-| No `pyproject.toml` / project not found | Open the extracted project folder, rather than its parent |
-| `No module named research_platform` | Re-run the editable install using this project's `.venv` Python |
-| Permission or network error during installation | Read the first error; do not change system security settings blindly |
-| No GitHub repository visible | Check whether you have only signed in, or actually cloned/published a repository |
-
-For macOS/Linux, use `python3 -m venv .venv`, then `.venv/bin/python` in place of `.\.venv\Scripts\python.exe`.
-
-Next read [the architecture](docs/architecture.md) and [the first build milestones](docs/next_steps.md). Today's completion point is that `doctor` succeeds, the synthetic example runs, and you can inspect the project files. Live data ingestion and the Nestlé financial model come next.
-
-## Official setup references
-
-- [Python in VS Code](https://code.visualstudio.com/docs/python/python-tutorial)
-- [Selecting a Python environment](https://code.visualstudio.com/docs/python/environments)
-- [Python virtual environments](https://docs.python.org/3.13/library/venv.html)
-- [Editable Python installs](https://setuptools.pypa.io/en/latest/userguide/development_mode.html)
-- [VS Code repositories and remotes](https://code.visualstudio.com/docs/sourcecontrol/repos-remotes)
-
-Technical guidance checked on 10 October 2026. Runtime checks were executed in the provided Linux Python environment; Windows desktop installation was not executed here.
+| Date | Status | Choice and reason |
+|---|---|---|
+| 10 October 2026 | Confirmed | The brief is required context. Its settled choices include Nestlé first, Python calculations, Excel review, local development and shared evidence with explicit company effects. |
+| 10 October 2026 | Confirmed | Keep the minimum understandable layout. This cleanup reduces maintained project files from 26 to 13, replacing the seven-document/five-subpackage scaffold with three documents and five Python files. Progress, next steps and decisions now live here; unique architecture detail lives in the brief. Add a file only for a concrete need that existing locations cannot sensibly serve. |
+| 10 October 2026 | Confirmed | Remove the unused Keurig Dr Pepper configuration, empty environment example and unused data directories. Retain earlier runs and their frozen configuration snapshots. No second company has been selected. |
+| 10 October 2026 | Proposed | One local SQLite registry for evidence and versioned assumptions, with frozen run snapshots. This avoids competing editable assumption stores. The earlier nested model-file proposal is simplified to `nestle.py`; create it only when implementing the model. |

@@ -1,7 +1,6 @@
 .venv/
 .env
 .env.*
-!.env.example
 local_store/
 outputs/
 __pycache__/
