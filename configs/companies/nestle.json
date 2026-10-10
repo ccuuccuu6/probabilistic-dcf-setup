@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "company_id": "nestle",
+  "display_name": "Nestlé",
+  "reporting_currency": "CHF",
+  "status": "setup_template_not_a_financial_model",
+  "research_topics": ["coffee", "fx"],
+  "exposure_mappings": [],
+  "notes": "Research topics route relevant evidence for review. They do not quantify an exposure, currency weighting, cost sensitivity, or hedge. Verify source-backed company mappings before forecasting."
+}
