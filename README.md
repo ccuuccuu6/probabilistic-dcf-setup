@@ -21,12 +21,33 @@ the historical accounts from original disclosures, explain how the figures conne
 check the result and leave room for forecasts. The research and review roles are
 separate AI requests; Python reads the cited amounts and performs the calculations.
 
-You supply the company and, optionally, historical years. Without years, discovery
-looks for the latest two fully reported annual periods. The process checks its
-settings, opens a separate recorded run, then searches the web for the correct
-company and authoritative reports. It downloads and preserves the originals with
+You supply the company and, optionally, fiscal years. Discovery includes annuals
+and all reported quarters, half-years and cumulative nine-month disclosures within
+those years. Without years it selects the latest two fully reported fiscal years,
+including their interim disclosures. The process checks its settings and looks for
+the latest matching saved run. Completed work is reused; an interrupted compatible
+run continues in a new folder, preserving the earlier one. A first run searches the
+web for the correct company and authoritative reports. It downloads and preserves the originals with
 their source information and retrieval times, so later checks use a saved record
 of the evidence rather than a website that might change.
+
+Discovery separates advisory `notes` from `blocking_issues`. Notes retain proposed
+consolidation scope, comparative basis, restatement cautions and optional-source
+limitations for extraction and the final structure review. Genuine unresolved
+identity/evidence problems still stop before downloads. A missing optional XLSX
+does not itself block usable primary PDF/HTML evidence; that alternative must still
+pass local extraction and every required review. Discovery receives only company,
+historical periods and research date. Future years only allocate blank Excel columns.
+Blind source reconstruction and coverage inventories do not receive the notes.
+
+Every fiscal year needs a cited disclosure decision for Q1–Q4, H1–H2 and 9M.
+Each reported period has its own ID, fiscal start/end dates and kind. Nine-month
+sales are not standalone Q3 sales; H1 is not Q2. A company may publish quarterly
+sales but only half-year/full-year statements. In that case, the model keeps the
+quarterly sales and documents unavailable earnings, balance-sheet and cash-flow
+figures. It does not divide annuals or subtract cumulative reports to invent
+standalone observations. A cited, reviewed absence is required; omission alone
+cannot justify a blank.
 
 The first analyst works through those documents to propose segments, statements,
 supporting schedules, definitions and accounting relationships. For a reported
@@ -63,14 +84,16 @@ usage and estimated costs appear as the process runs.
 The process ends there. Derived history and linked accounting checks recalculate
 in Excel; edits do not change Python's saved results or rerun source/AI reviews.
 Forecast assumptions, distributions, DCF and ongoing news maintenance
-remain later work. Starting initiation again creates a new run rather than resuming
-or updating the earlier one. Passing checks means the configured gates passed, not
+remain later work. Starting initiation again resumes compatible saved progress or
+returns an existing accepted result; `--fresh` explicitly starts new research.
+Passing checks means the configured gates passed, not
 that shared source, parsing or AI mistakes have become impossible.
 
 The required coverage decisions span operating segments, income statement, balance
 sheet, cash flow, working capital, net debt, equity and shares. Undisclosed or
 inapplicable schedules need cited explanations and reviewer acceptance. They are
-not filled with zeros. Core statements cannot be waived. Do not add overlapping
+not filled with zeros. Annual core statements cannot be waived; interim sections
+may be selective where that matches the actual disclosure. Do not add overlapping
 segment views or pretend that a company publishes full segment balance sheets.
 
 ## Function order when you run initiation
@@ -84,18 +107,26 @@ conversation. The full drafts and source archive remain in Python/run records.
 |---|---|---|
 | 1 | `main()` → `find_project_root()` | Read the terminal command and find the project folder. |
 | 2 | `initiate_company()` → `OpenAIProvider.from_env()` → `validate_configuration()` | Validate years/limits and load private API/model settings. No AI call yet. |
-| 3 | `SourceStore(...)`, `save()` | Create a unique run, initialize its source index and write an in-progress record with code/dependency versions. |
-| 4 | `ask()` → `OpenAIProvider.complete()` → `validate_shape()` | Send the discovery instructions with web search enabled; require a structured response. The same call/logging path is reused for every later AI request. |
-| 5 | `validate_discovery()` | Check identity fields, fiscal dates, requested coverage and supplied publication dates. These mechanical checks do not prove the selected company/source is correct. |
-| 6 | `add_sources()` → `SourceStore.add()` → `download()` → `_units()` | Archive original files with hashes/timestamps and index their pages, spreadsheet rows or HTML chunks. |
-| 7 | `ask()` with extraction instructions; `catalog()`, `search()`, `read()` | AI navigates the archive, requests additional source URLs, saves batches of cited row definitions, then proposes a complete candidate. `save_rows` and `propose` are response actions handled inside `initiate_company()`, not separate Python functions. |
+| 3 | `_initiation_lock()` → `_run_initiation()` → `_saved_run()` / `_resume_history()` | Prevent concurrent project runs, find matching progress and verify compatibility, journal and originals. Return an existing accepted result, or create a fresh/continuation folder and initialize its source index and durable record. |
+| 4 | `ask()` → saved response or `OpenAIProvider.complete()` → `validate_shape()` | Reuse an exactly matching recorded request without AI, or save a pending-call record and send the discovery request with web search enabled. This call/logging path is reused for every later AI request. |
+| 5 | `validate_discovery()` | Stop on `blocking_issues`; retain advisory `notes`. Check identity fields, fiscal dates, requested coverage and supplied publication dates. These mechanical checks do not prove the selected company/source is correct. |
+| 6 | `add_sources()` → `SourceStore.restore()` or `SourceStore.add()` / `download()` | Reopen verified originals and replay earlier acquisition outcomes, or download and index new documents. Saved source identity, retrieval times and review contexts remain unchanged. |
+| 7 | `ask()` with extraction instructions; `catalog()`, `search()`, `read()` | AI navigates the archive, requests additional source URLs, saves batches of cited row definitions, then proposes a complete candidate. `save_rows` and `propose` are response actions handled inside `_run_initiation()`, not separate Python functions. |
 | 8 | `materialize_and_check()` → `SourceStore.resolve()` / `parse_number()` | Read cited numbers, apply declared units/signs, calculate derived rows and test accounting, dependencies, coverage and gaps. Failed checks return to step 7. |
 | 9 | `review("source_review", ...)` → `compare_source_facts()` | Blindly reconstruct reported concepts in batches of up to 20. Only concept identity and requested periods are supplied; the reviewer selects and reads its own numeric/header context. Save its facts before comparing amounts, units and entities. |
 | 10 | `review("source_alignment", ...)` → `_review_issues()` | After the blind answer is recorded, compare meanings and reporting vintages against the candidate and originals. Require a cited reasoned verdict for every reported row; equal amounts alone cannot establish equivalent definitions. |
 | 11 | `review("coverage_inventory", ...)` → `validate_inventory()` | Independently inventory all eight sections, without candidate rows, definitions or verdicts. Save each cited inventory before revealing the model. |
 | 12 | `review("model_review", ...)` → `compare_inventory()` / `_review_issues()` | Match every expected item to a candidate row and challenge nine structural topics. Other review verdicts and numerical check results are withheld. Missing lines, duplicate matches or unresolved coverage differences block acceptance. |
-| 13 | The attempt loop in `initiate_company()` | Send unresolved findings back to step 7; rerun all gates and retain earlier proposals/checks/reviews. Continue while making progress under the shared estimated-cost threshold. |
+| 13 | The attempt loop in `_run_initiation()` | Send unresolved findings back to step 7; rerun all gates and retain earlier proposals/checks/reviews. Continue while making progress under the shared estimated-cost threshold. |
 | 14 | `export_workbook()` → `save()` → return to `main()` | If every gate passes, publish the historical workbook with blank forecast columns, finalize the record and print paths/status. Otherwise record an incomplete result. |
+
+While each AI call runs, `TerminalProgress.call_timer()` updates a single terminal
+line every second, for example `Call 2: extract (gpt-6.1-sol): waiting 00:18`.
+It prints the final duration on success or failure and stops the timer before the
+next message. `api-check` uses the same timer. Redirected output receives a final
+duration without repeated carriage-return updates. Each initiation call's measured
+`elapsed_seconds` is also saved in `calls.jsonl`; the counter measures elapsed
+waiting time, not percentage completion or time remaining.
 
 After every attempted AI call, `response_usage()`, `aggregate_usage()` and
 `format_usage()` extract reported usage and print cumulative stage and run totals;
@@ -110,7 +141,20 @@ additional URLs, but there is no second web-research stage. Discovery validation
 failures and provider errors (including HTTP 429, refusal or an incomplete response)
 stop the run; they do not trigger automatic paid retries. Financial/format validation
 issues inside the proposal/review loop can trigger revision. Rerunning the command
-starts a new run; saved records do not yet provide resumable execution.
+reuses saved responses in order and reconstructs those same isolated contexts
+locally. A failed request with a known charge may be retried on continuation;
+its previous charge remains counted. Unknown charges still block new requests.
+
+API transport failures now retain a sanitized category (timeout, DNS, TLS,
+connection, interrupted response or other network/protocol error), numeric OS codes
+when available, elapsed time and the configured timeout in
+`calls.jsonl` under `provider_response._transport`. Each request sends and records a
+unique `X-Client-Request-Id`, including successful calls. This helps trace requests
+whose responses were lost; it is not a response ID, retrieval mechanism or retry
+deduplication guarantee. See [OpenAI request debugging](https://developers.openai.com/api/reference/overview#debugging-requests).
+Raw exception text, partial responses and credentials are excluded from diagnostics.
+The terminal reports the request failure before its resulting budget warning.
+Unknown usage still stops the run; a lost response's charge is not assumed to be zero.
 
 Each extraction decision is another paid request. Each source batch of at most 20
 reported rows has a blind reconstruction and a separate meaning comparison. Eight
@@ -185,9 +229,40 @@ To start the actual company initiation:
 .\.venv\Scripts\python.exe -m research_platform initiate "Nestlé S.A., NESN, SIX, Switzerland" --years 2024 2025
 ```
 
-The same command accepts another company name. Without `--years`, discovery selects
-the latest two fully reported annual periods. `--forecast-years` controls the number
+The same command accepts another company name. `--years 2024 2025` now includes
+reported interim disclosures within those fiscal years as well as annual accounts.
+Without `--years`, discovery selects the latest two fully reported fiscal years
+and their interims. `--forecast-years` controls the number
 of empty future columns (default five); fiscal date definitions remain in the record.
+
+Run the **same command again to resume**. Matching uses the company query (ignoring
+case and extra spaces), requested fiscal years/history length and number of blank
+forecast columns. It chooses the newest matching run. A compatible accepted result
+is returned without further AI calls. Resuming retains the original research date;
+it does not search for newer news or refresh an accepted model.
+
+Append `--fresh` when you deliberately want a new research run and budget. You may
+instead append `--resume "outputs\initiate_<company>_<time>_<id>"` to identify the
+latest matching run explicitly; this cannot branch from an older matching run.
+Do not combine these options. Changing the cumulative budget on continuation is
+not allowed.
+
+Saved responses are reused only with the same code, Python/parser versions,
+provider/model settings, original documents and exact reconstructed request
+contexts. Missing or damaged records and incompatible settings stop before new
+spending rather than silently starting over. **Runs made before this resume feature
+cannot be continued:** preserve them and use `--fresh` once to start a compatible
+run. In particular, the earlier Nestlé attempts predate these checkpoints.
+
+Progress is saved before dispatching each paid request and after its response and
+usage are durably journaled. Ctrl+C between requests, during a document acquisition
+or during Excel export can recover completed AI work. A terminated process cannot
+recover a response that was never saved. An unanswered in-flight request or lost
+usage leaves its charge unknown and blocks more paid calls under the budget rule.
+There is **no charge-reconciliation command** yet, and the adapter uses `store: false`,
+so it cannot retrieve a lost response afterward. A known failed request can be
+retried on continuation, with its earlier cost retained; do not assume an unknown
+failed call cost nothing.
 
 Live execution makes paid API calls. **The whole run stops when its returned-usage
 cost estimate reaches or exceeds $20**, including research, navigation, all reviews,
@@ -203,7 +278,9 @@ even if it was the final review. Missing usage or unrecognized pricing stops the
 run as incomplete; configured model prices must be known before research starts.
 The **last request can overshoot $20** because the provider returns usage after
 charging. This is a strict stop on the reported estimate, not an exact invoice cap.
-The adapter does not automatically retry failed paid requests.
+The adapter does not automatically retry failed paid requests. The threshold and
+reported costs carry across all continuations; resuming does not reset the $20
+allowance or charge again for replayed responses.
 
 Removing the old call ceilings permits complete independent reviews on larger
 models. Repeated unchanged navigation or a failed candidate resubmitted without
@@ -264,14 +341,27 @@ post-response stopping threshold cannot prevent its final request overshooting. 
 
 ## Outputs and how to check them
 
-Each invocation creates a new `outputs/initiate_<company>_<time>_<id>/` folder:
+A first run, explicit `--fresh` run or continuation creates an
+`outputs/initiate_<company>_<time>_<id>/` folder. Returning an already accepted
+result creates no new run folder:
 
 | Artifact | What it contains |
 |---|---|
-| `record.json` | Request, status, discovered identity/periods, source metadata, proposals, revisions, resolved figures, equations, checks, review results, errors, usage/cost totals, code snapshot and dependency versions |
-| `calls.jsonl` | Timestamped prompts, supplied evidence, structured responses, provider responses/model identifiers, reported usage and estimated cost; no API key or authorization header |
-| `sources/` | Original documents with hashes; created only when documents are obtained |
+| `record.json` | Request, status, parent-run path, pending call, source acquisition journal, discovered identity/periods, proposals, revisions, resolved figures, equations, checks, reviews, errors, cumulative usage/cost, code snapshot and dependency versions |
+| `calls.jsonl` | Complete paid-call history, including inherited calls: timestamped prompts, elapsed seconds, evidence, structured/provider responses, model identifiers, reported usage and estimated cost; no API key or authorization header |
+| `sources/` | Newly obtained originals with hashes; a continuation references earlier originals in its ancestor folders instead of copying or downloading them again |
 | `model.xlsx` | Historical model with calculated rows linked by Excel formulas, reported source inputs, live arithmetic checks alongside recorded results, blank forecast columns, AI reviews and Sources |
+
+A continuation's `parent_run` links to the preserved earlier run. Its copied call
+journal carries cumulative costs once; do not add totals from every ancestor folder
+as if they were separate bills. Back up and retain these linked folders together
+because originals remain at their original paths. An interrupted download can leave
+an unused partial file in the earlier folder; it is not accepted source evidence.
+
+`outputs/.initiation.lock` is a small generated coordination file. An operating-system
+lock allows one initiation at a time in the project and releases when the process
+exits or is killed. The file remaining on disk does not mean a run is still active;
+do not delete it to bypass an active run.
 
 A source's publication date is AI-discovered metadata checked against available
 evidence, not an authenticated availability timestamp. Unknown dates remain null;
@@ -288,8 +378,9 @@ row in its documented source scale. **Checks** now includes the basis of each ch
 **AI reviews** shows the independently recorded facts and expected lines as well as
 the subsequent cited verdicts. Inspect `record.json`/`calls.jsonl` for complete context.
 Same-source reconstruction is explicitly recorded; it is not a second independent
-underlying observation. A reported cash-continuity adjustment disclosed only for one
-period leaves unrelated historical cells blank, never zero.
+underlying observation. Every unavailable row/period has cited reasons in its cell
+comment; blanks never stand for zero. Coverage reviews record which periods each
+line should contain and block acceptance if a disclosed observation is omitted.
 
 Excel now contains **working formulas for derived historical rows**, generated from
 the same signed accounting relationships Python uses, with cross-sheet links and
@@ -298,11 +389,18 @@ compares them with their components instead of turning evidence into a construct
 balance. Missing/deleted inputs produce an input error rather than silently becoming zero.
 
 The eight financial tabs have company/statement headings, financial lines down the
-rows, historical years across columns, frozen headings, number formatting and five
+rows, dated historical periods across columns, frozen headings, number formatting and five
 yellow blank forecast columns by default. Reported inputs are blue; calculations
 are black, with cross-sheet formulas green. Row IDs, definitions and other audit
 metadata are grouped to the right; expand them when needed. Source comments remain.
 Start here, Checks, AI reviews and Sources make twelve tabs in total.
+Historical columns are sorted by end date, then start date and ID, with clear FY,
+quarter, half-year and YTD labels. Period dates and disclosure coverage appear in
+Start here and cell comments. These overlapping periods must not be summed across
+columns. Forecast columns remain blank annual columns. Cash continuity uses a
+cited predecessor whose closing date immediately precedes the period's start;
+FY and H1 may both link to the preceding FY rather than the previous displayed
+column. Stocks repeated at the same date must agree on the stated reporting basis.
 
 Open the workbook in Excel or a compatible calculation engine to calculate its
 formulas. Automatic full recalculation is requested; no cached formula results are
@@ -319,17 +417,34 @@ runs. An interrupted export can leave `model.pending.xlsx`; it is not a complete
 result. `record.json` is authoritative, and an interrupted process can remain
 `in_progress`. Earlier run folders are never overwritten.
 
-## Current state and verification — 10 October 2026
+## Current state and verification — 11 October 2026
 
 The reusable workflow, real API adapter, bounded source reader, numerical checks,
 formula-based Excel export, per-stage usage and $20 estimated-cost stop are implemented.
+Reported quarters, halves and 9M within the selected completed fiscal years now
+join annual history, with period-specific coverage, explicit unavailable observations,
+stock/flow distinctions and dated cash-continuity links. Every interactive CLI AI
+request has a live elapsed counter and a recorded final duration. Compatible runs
+now resume automatically using saved responses and verified originals, with one
+cumulative budget, isolated reviewer contexts and preserved parent runs. Accepted
+results are reused unless `--fresh` is explicit. Durable pending-call records stop
+an unanswered request from being forgotten after interruption. These changes use
+the existing modules and test file; no maintained project files or dependencies
+were added. Continuations and the project lock are generated output artifacts.
 The previous fixed `nestle.py` extractor and its
 `--sources` command have been removed. Company-specific definitions now belong in
 cited run data. The unused synthetic FX modules, their command and both starter
 JSON configs have now been removed. Initiation discovers its company and reporting
 structure from the query; no company config or demonstration is required.
 
-**70 offline tests pass.** They exercise two unrelated fictional companies with
+**109 offline tests and setup doctor pass.** Twenty resume regressions cover
+interrupted extraction/review navigation, repeated interruptions, source download
+and parser interruptions, workbook export with zero additional AI calls, cumulative
+spending and known charged failures, unknown/in-flight charges, stale pending markers,
+damaged journals, code/provider/parser/source drift, archive paths, project locking,
+accepted-result reuse, explicit fresh starts, legacy records and frozen research dates.
+No paid calls have been made for this change; live-provider recovery remains unverified.
+Existing tests exercise two unrelated fictional companies with
 different layouts/currencies, extraction batches, reviewer search/read navigation,
 autonomous correction, accounting and precision failures, missing citations, review
 omissions, budget exhaustion, immutable runs, source hashes and empty forecast cells.
@@ -348,10 +463,19 @@ review, unknown/stale usage, per-stage totals, no-progress stops and successful 
 beyond the former call/navigation/draft ceilings. These use scripted reviewers;
 they demonstrate gates, not live AI skill. Setup doctor also passes. No paid calls
 were made for this step, and a real Excel application was not used in these tests;
-new workbooks request recalculation when opened there. The lower test count reflects
-removal of obsolete FX/configuration tests; the initiation, accounting, evidence,
+new workbooks request recalculation when opened there. Obsolete FX/configuration
+tests were removed; the initiation, accounting, evidence,
 Excel and spending checks remain. Project-root checks now work without a configs
 folder, and `doctor` checks Python and installed dependencies without reading credentials.
+
+The interim/timer addition contributes eleven regressions: live counting while a
+request is still running, timer cleanup on failure, readable redirected output,
+mixed annual/full-H1/sales-only-Q1/9M history, date-based cash predecessor formulas,
+complete disclosure-cadence decisions and valid fiscal boundaries, cited unavailable
+cells, independent period-omission detection, stock-token reuse only at matching
+dates, equal-precision same-date stock disagreement, and legitimate optional interim
+subtotal absence. Call logs also verify numeric nonnegative elapsed durations.
+These are synthetic offline checks, not a completed live Nestlé interim extraction.
 
 A subsequent dependency audit found no further unused maintained modules. Removed
 the unreferenced package `__version__` constant (the version belongs in pyproject.toml)
@@ -368,6 +492,56 @@ $0.000252. It verifies API access and structured output, not web search or compa
 research accuracy. This supersedes the earlier HTTP 429 as the latest connection
 result; the earlier failed attempt's cost remains unknown. No successful full AI
 company initiation has been verified. No earlier company or FX run was changed.
+
+The first inspected live initiation attempt,
+`initiate_nestl_s_a_nesn_six_switzerland_20261010T222359Z_85b437bc`, stopped at discovery.
+Its saved record contains one Sol call, 58,105 reported tokens, two search actions
+and estimated cost $0.1577425. Discovery returned eight source references but placed
+reporting-scope/basis cautions, unavailable optional XLSX files and a forecast-scope
+note in `issues`. The old `validate_discovery()` treated any entry there as fatal, before
+source downloads: zero archived originals, extracted rows or financial checks, and
+no workbook. Replaying that validation locally reproduces the stop without an API
+call. The response says PDF tables are available; their local readability and
+coverage were not tested. Five forecast years mean blank export columns, not
+forecast evidence to discover. This exposed a discovery-output design weakness.
+The subsequent fix separates advisory notes from blocking issues and limits discovery
+to historical settings. Notes remain provisional and subject to original-source
+verification; the failed run remains unchanged. No paid rerun was made by the agent
+for that fix. The user's next attempt, described below, reached PDF extraction.
+
+Five new offline regressions verify advisory-note continuation and persistence,
+historical-only discovery inputs, blank forecasts and isolated blind reviews;
+genuine blockers with recorded usage; missing required discovery fields; an optional
+download failure with usable archived evidence; and total source unavailability.
+Existing arithmetic and missing-evidence cases now include reassuring notes and
+still fail correctly. The full 75-test suite and setup doctor pass after the fix.
+Fallback tests use synthetic disclosures, not Nestlé's live PDFs. No files were
+added, no models were changed, and the $20 spending stop remains unchanged.
+
+The user's next live attempt,
+`initiate_nestl_s_a_nesn_six_switzerland_20261010T223344Z_b5234ebc`, passed discovery,
+archived/text-indexed four PDFs and saved 41 draft rows. Two supplementary pages
+returned HTTP 403 and a third download had a connection error; these were recorded
+as feedback and did not prevent extraction. The fifth AI call then failed at the
+transport layer after 9.576697 seconds, against a 120-second configured timeout.
+The old handler discarded the underlying exception, so this record cannot identify
+the specific network/TLS/timeout cause. Four calls reported 141,523 tokens with a
+$0.4090896 estimated subtotal; the fifth request's usage and possible charge remain
+unknown. The run correctly stopped on unknown cost, with no numerical checks,
+reviews or workbook. The 41 rows in `draft_rows` remain unverified; `rows` is empty.
+
+Diagnostic hardening now preserves safe transport categories/codes/timings and a
+client request ID, including interruptions during response reads. This does not
+repair or establish the cause of the earlier connection failure. Timeout, models,
+batch sizes and no-retry/unknown-cost rules were unchanged by that diagnostic fix.
+At that point there was no resume command, so retrying started new research. The
+11 October resume implementation described above supersedes that limitation for
+new compatible runs; these older runs and their unknown charges remain preserved.
+All 78 offline tests and setup doctor pass. New mocks cover timeouts, DNS/TLS and
+connection errors, partial/protocol failures during response reads, interrupted HTTP
+error bodies, unique request IDs, secret redaction and preservation of the known cost
+subtotal with no further request after unknown usage. No live API call or new project
+file was needed for this diagnostic change.
 
 The prior fixed Nestlé reference remains intact:
 [model.xlsx](outputs/nestle_2024_2025_20261010T180411Z_c133cf62/model.xlsx).
@@ -406,15 +580,43 @@ was added. Semantic equivalence and the initial disclosure inventory still requi
 AI judgment. Multiple passing gates therefore do not supply a numerical confidence
 level. No live API calls or new company outputs were created for this implementation.
 
-Current boundaries: annual statements with signed additive accounting bridges;
-up to five historical years, 500 rows and 12 source documents; bounded source sizes,
-navigation and context. Text-based PDFs, ordinary XLSX and UTF-8 HTML are supported.
+Current boundaries: annual and reported quarterly, half-year and nine-month
+history with signed same-period additive accounting bridges;
+up to five completed fiscal years, 500 rows and 12 source documents; bounded source sizes,
+navigation and context, including 16,000 output tokens per response. More interim
+reports increase calls, evidence volume and cost; large histories can exceed those
+bounds or the $20 threshold and end incomplete. Do not omit available periods to
+fit a limit. Automatic FY-minus-H1 or 9M-minus-H1 calculations are not implemented.
+Each selected fiscal year still requires an annual anchor and full annual core
+statements; initiation of an unfinished current fiscal year is not yet supported.
+Text-based PDFs, ordinary XLSX and UTF-8 HTML are supported.
 Scanned reports needing OCR, unsupported spreadsheet formats, blocked/paywalled
 sites, proxy-only networks, ambiguous entities and unsupported sector conventions
 can end incomplete. The source downloader accepts public HTTPS only. This is a
 reusable engine with explicit limits, not demonstrated universal company coverage.
 
 ## Next milestone
+
+Resume and its offline interruption, replay, source-integrity and spending checks
+are complete. Next verify on a controlled live
+attempt that completed stages are reused and cumulative costs remain correct after
+a recoverable interruption. No successful live resume or full autonomous model has
+yet been demonstrated. Older attempts require one explicit `--fresh` run because
+their schemas and checkpoint format differ; do not claim their draft rows can be
+silently promoted or continued.
+
+Discovery now passes on the user's live Nestlé attempt, and PDF indexing and draft
+extraction have begun. The immediate next milestone is a complete extraction and
+review under the existing budget, now including reported quarters, halves and 9M
+within 2024–2025. Verify the disclosure calendar and sales-only versus full-statement
+coverage against originals; the old annual reference cannot verify the added
+interims. Observe each call's live elapsed time alongside stage costs. If transport
+failure recurs, use its new category,
+OS code, timing and client request ID to investigate the connection/proxy/TLS/provider
+path; the old 9.6-second failure is not evidence that the 120-second timeout is too
+short. Do not hide unknown charges with automatic generation retries. Resumable runs
+preserve completed work but still stop if any request's charge is unknown. Usage
+reconciliation and recovery of unsaved provider responses remain unimplemented.
 
 The connection test has passed. With API/model settings stored locally, run the generic process for Nestlé's
 2024–2025 accounts and compare it with the preserved originals/reference. Record
@@ -513,4 +715,9 @@ run-preservation rule; no new output folder or paid API call was created for cle
 | 10 October 2026 | Confirmed model choice for this step | Keep Sol for every role: no current AI task is demonstrably low-stakes enough for a confident Luna substitution. Simple mechanical work already runs in Python; revisit model choices using measured stage costs and accuracy. |
 | 10 October 2026 | Confirmed and implemented | Remove obsolete fx.py/demo.py, starter configs and demo command to reduce clutter. Keep project discovery, current initiation and all saved runs. Real FX research waits for an implemented economic need; its design principles remain in the brief. |
 | 10 October 2026 | Verified cleanup | A follow-up source/dependency audit found no additional obsolete active modules. Removed unused duplicate version metadata and the stale generated source-tree egg-info directory; the installed package and doctor still work. Retain necessary support files and saved runs rather than reducing file count for its own sake. |
+| 10 October 2026 | Implemented and verified offline; live rerun pending | The first inspected live Nestlé initiation stopped before downloads because discovery put routine scope/basis notes in the fatal issues field (58,105 tokens; estimated $0.1577425). The user authorized the fix: separate notes/blocking_issues, preserve notes for extraction and structural challenge, keep blind contexts isolated, and send only historical settings to discovery. Required evidence and accounting gates remain. All 75 offline tests and doctor pass. Earlier run preserved; no paid rerun for the fix. |
+| 10 October 2026 | Observed transport failure; diagnostics verified offline | The next user-run initiation archived four PDFs and saved 41 unverified draft rows, then lost the fifth AI response after 9.58s. Recorded cost is $0.4090896 plus an unknown fifth-call charge. Preserve safe error categories, OS codes, request timing and client request IDs; show the primary failure before the cost guard. All 78 offline tests and doctor pass. No automatic retries, timeout/model changes or agent-triggered paid run. The original network cause and full model accuracy remain unresolved. |
+| 10 October 2026 | Confirmed and verified offline | Show a live elapsed counter for each interactive CLI AI call, including api-check, plus final duration on success/failure; save initiation elapsed seconds in calls.jsonl. Redirected output receives one final duration. No background requests, retries or model changes. |
+| 10 October 2026 | Confirmed and implemented; live evaluation pending | Historical initiation includes reported quarters, halves and cumulative 9M for selected completed fiscal years. Require cited cadence and per-section/per-period coverage, preserve sparse disclosures, distinguish stocks/flows and cumulative/standalone periods, and date cash bridges explicitly. Generate matching Excel columns/checks. No invented quarters or cross-period subtraction. All 89 offline tests and doctor pass; no paid rerun, new files or earlier-run changes. Source/context/cost limits and unfinished-current-year support remain explicit boundaries. |
+| 11 October 2026 | Confirmed and verified offline; live recovery unverified | Resume the newest compatible matching initiation automatically; return accepted results without AI, and require explicit `--fresh` to start new research. Preserve earlier folders and original evidence, replay exact saved calls/source outcomes in isolated contexts, and carry each paid call's tokens/cost once across the continuation lineage. Save pending requests before dispatch, durably journal responses, and serialize initiation with an OS lock. Code/settings/parser/source drift, legacy records and unknown charges stop rather than trigger an unnoticed restart. Recover completed work around document acquisition and Excel export; no lost-response retrieval or usage-reconciliation command is implemented. All 109 offline tests and doctor pass, including 20 resume regressions. No paid calls or new maintained files. |
 | 10 October 2026 | Unresolved | Measured unattended accuracy/cost and optimal model mix, additional document/sector support and later production-baseline promotion rules. |

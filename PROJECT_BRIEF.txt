@@ -1,6 +1,6 @@
 PROBABILISTIC FUNDAMENTAL RESEARCH PLATFORM
 Project ambition and handoff for Codex in VS Code
-Consolidated: 10 October 2026
+Consolidated: 11 October 2026
 
 READ THIS BEFORE CHOOSING OR IMPLEMENTING A MAJOR TASK
 
@@ -246,6 +246,26 @@ Batch extraction and let reviewers independently navigate sources. Record prompt
 responses, model identities, critiques, revisions and timestamps. End unresolved
 runs as incomplete without asking a human to pilot each stage. Zero errors cannot
 be guaranteed: source quality, model mistakes and correlated reviewer errors remain.
+
+Initiation must preserve completed work through interruptions and resume compatible
+progress on the next matching request, without repaying for saved AI responses.
+Keep earlier runs and original sources intact, reconstruct independent review
+contexts, and carry one cumulative token/cost history and spending allowance across
+continuations. Freeze the research date and verify code, settings, parsers and
+evidence before reuse; incompatible progress needs an explicit fresh start, never
+an unnoticed paid restart. Record a pending request before sending it and preserve
+returned usage. A lost response with an unknown charge cannot safely permit more
+spending. Resuming an initiation is distinct from refreshing completed research
+with new evidence or accepting unfinished checks.
+
+Historical initiation must include reported quarterly and half-year disclosures,
+as well as annuals, within the selected fiscal years. Preserve cumulative nine-month
+figures separately from standalone quarters, with explicit fiscal dates and stock,
+flow, ratio or average definitions. Respect sales-only releases rather than inventing
+quarterly accounts. Missing disclosures need cited reasons and independent coverage
+review. Overlapping durations must not be added together; any later cross-period
+derivation needs compatible definitions and reporting vintages and must be labelled
+calculated. Cash continuity follows actual balance dates, not column position.
 
 The user authorized three complementary check sets: deterministic reconciliation,
 blind source reconstruction, and an evidence-first completeness/structure review.

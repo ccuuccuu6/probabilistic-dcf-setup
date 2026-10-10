@@ -8,15 +8,21 @@ Alternative providers implement AIProvider without changing the research workflo
 
 from __future__ import annotations
 
+import errno
+from http.client import HTTPException, IncompleteRead
 import json
 import math
 import os
 from pathlib import Path
 import re
+import socket
+import ssl
+from time import monotonic
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 
 ROLE_SETTINGS = {
@@ -309,7 +315,7 @@ def _provider_error_code(error: HTTPError) -> str | None:
     """Expose only known machine codes, never an error body's credential echo."""
     try:
         data = _strict_json(error.read(65537).decode("utf-8"))
-    except (OSError, ValueError, UnicodeError, AttributeError):
+    except (OSError, HTTPException, ValueError, UnicodeError, AttributeError):
         return None
     detail = data.get("error") if isinstance(data, dict) else None
     code = detail.get("code") if isinstance(detail, dict) else None
@@ -318,6 +324,34 @@ def _provider_error_code(error: HTTPError) -> str | None:
                "invalid_request_error", "invalid_value", "unsupported_value",
                "context_length_exceeded", "account_deactivated")
     return code if isinstance(code, str) and code in allowed else None
+
+
+def _transport_failure(error: Exception) -> dict:
+    """Retain diagnostic categories/codes, never exception text or partial bodies."""
+    cause = error.reason if isinstance(error, URLError) and isinstance(error.reason, Exception) else error
+    if isinstance(cause, ssl.SSLCertVerificationError):
+        kind = "tls_certificate_error"
+    elif isinstance(cause, ssl.SSLError):
+        kind = "tls_error"
+    elif (isinstance(cause, TimeoutError) or getattr(cause, "errno", None) == errno.ETIMEDOUT
+          or getattr(cause, "winerror", None) == 10060):
+        kind = "timeout"
+    elif isinstance(cause, socket.gaierror):
+        kind = "dns_error"
+    elif isinstance(cause, ConnectionError):
+        kind = "connection_error"
+    elif isinstance(cause, IncompleteRead):
+        kind = "interrupted_response"
+    elif isinstance(cause, HTTPException):
+        kind = "protocol_error"
+    else:
+        kind = "network_error"
+    detail = {"failure_kind": kind}
+    for name in ("errno", "winerror"):
+        value = getattr(cause, name, None)
+        if type(value) is int:
+            detail[name] = value
+    return detail
 
 
 class OpenAIProvider:
@@ -378,6 +412,7 @@ class OpenAIProvider:
     def metadata(self) -> dict[str, Any]:
         """Safe run provenance; API keys and authorization headers are excluded."""
         return {"provider": "openai_responses", "models": dict(self.models),
+                "endpoint": self.endpoint,
                 "max_output_tokens": self.max_output_tokens, "timeout": self.timeout,
                 "service_tier": "default"}
 
@@ -404,31 +439,50 @@ class OpenAIProvider:
             body["tools"] = [{"type": "web_search"}]
             body["tool_choice"] = "required"
             body["include"] = ["web_search_call.action.sources"]
+        transport = {"client_request_id": str(uuid4()), "timeout_seconds": self.timeout}
         request = Request(
             self.endpoint, data=json.dumps(body, allow_nan=False).encode("utf-8"),
             headers={"Authorization": "Bearer " + self._api_key,
-                     "Content-Type": "application/json"}, method="POST",
+                     "Content-Type": "application/json",
+                     "X-Client-Request-Id": transport["client_request_id"]}, method="POST",
         )
+        started = monotonic()
+        self.last_response = {"status": "transport_error", "_transport": transport}
         try:
             with urlopen(request, timeout=self.timeout) as response:
                 raw = response.read(16 * 1024 * 1024 + 1)
             if len(raw) > 16 * 1024 * 1024:
+                self.last_response["status"] = "response_error"
+                transport["failure_kind"] = "response_too_large"
                 raise AIError("AI response exceeded the 16 MiB safety limit.")
             result = _strict_json(raw.decode("utf-8"))
         except HTTPError as exc:
-            self.last_response = {"status": "transport_error", "http_status": exc.code}
+            self.last_response["http_status"] = exc.code
+            transport["failure_kind"] = "http_error"
             error_code = _provider_error_code(exc)
             if error_code is not None:
                 self.last_response["error_code"] = error_code
             detail = f" ({error_code})" if error_code is not None else ""
             raise AIError(f"AI provider returned HTTP {exc.code}{detail}; no automatic retry.") from None
-        except (URLError, TimeoutError, OSError):
-            self.last_response = {"status": "transport_error"}
-            raise AIError("AI request failed or timed out; no automatic retry.") from None
+        except (URLError, OSError, HTTPException) as exc:
+            transport.update(_transport_failure(exc))
+            elapsed = monotonic() - started
+            codes = ", ".join(f"{name}={transport[name]}" for name in ("errno", "winerror") if name in transport)
+            detail = transport["failure_kind"].replace("_", " ") + (f"; {codes}" if codes else "")
+            raise AIError(f"AI transport failure ({detail}) after {elapsed:.1f}s "
+                          f"(configured timeout {self.timeout:g}s). Client request ID: "
+                          f"{transport['client_request_id']}. Usage and charge are unknown; no automatic retry.") from None
         except (ValueError, UnicodeDecodeError):
+            self.last_response["status"] = "response_error"
+            transport["failure_kind"] = "invalid_json"
             raise AIError("AI provider returned an invalid JSON response.") from None
+        finally:
+            transport["elapsed_seconds"] = round(monotonic() - started, 6)
         if not isinstance(result, dict):
+            self.last_response["status"] = "response_error"
+            transport["failure_kind"] = "invalid_json"
             raise AIError("AI provider returned a non-object response.")
+        result["_transport"] = transport
         self.last_response = result
         if result.get("status") != "completed":
             raise AIError("AI response was incomplete or failed; it cannot be accepted.")

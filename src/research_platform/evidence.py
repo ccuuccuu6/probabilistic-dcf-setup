@@ -257,7 +257,8 @@ class SourceStore:
         self.sources = []
         self._units = {}
 
-    def add(self, spec: dict) -> dict:
+    @staticmethod
+    def _validate_spec(spec: dict):
         if not isinstance(spec, dict) or not all(key in spec for key in ("id", "url", "title", "published_at", "reason", "kind")):
             raise ValueError("Source metadata must include identity, URL, title, publication time, selection reason and kind.")
         if any(not isinstance(spec[key], str) or not spec[key].strip() for key in ("url", "title", "reason", "kind")):
@@ -267,6 +268,28 @@ class SourceStore:
         source_id = spec["id"]
         if not isinstance(source_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,60}", source_id):
             raise ValueError("Invalid source ID.")
+
+    @staticmethod
+    def _index(payload: bytes, file_format: str, source_id: str):
+        """Use the same bounded parser for new and restored originals."""
+        units, text_length = {}, 0
+        for unit in _units(payload, file_format):
+            text_length += len(unit["text"])
+            if len(units) >= MAX_UNITS or text_length > MAX_TEXT:
+                raise ValueError("Source exceeds 3000 units or 3 million extracted characters.")
+            unit["source_id"] = source_id
+            units[unit["unit_id"]] = unit
+        if not units or not text_length:
+            raise ValueError("No readable source text; scanned reports require an OCR-capable adapter.")
+        metadata = {"unit_count": len(units),
+                    "empty_units": [key for key, unit in units.items() if not unit["text"].strip()],
+                    "extraction_warnings": [{"unit_id": key, "messages": unit["warnings"]}
+                                            for key, unit in units.items() if unit.get("warnings")]}
+        return units, metadata
+
+    def add(self, spec: dict) -> dict:
+        self._validate_spec(spec)
+        source_id = spec["id"]
         for existing in self.sources:
             if existing["id"] == source_id:
                 if existing["url"] != spec["url"]:
@@ -296,25 +319,71 @@ class SourceStore:
                            "sha256": hashlib.sha256(payload).hexdigest(), "path": str(path),
                            "format": file_format, "status": "unreadable"})
         self.sources.append(descriptor)
-        units, text_length = {}, 0
         try:
-            for unit in _units(payload, file_format):
-                text_length += len(unit["text"])
-                if len(units) >= MAX_UNITS or text_length > MAX_TEXT:
-                    raise ValueError("Source exceeds 3000 units or 3 million extracted characters.")
-                unit["source_id"] = source_id
-                units[unit["unit_id"]] = unit
-            if not units or not text_length:
-                raise ValueError("No readable source text; scanned reports require an OCR-capable adapter.")
+            units, metadata = self._index(payload, file_format, source_id)
         except Exception as exc:
             descriptor["error"] = str(exc)
             raise
         self._units[source_id] = units
-        descriptor.update({"status": "ready", "unit_count": len(units),
-                           "empty_units": [key for key, unit in units.items() if not unit["text"].strip()],
-                           "extraction_warnings": [{"unit_id": key, "messages": unit["warnings"]}
-                                                   for key, unit in units.items() if unit.get("warnings")]})
+        descriptor.update(status="ready", **metadata)
         return descriptor
+
+    def restore(self, descriptor: dict, *, archive_root: Path) -> dict:
+        """Reopen a verified original without fetching it or rewriting its history.
+
+        The descriptor continues to point at its original run. Only ready sources
+        regain evidence units; an earlier parsing failure cannot become approval
+        merely because a run is resumed.
+        """
+        self._validate_spec(descriptor)
+        required = ("fetched_url", "fetched_at", "sha256", "path", "format", "status")
+        if any(not isinstance(descriptor.get(key), str) or not descriptor[key].strip() for key in required):
+            raise ValueError("Archived source metadata is incomplete.")
+        source_id, file_format = descriptor["id"], descriptor["format"]
+        if file_format not in {"pdf", "xlsx", "html"} or descriptor["status"] not in {"ready", "unreadable"}:
+            raise ValueError("Archived source format or status is invalid.")
+        if not re.fullmatch(r"[0-9a-f]{64}", descriptor["sha256"]):
+            raise ValueError("Archived source hash is invalid.")
+        for existing in self.sources:
+            if existing["id"] == source_id:
+                if existing != descriptor:
+                    raise ValueError("A restored source ID cannot refer to different archived metadata.")
+                return existing
+        if len(self.sources) >= 12:
+            raise ValueError("The run reached its 12-source limit.")
+
+        try:
+            archive_root = Path(archive_root).resolve(strict=True)
+            path = Path(descriptor["path"]).resolve(strict=True)
+            path.relative_to(archive_root)
+        except (OSError, ValueError) as exc:
+            raise ValueError("Archived source is missing or outside the allowed output directory.") from exc
+        if not path.is_file() or path.name != f"{source_id}.{file_format}":
+            raise ValueError("Archived source path does not match its ID and format.")
+        if not 0 < path.stat().st_size <= MAX_BYTES:
+            raise ValueError("Archived source is empty or exceeds 25 MB.")
+        with path.open("rb") as original:
+            payload = original.read(MAX_BYTES + 1)
+        if not payload or len(payload) > MAX_BYTES or hashlib.sha256(payload).hexdigest() != descriptor["sha256"]:
+            raise ValueError("Archived source content does not match its saved hash or size limits.")
+        signature = "pdf" if payload.startswith(b"%PDF") else "xlsx" if payload.startswith(b"PK\x03\x04") else "html"
+        if signature != file_format:
+            raise ValueError("Archived source content does not match its saved format.")
+
+        units = None
+        if descriptor["status"] == "ready":
+            if isinstance(descriptor.get("unit_count"), bool) or not isinstance(descriptor.get("unit_count"), int):
+                raise ValueError("Archived source unit count is invalid.")
+            units, metadata = self._index(payload, file_format, source_id)
+            if any(descriptor.get(key) != value for key, value in metadata.items()):
+                raise ValueError("Archived source extraction metadata changed; saved evidence cannot be replayed.")
+        elif not isinstance(descriptor.get("error"), str) or not descriptor["error"]:
+            raise ValueError("An unreadable archived source must retain its parsing error.")
+        restored = copy.deepcopy(descriptor)
+        self.sources.append(restored)
+        if units is not None:
+            self._units[source_id] = units
+        return restored
 
     def catalog(self, max_units=None) -> list:
         """List stable unit IDs, explicitly marking any requested preview limit."""
