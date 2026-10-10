@@ -58,11 +58,28 @@ Two activities must stay distinct:
 - Research and improvement: discover or challenge relationships, propose alternative
   models/distributions and compare them with an incumbent before promotion.
 
+Company initiation and maintenance use this same cycle. Initiation establishes a
+source-backed reporting map, reconciled history, equations, initial assumptions and
+the first reproducible output. Maintenance evaluates new evidence against that
+baseline, records what changed or why no change was warranted, and recalculates
+affected dependencies. Do not rebuild a company's model from scratch for each item
+of news or let an update erase how an earlier conclusion was reached.
+
 AI should progressively support onboarding, extraction, reconciliation proposals,
 model construction, distribution design, evidence interpretation, relationship
 discovery, review and explanation. Numerical code owns accounting, parameter fitting,
 sampling, valuation, solver calculations and scoring. Do not call an LLM once per
 simulation path or use prose reasoning as the arithmetic engine.
+
+The user's goal is AI-assisted execution and challenge with little routine human
+intervention. Proposed automation uses bounded proposal/review/revision cycles,
+source checks and deterministic accounting checks, with explicit stop and acceptance
+criteria. On failure retain the last valid result and record an exception. Agreement
+between agents is not independent evidence of accuracy. Validate the process on
+reviewed examples and forward outcomes before relying on unattended operation;
+new forecast model structures remain candidates until a documented promotion gate.
+Initial historical models may be accepted automatically by the bounded source,
+accounting and review gates; they do not require a human to pilot each stage.
 
 Research tasks should identify an economic mechanism, observable target, expected
 lag, necessary data, competing explanation, baseline, cost and a way to reject the
@@ -188,7 +205,9 @@ need evidence. Research agents must not silently rewrite production models or hi
   data influenced the change. Begin with evidence that can actually be obtained.
 - Calculation authority: Python. Excel is the review and audit interface. Any
   future Excel input/edit workflow needs an explicit validated import contract;
-  avoid two competing calculation engines.
+  avoid two independently maintained models. Generate Excel calculation views
+  from the same equation definitions, preserving reported evidence and distinguishing
+  live workbook arithmetic from frozen Python/source-review acceptance.
 - Development: the existing Windows VS Code project and its virtual environment.
 - Code organization: one shared repository initially, with company configurations
   and reusable modules. Keep secrets and raw research/output stores out of Git.
@@ -208,19 +227,57 @@ or privacy from local references. Never invent the user's Git identity.
 
 10. DELIVER SMALL COMPLETE STEPS THAT SERVE THE WHOLE SYSTEM
 
-Recommended implementation sequence (execution guidance, not a fixed user mandate):
-1. Finish and verify the local setup and code-history checkpoint.
-2. Define Nestlé's reporting periods, financial rows and metric definitions.
-3. Preserve a small official-source bundle and implement source/fact/version records.
-4. Reconcile history and a compact deterministic financial/cash-flow/valuation model.
-5. Export an inspectable Excel review with source-linked assumptions and checks.
-6. Add defensible uncertainty to selected drivers, with shared coherent factor paths.
-7. Record provisional forecasts as soon as meaningful targets and resolution rules
+The immediate scope, corrected by the user on 10 October 2026, is reusable autonomous
+historical initiation. A company query must trigger AI discovery of legal identity,
+reporting structure and authoritative sources, followed by cited extraction,
+independent challenge, deterministic checks and bounded revisions. Do not require
+a bespoke company extractor or a user-prepared historical model. API credentials
+and model choices are private local settings, separate from tracked code and frozen
+research inputs. Record token usage and dated cost estimates alongside each run;
+select models through measured accuracy/cost comparisons, not assumed agent agreement.
+
+Retrieve original financial disclosures, preserve exact sources and reporting
+versions, build and reconcile history, and provide an inspectable model with empty
+forecast periods and documented accounting links. No forecast values, assumption
+estimation, distributions or DCF belong in this step. Bounded AI orchestration for
+this historical step is now explicitly authorized; earlier deferrals are superseded.
+Numbers must come from archived source locations, never merely AI-generated amounts.
+Batch extraction and let reviewers independently navigate sources. Record prompts,
+responses, model identities, critiques, revisions and timestamps. End unresolved
+runs as incomplete without asking a human to pilot each stage. Zero errors cannot
+be guaranteed: source quality, model mistakes and correlated reviewer errors remain.
+
+The user authorized three complementary check sets: deterministic reconciliation,
+blind source reconstruction, and an evidence-first completeness/structure review.
+Record independent facts and expected disclosures before revealing the proposed
+answers; compare meanings and amounts afterward, without using peer approval as
+evidence. Rerun checks after revisions and preserve disagreements. Permit documented
+reporting differences and period-specific adjustments instead of forcing balances
+or inventing historical zeros. Separate reviewer contexts improve the process but
+do not establish statistically independent errors or a numerical confidence level.
+
+The preserved first Nestlé example uses the user's selected 2024–2025 annual coverage
+on the FY2025 publication basis. It is a comparison reference for the generic process,
+not the initiation architecture. Later segment restatements are separate reporting
+versions, not silent relabelings. README distinguishes offline workflow tests from
+live AI research, provider configuration and outstanding accuracy validation.
+
+Implementation sequence, with later stages remaining roadmap rather than current scope:
+1. Discover a requested company's identity, reporting periods, authoritative sources,
+   financial rows and definitions through the reusable AI workflow.
+2. Preserve originals, extract history in cited batches, independently review sources
+   and structure, reconcile accounting and revise within bounds. Export accepted
+   history with blank forecasts, or explicit incomplete results. Validate first on
+   Nestlé and then unrelated real companies; synthetic fixtures prove mechanics only.
+3. Develop supported operating drivers and linked forecast equations, then a separate
+   DCF. Do not impose forecast policies while still establishing reported history.
+4. Add defensible uncertainty to selected drivers, with shared coherent factor paths.
+5. Record provisional forecasts as soon as meaningful targets and resolution rules
    exist; add reverse valuation alongside or afterward. Its completion must not
    delay the first useful forecast record.
-8. Make evidence updates repeatable, explainable and versioned; demonstrate a second
+6. Make evidence updates repeatable, explainable and versioned; demonstrate a second
    company can reuse the evidence and factor engine with limited adapter changes.
-9. Extend catalyst analysis, AI research and candidate evaluation as the required
+7. Extend catalyst analysis, AI research and candidate evaluation as the required
    inputs and forward outcomes become available; automate stable stages progressively.
 
 These steps refine the existing milestones rather than restart the project. Dates,
@@ -257,7 +314,10 @@ Make this brief a required reference in AGENTS.md while preserving its economic 
 Maintain short current-state, next-milestone and dated-decision sections in README.md.
 Record implemented capabilities, verification, open issues and material choices with
 their reasons. Update those sections after meaningful work so continuity does not
-rely on chat memory. Label confirmed decisions, proposals and unresolved questions.
+rely on chat memory. Also capture material requirements, decisions and open questions
+from substantive discussions when no code changes. Update the appropriate existing
+document rather than copying every detail into all three. Label confirmed decisions,
+proposals and unresolved questions; discussion of a plan does not authorize building it.
 The user's 10 October 2026 cleanup instruction supersedes the earlier separate
 documentation files. Use README.md, AGENTS.md and this brief for now; add another
 document, code module or runtime directory only when an implemented capability
@@ -279,16 +339,43 @@ current decisions and verified implementation.
 Consolidated from the former architecture document during the 10 October 2026
 cleanup. These are implementation principles and proposals, not built capabilities.
 
+Operating model and valuation:
+- Start with disclosed operating segments, then reconcile corporate/unallocated
+  items into the group income statement. Link the balance sheet and cash-flow
+  statement through working capital, investment/depreciation, cash, debt, interest,
+  leases, equity movements and share-count schedules as applicable. Preserve both
+  historical observations and future periods; distinguish reported, calculated,
+  estimated and missing values. Segment definitions and restatements need versions.
+- Do not fabricate undisclosed segment balance sheets or add overlapping product
+  and geographic sales views together. Each scenario must satisfy accounting and
+  cash/debt identities, with an explicit financing convention rather than arbitrary
+  balancing entries. Use fundamental drivers at a granularity the evidence supports.
+- Keep the DCF separate from operating equations. Its purpose is to translate
+  coherent operating cash flows into estimated fundamental value per share, not
+  create operating forecasts or establish a distribution of future traded prices.
+  A reusable dcf.py is proposed when the calculation is implemented. Explicit
+  policies must connect operating cash flow to valuation cash flow, discount and
+  terminal assumptions, and the enterprise-to-equity bridge without double counting.
+- Proposed model.xlsx and dcf.xlsx exports would share a run and frozen inputs;
+  Python remains the calculation authority. Expose sources, assumptions, calculations
+  and checks without fragile links to another editable workbook. Show a selected
+  coherent scenario separately from distribution summaries: independent row medians
+  need not form a balanced financial statement.
+
 Code and storage:
-- The present flat Python package contains project/configuration checks, shared FX
-  arithmetic and the synthetic demo. No financial-model package is needed yet.
-- When implementing Nestlé's model, start with src/research_platform/nestle.py.
-  Separate reusable equations when real complexity or reuse warrants it. Do not
-  force company differences into one generic formula or build sector templates
-  before a second use establishes the common economics.
-- Keep company identity and structural definitions in configs/. Evolving estimates,
-  observations and distribution parameters do not belong in configuration or equations.
-- Proposed local_store/research.sqlite holds source identity/availability, extracted
+- Keep the package flat and small. Separate responsibilities within cohesive code;
+  a future capability does not automatically justify a module or directory now.
+  README owns which components are written, executed and verified. The historical
+  initiation step should not recreate the deleted full-platform scaffolding.
+- Company-specific reporting definitions and source mappings belong in versioned
+  initiation results, separate from reusable API, source and workflow code. Do not
+  force company differences into one generic formula. Unsupported economics or
+  missing disclosures remain explicit gaps rather than invented template inputs.
+- Initiation must not require a pre-existing company configuration. Existing configs/
+  contains setup identities/topics; discovered identity and reporting definitions
+  are frozen in the run. A later maintained baseline needs explicit versioning and
+  promotion rules. Evolving estimates and observations are not editable equations.
+- A proposed later local_store/research.sqlite design holds source identity/availability, extracted
   facts, distribution versions and company mappings in distinct records. Original
   documents belong in local_store/raw_sources/. Use one storage-access boundary;
   financial equations must not query storage directly. Create these only when needed.
@@ -296,6 +383,12 @@ Code and storage:
   family/representation, parameters and support, dependency/persistence specification,
   evidence, estimation method, judgment/calibration status, version and availability.
   A company exposure is separate from the distribution of a shared factor.
+- Link every material assumption revision to the evidence, calculation or qualitative
+  interpretation supporting it, the previous version and the estimation/update method.
+  Preserve decisions to retain, reject or defer an update as well as accepted changes.
+  When AI is introduced, record prompts, model identifiers, outputs and review results
+  alongside their input versions. Store equation/method versions once and reference
+  them from calculations; do not duplicate editable formulas throughout the database.
 - Select explicit versions using a coherent snapshot and information cutoff, validate
   definitions/currencies/periods, then freeze inputs. Missing material assumptions
   remain gaps or errors; do not invent defaults or fetch newer inputs during a run.

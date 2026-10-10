@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "probabilistic-dcf-setup"
 version = "0.1.0"
-description = "A small local research-platform setup and synthetic shared-FX demonstration"
+description = "Local AI-driven historical company initiation and a synthetic shared-FX demonstration"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["openpyxl==3.1.5", "pypdf[crypto]==6.20.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
