@@ -62,10 +62,14 @@ def main() -> int:
     commands.add_parser("doctor", help="Check the project, Python and installed dependencies without API calls")
     api_check = commands.add_parser("api-check", help="Make one small paid API call and show reported token usage")
     api_check.add_argument("--role", choices=["researcher", "extractor", "reviewer"], default="extractor")
-    initiate = commands.add_parser("initiate", help="Research and check a company's historical model using configured AI APIs")
+    initiate = commands.add_parser("initiate", help="Build and check historical accounts from a local company archive using configured AI APIs")
     initiate.add_argument("company", help="Company name, ideally with ticker/exchange/country")
-    initiate.add_argument("--years", nargs="+", type=int,
-                          help="Fiscal years including reported quarters, halves and YTD; default: latest two complete fiscal years")
+    initiate.add_argument("--sources", required=True, help="Local company archive containing financial_reports/, visible_alpha/ and optional transcripts/")
+    history = initiate.add_mutually_exclusive_group()
+    history.add_argument("--years", nargs="+", type=int,
+                         help="Explicit fiscal years, including reported quarters, halves and YTD")
+    history.add_argument("--history-years", type=int, default=10,
+                         help="Latest fully reported fiscal years evidenced in the archive (default: 10)")
     initiate.add_argument("--forecast-years", type=int, default=5, help="Number of empty forecast columns (default: 5)")
     initiate.add_argument("--budget-usd", type=float, default=20.0,
                           help="Stop at this cumulative estimated USD cost (default and maximum: 20); last request can overshoot")
@@ -83,7 +87,7 @@ def main() -> int:
             print(f"Virtual environment: {'active' if sys.prefix != sys.base_prefix else 'not active; recommended'}")
             print(f"Git executable: {'available' if shutil.which('git') else 'not on PATH; install Git for publishing later'}")
             try:
-                for package in ("openpyxl", "pypdf"):
+                for package in ("openpyxl", "pypdf", "xlrd"):
                     print(f"{package}: {version(package)}")
             except PackageNotFoundError as error:
                 raise ValueError("A required package is missing; install the project with python -m pip install -e .") from error
@@ -111,9 +115,10 @@ def main() -> int:
         else:
             from research_platform.initiation import initiate_company
             from research_platform.project import read_json
-            print("Researching annual and reported interim accounts through configured AI APIs; forecast columns remain empty.", flush=True)
-            print(f"Estimated cost stop: ${arguments.budget_usd:.2f}. Usage is reported after each request; the last request can cross the threshold.", flush=True)
+            print("Reading local annual and reported interim sources; no browser search. Forecast columns remain empty.", flush=True)
+            print(f"Estimated cost stop: ${arguments.budget_usd:.2f}, with a conservative allowance checked before each request. Actual billing is known afterward.", flush=True)
             directory = initiate_company(root, arguments.company, years=arguments.years,
+                                         historical_years=arguments.history_years, source_directory=arguments.sources,
                                          forecast_years=arguments.forecast_years, max_cost_usd=arguments.budget_usd,
                                          progress=TerminalProgress(), resume=arguments.resume, fresh=arguments.fresh)
             record = read_json(directory / "record.json")

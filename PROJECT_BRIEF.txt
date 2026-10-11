@@ -227,22 +227,29 @@ or privacy from local references. Never invent the user's Git identity.
 
 10. DELIVER SMALL COMPLETE STEPS THAT SERVE THE WHOLE SYSTEM
 
-The immediate scope, corrected by the user on 10 October 2026, is reusable autonomous
-historical initiation. A company query must trigger AI discovery of legal identity,
-reporting structure and authoritative sources, followed by cited extraction,
+The immediate scope, corrected on 10 October and updated on 11 October 2026, is
+reusable historical initiation from a company query and local source archive.
+AI establishes legal identity, reporting structure and authoritative evidence
+within supplied originals, followed by cited extraction,
 independent challenge, deterministic checks and bounded revisions. Do not require
 a bespoke company extractor or a user-prepared historical model. API credentials
 and model choices are private local settings, separate from tracked code and frozen
 research inputs. Record token usage and dated cost estimates alongside each run;
 select models through measured accuracy/cost comparisons, not assumed agent agreement.
 
-Retrieve original financial disclosures, preserve exact sources and reporting
+Use the user's original vendor exports and company financial disclosures, preserve exact sources and reporting
 versions, build and reconcile history, and provide an inspectable model with empty
 forecast periods and documented accounting links. No forecast values, assumption
 estimation, distributions or DCF belong in this step. Bounded AI orchestration for
 this historical step is now explicitly authorized; earlier deferrals are superseded.
 Numbers must come from archived source locations, never merely AI-generated amounts.
-Batch extraction and let reviewers independently navigate sources. Record prompts,
+Supply whole selected documents, with all extracted text and numeric indexes, to
+the extractor and each independently navigating reviewer. Keep opened documents in
+that context's later calls; do not cut off notes or definitions with page batching
+or application character caps. Exact page/cell references remain necessary for
+citations. Financial rows may be produced/reviewed in groups without splitting their
+source context. Provider capacity and cost still apply; fail explicitly rather than
+silently trimming documents. Record prompts,
 responses, model identities, critiques, revisions and timestamps. End unresolved
 runs as incomplete without asking a human to pilot each stage. Zero errors cannot
 be guaranteed: source quality, model mistakes and correlated reviewer errors remain.
@@ -267,6 +274,50 @@ review. Overlapping durations must not be added together; any later cross-period
 derivation needs compatible definitions and reporting vintages and must be labelled
 calculated. Cash continuity follows actual balance dates, not column position.
 
+The standard historical request is ten completed fiscal years and their reported
+interims; the initial two-year Nestlé example remains a validation slice. On 11 October
+2026 the user authorized local Visible Alpha exports and manually collected company
+documents in place of wide browser discovery. This changes evidence acquisition,
+not the reusable modelling/checking engine or the need for independent company
+source verification. A raw export is not a user-completed historical model. Current
+vendor history is not automatically point-in-time evidence; actuals, estimates,
+adjusted measures and reporting vintages remain distinguishable.
+
+The supplied Visible Alpha consensus workbook contains both historical actuals and
+future consensus. The user has selected its lower company-specific/reporting tables
+as the historical starting point; the upper standardized tables through Ratios are
+excluded as model inputs. Prefer eligible Filings cells, then VA Actuals with
+independent support; neither the section location nor a vendor actual label proves
+direct company reporting. Preserve inferred-quarter, definition and vintage issues.
+Use a generic recognized export layout and exact cell references, never Nestle row
+numbers or hardcoded financial mappings. Unknown layouts fall back to company sources.
+
+An explicit vendor-table exception to whole-document AI inputs is authorized for
+this scope: Python prepares a labelled historical view of company metric rows and
+requested-year actual/filing cells, preserving relevant labels, notes, units, legends,
+missing markers and original citation indexes. The complete workbook remains intact;
+standardized, helper and consensus values are excluded from the historical prompt.
+Company documents still receive whole-document treatment. Consensus is retained
+for later dated comparison/research, not imported as historical actuals, current
+forecast values or the system's independent assumptions. No consensus engine is
+implemented in this step. README records actual workbook inspection and verification.
+
+Use explicit reporting versions and a dated change ledger for accounting standards,
+consolidation/perimeter, discontinued operations, segments/geographies, definitions,
+units and restatements. Reuse compatible concepts, but preserve distinct historical
+row identities for changed regions. Equations and calculated compositions can vary
+by period. Apply published recasts only where supported; otherwise show a break in
+comparability rather than inventing ten years on today's structure. A cross-year
+review must challenge missing changes and splices, beyond each year's checks.
+
+Annual tasks may use separate contexts, with complete selected documents retained
+inside each task and all evidence preserved in the run. Numerical code reads source
+cells and calculates; AI interprets and challenges. Stable document messages and
+conservative pre-request spending allowances control cost without weakening checks
+or silently changing models. README owns concrete limits, settings and verification.
+Do not extrapolate failed acquisition-loop spending into per-year prices or promise
+ten-year affordability/near-perfect accuracy without completed real benchmarks.
+
 The user authorized three complementary check sets: deterministic reconciliation,
 blind source reconstruction, and an evidence-first completeness/structure review.
 Record independent facts and expected disclosures before revealing the proposed
@@ -283,9 +334,9 @@ versions, not silent relabelings. README distinguishes offline workflow tests fr
 live AI research, provider configuration and outstanding accuracy validation.
 
 Implementation sequence, with later stages remaining roadmap rather than current scope:
-1. Discover a requested company's identity, reporting periods, authoritative sources,
-   financial rows and definitions through the reusable AI workflow.
-2. Preserve originals, extract history in cited batches, independently review sources
+1. Establish a requested company's identity, reporting periods, authoritative evidence,
+   financial rows and definitions from its local archive through the reusable AI workflow.
+2. Preserve originals, extract cited history with whole-document context, independently review sources
    and structure, reconcile accounting and revise within bounds. Export accepted
    history with blank forecasts, or explicit incomplete results. Validate first on
    Nestlé and then unrelated real companies; synthetic fixtures prove mechanics only.
@@ -395,10 +446,12 @@ Code and storage:
   setup configs and synthetic FX demo were removed to keep the active code focused.
   Discovered identity and reporting definitions are frozen in the run. A later maintained baseline needs explicit versioning and
   promotion rules. Evolving estimates and observations are not editable equations.
-- A proposed later local_store/research.sqlite design holds source identity/availability, extracted
-  facts, distribution versions and company mappings in distinct records. Original
-  documents belong in local_store/raw_sources/. Use one storage-access boundary;
-  financial equations must not query storage directly. Create these only when needed.
+- A proposed later local_store/research.sqlite design could hold source identity/availability,
+  extracted facts, distribution versions and company mappings in distinct records.
+  Current originals use local_store/<company>/ with source categories; do not create
+  a second raw_sources archive or database merely to implement this future proposal.
+  Use one storage-access boundary if needed later; financial equations must not query
+  storage directly. Create new infrastructure only for an implemented requirement.
 - Distribution records identify driver, shared/company scope, units, period coverage,
   family/representation, parameters and support, dependency/persistence specification,
   evidence, estimation method, judgment/calibration status, version and availability.

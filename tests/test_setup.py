@@ -515,6 +515,7 @@ class InitiationTests(unittest.TestCase):
         # These financial scenarios intentionally start independent runs. Resume
         # behavior has separate tests with the public default preserved.
         kwargs.setdefault("fresh", True)
+        kwargs.setdefault("historical_years", 2)
         directory = initiate_company(self.root, company.name, provider=provider, fetcher=company.fetch,
                                      **kwargs)
         record = json.loads((directory / "record.json").read_text(encoding="utf-8"))
@@ -959,6 +960,72 @@ class InitiationTests(unittest.TestCase):
         self.assertTrue(provider.searched_context)
         self.assertTrue(provider.requested_context)
         self.assertGreaterEqual(sum(call["stage"] == "model_review" for call in provider.calls), 3)
+
+    def test_whole_documents_reach_extraction_and_independent_reviews_without_character_caps(self):
+        company = SyntheticCompany()
+        book = load_workbook(io.BytesIO(company.payload()))
+        sheet = book.active
+        # Make source context exceed both former read and AI payload caps, and
+        # place a meaningful note outside the first 60 catalog previews.
+        for _ in range(45):
+            sheet.append(["Synthetic documentary context. " * 250])
+        late_note = "MATERIAL LATE NOTE: reported debt excludes supplier financing."
+        sheet.append([late_note])
+        final_unit = f"{company.sheet}!R{sheet.max_row}"
+        output = io.BytesIO()
+        book.save(output)
+        original = output.getvalue()
+        supplement = dict(company.source, id="supplement", url="https://example.invalid/supplement.html",
+                          title="SYNTHETIC SUPPLEMENT", kind="results")
+        company.discovery["sources"].append(supplement)
+
+        def fetch(url):
+            if url == supplement["url"]:
+                return b"<p>Synthetic subsequent documentary context.</p>", url, "text/html"
+            return original, url, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+        company.fetch = fetch
+
+        class DocumentReader(ScriptedProvider):
+            def complete(self, **kwargs):
+                result = super().complete(**kwargs)
+                payload = kwargs["payload"]
+                if payload["stage"] == "extract" and result["action"] == "propose":
+                    if not any(unit["source_id"] == "supplement" for unit in payload["evidence"]):
+                        result.update(action="read", candidate=None, read_requests=[
+                            {"source_id": "supplement", "unit_id": "chunk:1"}])
+                        return result
+                if result.get("read_requests"):
+                    # Selecting one unit must deliver every unit of that source.
+                    result["read_requests"] = result["read_requests"][:1]
+                return result
+
+        directory, record, provider = self.run_case(company, DocumentReader(company))
+        self.assertEqual(record["status"], "accepted", record["issues"])
+        self.assertTrue((directory / "model.xlsx").exists())
+        extraction = [call for call in provider.calls if call["stage"] == "extract"]
+        self.assertEqual({unit["source_id"] for unit in extraction[-1]["evidence"]},
+                         {"annual", "supplement"})
+        self.assertGreater(len(json.dumps(extraction[-1])), 260_000)
+        for stage in ("extract", "source_review", "source_alignment", "coverage_inventory", "model_review"):
+            calls = [call for call in provider.calls if call["stage"] == stage]
+            if stage in ("source_review", "coverage_inventory", "model_review"):
+                self.assertEqual(calls[0]["evidence"], [], stage)
+            received = [call for call in calls if call["evidence"]]
+            self.assertTrue(received, stage)
+            for call in received:
+                with self.subTest(stage=stage):
+                    source = next(item for item in call["catalog"] if item["id"] == "annual")
+                    self.assertTrue(source["catalog_truncated"])
+                    self.assertNotIn(final_unit, [unit["id"] for unit in source["units"]])
+                    annual = [unit for unit in call["evidence"] if unit["source_id"] == "annual"]
+                    self.assertEqual(len(annual), source["unit_count"])
+                    self.assertEqual(len({unit["unit_id"] for unit in annual}), len(annual))
+                    self.assertIn(late_note, next(unit["text"] for unit in annual
+                                                 if unit["unit_id"] == final_unit))
+                    self.assertGreater(sum(len(unit["text"]) for unit in annual), 260_000)
+                    if stage in ("source_review", "coverage_inventory", "model_review"):
+                        self.assertNotIn("supplement", {unit["source_id"] for unit in call["evidence"]})
 
     def test_every_required_review_must_be_present_and_pass(self):
         for fault in ("missing_source", "duplicate_source", "missing_source_context", "missing_alignment",
@@ -1533,7 +1600,7 @@ class InitiationTests(unittest.TestCase):
     def test_useful_progress_can_exceed_former_request_and_navigation_ceilings(self):
         class ManySteps(ScriptedProvider):
             saves = 0
-            reviewer_reads = 0
+            reviewer_searches = 0
 
             def complete(self, **kwargs):
                 payload = kwargs["payload"]
@@ -1545,14 +1612,12 @@ class InitiationTests(unittest.TestCase):
                     row["definition"] += f" Synthetic draft revision {self.saves}."
                     return {"action": "save_rows", "read_requests": [], "sources": [], "rows": [row],
                             "delete_row_ids": [], "search_query": "", "candidate": None}
-                if payload["stage"] == "model_review" and self.reviewer_reads < 7:
-                    refs = [{"source_id": source["id"], "unit_id": unit["id"]}
-                            for source in payload["catalog"] for unit in source["units"]]
-                    ref = refs[self.reviewer_reads]
-                    self.reviewer_reads += 1
+                if payload["stage"] == "model_review" and self.reviewer_searches < 7:
+                    query = self.company.rows[self.reviewer_searches]["label"]
+                    self.reviewer_searches += 1
                     self.calls.append(copy.deepcopy(payload))
                     self.last_response = self.synthetic_response("model_review")
-                    return {"checks": [], "matches": [], "issues": [], "search_query": "", "read_requests": [ref]}
+                    return {"checks": [], "matches": [], "issues": [], "search_query": query, "read_requests": []}
                 return super().complete(**kwargs)
 
         company = SyntheticCompany()
@@ -1735,6 +1800,7 @@ class ResumeTests(unittest.TestCase):
 
     def run_company(self, provider=None, **kwargs):
         provider = provider or self.Provider(self.company)
+        kwargs.setdefault("historical_years", 2)
         directory = initiate_company(self.root, self.company.name, provider=provider,
                                      fetcher=self.company.fetch, **kwargs)
         return directory, read_json(directory / "record.json"), provider
@@ -1965,7 +2031,7 @@ class ResumeTests(unittest.TestCase):
         original = (accepted / "record.json").read_bytes()
         provider = self.Provider(self.company)
         query = "  " + self.company.name.upper().replace(" ", "   ") + "  "
-        reused = initiate_company(self.root, query, provider=provider, fetcher=self.company.fetch)
+        reused = initiate_company(self.root, query, provider=provider, fetcher=self.company.fetch, historical_years=2)
         self.assertEqual(reused, accepted)
         self.assertEqual(provider.calls, [])
         self.assertEqual((accepted / "record.json").read_bytes(), original)
@@ -2315,6 +2381,59 @@ class WorkbookTests(unittest.TestCase):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_document_reads_preserve_all_units_order_citations_and_isolation(self):
+        first, second = SyntheticCompany(), SyntheticCompany(1)
+        sources = {first.source["url"]: first, second.source["url"]: second}
+
+        def fetch(url):
+            return sources[url].fetch(url)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SourceStore(Path(temporary), fetcher=fetch)
+            store.add(first.source)
+            store.add(dict(second.source, id="comparison"))
+            selected = [
+                {"source_id": "comparison", "unit_id": f"{second.sheet}!R3"},
+                {"source_id": "annual", "unit_id": f"{first.sheet}!R3"},
+                {"source_id": "comparison", "unit_id": f"{second.sheet}!R1"},
+            ]
+            result = store.read_documents(selected)
+            catalog = {source["id"]: source for source in store.catalog()}
+            expected = [(source_id, unit["id"]) for source_id in ("comparison", "annual")
+                        for unit in catalog[source_id]["units"]]
+            self.assertEqual([(unit["source_id"], unit["unit_id"]) for unit in result], expected)
+            self.assertEqual(len(store.read([selected[0]])), 1)
+            self.assertEqual(store.read_documents([]), [])
+            reference = first.rows[0]["observations"][0]["reference"]
+            token = next(unit for unit in result if unit["source_id"] == "annual"
+                         and unit["unit_id"] == reference["unit_id"])["numbers"][0]
+            self.assertEqual(token, store.read([reference])[0]["numbers"][0])
+            token["raw"] = 999999
+            self.assertEqual(store.resolve(reference), first.display_values[first.rows[0]["id"]][0])
+            for invalid in ({"source_id": "annual", "unit_id": "missing"},
+                            {"source_id": "missing", "unit_id": f"{first.sheet}!R1"}):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    store.read_documents([*selected, invalid])
+
+    def test_large_html_line_is_indexed_and_read_without_character_truncation(self):
+        context = "Synthetic qualitative context. " * 100_001
+        tail = "FINAL DISCLOSURE: reported revenue 42"
+        self.assertGreater(len(context), 3_000_000)
+        payload = ("<p>" + context + tail + "</p>").encode("utf-8")
+        company = SyntheticCompany()
+        with tempfile.TemporaryDirectory() as temporary:
+            store = SourceStore(Path(temporary), fetcher=lambda url: (payload, url, "text/html"))
+            store.add(company.source)
+            reference = {"source_id": "annual", "unit_id": "chunk:1"}
+            exact = store.read([reference])
+            whole = store.read_documents([reference])
+            self.assertEqual(exact, whole)
+            self.assertEqual(len(whole), 1)
+            self.assertEqual(whole[0]["text"], context + tail)
+            number = next(token for token in whole[0]["numbers"] if token["raw"] == "42")
+            self.assertEqual(store.resolve(dict(reference, number_index=number["index"],
+                                                number_format="dot_decimal")), 42)
+
     def test_native_spreadsheet_numbers_use_displayed_precision(self):
         book = Workbook()
         sheet = book.active
@@ -2788,6 +2907,1298 @@ class AIUsageTests(unittest.TestCase):
                 self.assertTrue(usage["reported"])
                 self.assertEqual(usage["total_tokens"], 1100)
                 self.assertAlmostEqual(usage["estimated_cost_usd"], 0.00015)
+
+
+class ApiCostEffortTests(unittest.TestCase):
+    def provider(self, **kwargs):
+        return OpenAIProvider(api_key="SYNTHETIC-SECRET", models={
+            role: "gpt-6.1-sol" for role in ("researcher", "extractor", "reviewer")}, **kwargs)
+
+    def arguments(self, payload):
+        return {"role": "extractor", "instructions": "Synthetic document mapping",
+                "payload": payload, "schema": {"type": "object"}}
+
+    def test_full_documents_have_stable_boundaries_without_duplicate_dynamic_context(self):
+        provider = self.provider()
+        units = [{"source_id": "a", "unit_id": "page-1", "text": "Original text " * 30000,
+                  "numbers": [{"raw": "12", "index": 0}]},
+                 {"source_id": "a", "unit_id": "page-2", "text": "Important late note", "numbers": []}]
+        original = {"evidence": units, "feedback": ["first"]}
+        untouched = copy.deepcopy(original)
+        first = provider._request_body(**self.arguments(original))
+        appended = {"source_id": "b", "unit_id": "sheet!R1", "text": "Other document", "numbers": []}
+        second = provider._request_body(**self.arguments(
+            {"evidence": [*units, appended], "feedback": ["changed"]}))
+        self.assertEqual(original, untouched)
+        self.assertEqual(first["input"][0], second["input"][0])
+        self.assertEqual(len(first["input"]), 2)
+        self.assertEqual(len(second["input"]), 3)
+        supplied = json.loads(first["input"][0]["content"][0]["text"])
+        self.assertEqual(supplied["evidence"], units)
+        dynamic = json.loads(second["input"][-1]["content"][0]["text"])
+        self.assertEqual(dynamic["evidence"]["source_ids"], ["a", "b"])
+        self.assertNotIn("Important late note", second["input"][-1]["content"][0]["text"])
+        self.assertEqual(json.loads(provider._request_body(**self.arguments(
+            {"evidence": [], "feedback": []}))["input"][0]["content"][0]["text"])["evidence"], [])
+
+    def test_identical_references_deduplicate_but_conflicting_evidence_never_does(self):
+        provider = self.provider()
+        unit = {"source_id": "a", "unit_id": "page-1", "text": "10", "numbers": []}
+        body = provider._request_body(**self.arguments({"evidence": [unit, copy.deepcopy(unit)]}))
+        self.assertEqual(json.loads(body["input"][0]["content"][0]["text"])["evidence"], [unit])
+        with self.assertRaisesRegex(AIError, "Conflicting"):
+            provider._request_body(**self.arguments({"evidence": [unit, dict(unit, text="20")]}))
+
+    def test_catalog_is_an_intact_stable_prefix_before_selected_documents(self):
+        provider = self.provider()
+        catalog = [{"id": "a", "title": "Whole annual report", "category": "financial_reports",
+                    "units": [{"id": "page-1", "preview": "Unique navigation preview", "number_count": 2}]},
+                   {"id": "b", "title": "Official historical tables", "category": "financial_reports", "units": []}]
+        first_unit = {"source_id": "a", "unit_id": "page-1", "text": "Complete original text", "numbers": []}
+        second_unit = {"source_id": "b", "unit_id": "Table!R1", "text": "Full spreadsheet row", "numbers": []}
+        original = {"catalog": catalog, "evidence": [], "feedback": []}
+        untouched = copy.deepcopy(original)
+        first = provider._request_body(**self.arguments(original))
+        after_read = provider._request_body(**self.arguments(
+            {"catalog": catalog, "evidence": [first_unit], "feedback": ["changed task state"]}))
+        after_second = provider._request_body(**self.arguments(
+            {"catalog": catalog, "evidence": [first_unit, second_unit], "feedback": ["changed again"]}))
+        self.assertEqual(original, untouched)
+        self.assertEqual(first["input"][0], after_read["input"][0])
+        self.assertEqual(after_read["input"][:2], after_second["input"][:2])
+        self.assertEqual(json.loads(first["input"][0]["content"][0]["text"])["catalog"], catalog)
+        self.assertEqual(json.loads(after_read["input"][1]["content"][0]["text"])["evidence"], [first_unit])
+        self.assertNotIn("Unique navigation preview", after_second["input"][-1]["content"][0]["text"])
+        self.assertEqual(json.loads(after_second["input"][-1]["content"][0]["text"])["catalog"]["source_count"], 2)
+
+    def test_filtered_review_catalog_never_inherits_other_roles_sources_or_reads(self):
+        provider = self.provider()
+        primary = {"id": "annual", "category": "financial_reports", "title": "Public original"}
+        vendor = {"id": "vendor", "category": "visible_alpha", "title": "Vendor-only context"}
+        provider._request_body(**self.arguments({"catalog": [primary, vendor], "evidence": [
+            {"source_id": "vendor", "unit_id": "sheet!R1", "text": "Prior proposed value", "numbers": []}]}))
+        arguments = dict(self.arguments({"catalog": [primary], "evidence": [], "concepts": []}), role="reviewer")
+        blind = provider._request_body(**arguments)
+        self.assertEqual(len(blind["input"]), 2)
+        self.assertEqual(json.loads(blind["input"][0]["content"][0]["text"])["catalog"], [primary])
+        self.assertEqual(json.loads(blind["input"][-1]["content"][0]["text"])["evidence"], [])
+        self.assertNotIn("Vendor-only context", json.dumps(blind))
+        self.assertNotIn("Prior proposed value", json.dumps(blind))
+        self.assertIn("catalog-and-whole-document-prefix", provider.metadata()["prompt_layout"])
+
+    def test_effort_defaults_and_settings_are_explicit_in_request_and_resume_metadata(self):
+        baseline = self.provider()
+        self.assertEqual(baseline._request_body(**self.arguments({}))["reasoning"],
+                         {"effort": "medium", "mode": "standard"})
+        self.assertEqual(baseline.metadata()["reasoning_efforts"],
+                         dict.fromkeys(("researcher", "extractor", "reviewer"), "medium"))
+        changed = self.provider(reasoning_efforts={"extractor": "high"})
+        self.assertNotEqual(changed.metadata(), baseline.metadata())
+        with tempfile.TemporaryDirectory() as temporary:
+            env_file = Path(temporary) / ".env"
+            env_file.write_text("OPENAI_API_KEY=SYNTHETIC-SECRET\n"
+                "RESEARCH_MODEL=gpt-6.1-sol\nEXTRACTION_MODEL=gpt-6.1-sol\nREVIEW_MODEL=gpt-6.1-sol\n"
+                "EXTRACTION_REASONING_EFFORT=high\nREVIEW_REASONING_EFFORT=high\n", encoding="utf-8")
+            with patch.dict(os.environ, {"REVIEW_REASONING_EFFORT": "medium"}, clear=True):
+                configured = OpenAIProvider.from_env(env_file)
+                configured.validate_configuration()
+            self.assertEqual(configured.reasoning_efforts,
+                             {"researcher": "medium", "extractor": "high", "reviewer": "medium"})
+            self.assertNotIn("SYNTHETIC-SECRET", json.dumps(configured.metadata()))
+
+    def test_invalid_effort_is_rejected_before_a_request(self):
+        for effort in ("", "extreme", None, [], "SYNTHETIC-SECRET"):
+            with self.subTest(effort=effort), patch("research_platform.ai.urlopen") as network:
+                provider = self.provider(reasoning_efforts={"extractor": effort})
+                with self.assertRaises(AIError) as raised:
+                    provider.complete(**self.arguments({}))
+                self.assertNotIn("SYNTHETIC-SECRET", str(raised.exception))
+                network.assert_not_called()
+
+    def test_local_allowance_reserves_input_and_full_output_without_spending_or_usage(self):
+        provider = self.provider()
+        with patch("research_platform.ai.urlopen") as network:
+            small = provider.estimate_request_cost(**self.arguments({"text": "tiny"}))
+            large = provider.estimate_request_cost(**self.arguments({"text": "x" * 280000}))
+            unknown_web = provider.estimate_request_cost(**self.arguments({}), web=True)
+            network.assert_not_called()
+        self.assertIsNone(provider.last_response)
+        self.assertFalse(small["is_exact"])
+        self.assertGreaterEqual(small["estimated_input_tokens"], 2048)
+        self.assertAlmostEqual(small["estimated_cost_usd"],
+                               (small["estimated_input_tokens"] * 2.5 + 16000 * 10) / 1_000_000)
+        self.assertAlmostEqual(large["estimated_cost_usd"],
+                               (large["estimated_input_tokens"] * 5 + 16000 * 15) / 1_000_000)
+        self.assertGreater(large["estimated_cost_usd"], small["estimated_cost_usd"])
+        self.assertIsNone(unknown_web["estimated_cost_usd"])
+
+
+class LocalSourceTests(unittest.TestCase):
+    """Local originals remain reproducible evidence, never implicit API input."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.archive = self.root / "company"
+        (self.archive / "financial_reports").mkdir(parents=True)
+
+    def inventory(self):
+        from research_platform.evidence import inventory_local_sources
+        return inventory_local_sources(self.archive)
+
+    @staticmethod
+    def legacy_workbook(*, cached_formula=False, empty_formula=False):
+        """A tiny independent BIFF8 fixture: a label and one numeric/formula cell."""
+        import struct
+
+        def record(code, data):
+            return struct.pack("<HH", code, len(data)) + data
+
+        def beginning(kind):
+            return record(0x0809, struct.pack("<HHHHII", 0x0600, kind, 0x0DBB, 1997, 0, 0x0600))
+
+        end = record(0x000A, b"")
+        # Built-in number format 2 is 0.00; no workbook writer is required.
+        style = record(0x00E0, struct.pack("<HH", 0, 2) + bytes(16))
+        label = record(0x0204, struct.pack("<HHHHB", 0, 0, 0, 7, 0) + b"Revenue")
+        if cached_formula or empty_formula:
+            cache = b"\x03\x00\x00\x00\x00\x00\xff\xff" if empty_formula else struct.pack("<d", 123.5)
+            formula = b"\x1f" + struct.pack("<d", 123.5)
+            number = record(0x0006, struct.pack("<HHH", 0, 1, 0) + cache
+                            + struct.pack("<HIH", 0, 0, len(formula)) + formula)
+        else:
+            number = record(0x0203, struct.pack("<HHHd", 0, 1, 0, 123.5))
+        sheet = (beginning(0x0010) + record(0x0200, struct.pack("<IIHHH", 0, 1, 0, 2, 0))
+                 + label + number + end)
+
+        def sheet_reference(offset):
+            return record(0x0085, struct.pack("<IBBBB", offset, 0, 0, 5, 0) + b"Sheet")
+
+        globals_ = beginning(0x0005) + record(0x0042, struct.pack("<H", 1200)) + style
+        offset = len(globals_ + sheet_reference(0) + end)
+        return globals_ + sheet_reference(offset) + end + sheet
+
+    def test_legacy_xls_preserves_original_and_numeric_cell_precision_on_restore(self):
+        path = self.archive / "financial_reports" / "original.xls"
+        path.write_bytes(self.legacy_workbook())
+        spec = self.inventory()["sources"][0]
+        self.assertEqual(spec["format"], "xls")
+        store = SourceStore(self.root / "run" / "sources")
+        descriptor = store.add_local(spec, root=self.archive)
+        reference = {"source_id": spec["id"], "unit_id": "Sheet!R1", "number_index": 0,
+                     "number_format": "dot_decimal"}
+        self.assertEqual(store.resolve(reference), 123.5)
+        self.assertEqual(store.read([reference])[0]["numbers"][0]["display_format"], "0.00")
+        self.assertEqual(_rounding_bound(reference, 1, store), 0.005)
+        self.assertEqual(Path(descriptor["path"]).read_bytes(), path.read_bytes())
+        restored = SourceStore(self.root / "continuation")
+        restored.restore(descriptor, archive_root=self.root / "run")
+        self.assertEqual(restored.resolve(reference), 123.5)
+
+    def test_legacy_xls_formula_cache_is_read_and_never_recalculated(self):
+        path = self.archive / "financial_reports" / "original.xls"
+        path.write_bytes(self.legacy_workbook(cached_formula=True))
+        spec = self.inventory()["sources"][0]
+        store = SourceStore(self.root / "run")
+        descriptor = store.add_local(spec, root=self.archive)
+        reference = {"source_id": spec["id"], "unit_id": "Sheet!R1", "number_index": 0,
+                     "number_format": "dot_decimal"}
+        self.assertEqual(store.resolve(reference), 123.5)
+        self.assertIn("not recalculated", descriptor["extraction_warnings"][0]["messages"][0])
+
+    def test_legacy_xls_missing_formula_cache_fails_explicitly(self):
+        path = self.archive / "financial_reports" / "original.xls"
+        path.write_bytes(self.legacy_workbook(empty_formula=True))
+        spec = self.inventory()["sources"][0]
+        store = SourceStore(self.root / "run")
+        with self.assertRaisesRegex(ValueError, "no usable cached result.*B1"):
+            store.add_local(spec, root=self.archive)
+        self.assertEqual(store.sources[0]["status"], "unreadable")
+        self.assertEqual(Path(store.sources[0]["path"]).read_bytes(), path.read_bytes())
+
+    def test_primary_search_filters_sources_before_limiting_matches(self):
+        self.report(value="100")
+        vendor = self.archive / "visible_alpha"
+        vendor.mkdir()
+        (vendor / "actuals.csv").write_text(
+            "Concept,Actual\n" + "".join(f"Revenue {index},{index}\n" for index in range(40)),
+            encoding="utf-8")
+        specs = self.inventory()["sources"]
+        vendor_spec = next(spec for spec in specs if spec["category"] == "visible_alpha")
+        primary_spec = next(spec for spec in specs if spec["category"] == "financial_reports")
+        store = SourceStore(self.root / "run")
+        # The crowded vendor is deliberately indexed before primary evidence.
+        store.add_local(vendor_spec, root=self.archive)
+        store.add_local(primary_spec, root=self.archive)
+        unrestricted = store.search("Revenue")
+        self.assertEqual(len(unrestricted["matches"]), 30)
+        self.assertTrue(unrestricted["truncated"])
+        self.assertEqual({match["source_id"] for match in unrestricted["matches"]}, {vendor_spec["id"]})
+        primary = store.search("Revenue", source_ids={primary_spec["id"]})
+        self.assertEqual(len(primary["matches"]), 1)
+        self.assertEqual(primary["matches"][0]["source_id"], primary_spec["id"])
+        self.assertFalse(primary["truncated"])
+        self.assertEqual(store.search("Revenue", source_ids=[])["matches"], [])
+        for invalid in ({"unknown"}, primary_spec["id"], [None]):
+            with self.subTest(source_ids=invalid):
+                with self.assertRaises(ValueError):
+                    store.search("Revenue", source_ids=invalid)
+
+    def report(self, name="company_2025-fy_results_pub-2026-02-19.html", value="8\u2019639"):
+        path = self.archive / "financial_reports" / name
+        path.write_text(f"<html><body><h1>Consolidated company accounts</h1><p>Revenue  {value}</p></body></html>",
+                        encoding="utf-8")
+        return path
+
+    def test_local_inventory_archives_originals_without_network_and_restores(self):
+        path = self.report()
+        manifest = self.inventory()
+        spec = manifest["sources"][0]
+        self.assertEqual(spec["category"], "financial_reports")
+        self.assertIsNone(spec["published_at"])
+        self.assertEqual(spec["filename_publication_hint"], "2026-02-19")
+        self.assertEqual(spec["metadata_verification"], "user_supplied_not_verified")
+        self.assertEqual(manifest, self.inventory())
+        store = SourceStore(self.root / "run" / "sources", fetcher=lambda url: self.fail("Unexpected network access"))
+        descriptor = store.add_local(spec, root=self.archive)
+        self.assertEqual(Path(descriptor["path"]).read_bytes(), path.read_bytes())
+        self.assertEqual(store.add_local(spec, root=self.archive), descriptor)
+        self.assertEqual(store.catalog()[0]["category"], "financial_reports")
+        unit = store.read_documents([{"source_id": spec["id"], "unit_id": "chunk:1"}])[0]
+        reference = {"source_id": spec["id"], "unit_id": "chunk:1", "number_index": 0,
+                     "number_format": "dot_decimal"}
+        self.assertEqual(unit["numbers"][0]["raw"], "8\u2019639")
+        self.assertEqual(store.resolve(reference), 8639)
+        restored = SourceStore(self.root / "continuation")
+        restored.restore(descriptor, archive_root=self.root / "run")
+        self.assertEqual(restored.resolve(reference), 8639)
+
+    def test_manifest_detects_modified_added_removed_files_and_metadata(self):
+        path = self.report()
+        before = self.inventory()
+        path.write_text("<html>Revenue  8640</html>", encoding="utf-8")
+        changed = self.inventory()
+        self.assertNotEqual(before["manifest_sha256"], changed["manifest_sha256"])
+        with self.assertRaisesRegex(ValueError, "changed after inventory"):
+            SourceStore(self.root / "run").add_local(before["sources"][0], root=self.archive)
+        extra = self.report("another.html", "123")
+        added = self.inventory()
+        self.assertNotEqual(changed["manifest_sha256"], added["manifest_sha256"])
+        extra.unlink()
+        self.assertEqual(changed["manifest_sha256"], self.inventory()["manifest_sha256"])
+        (self.archive / "sources.csv").write_text(
+            "relative_filename,original_download_url,verified_publication_date,reporting_basis\n"
+            f"financial_reports/{path.name},https://example.com/results,2026-02-19,restated\n", encoding="utf-8")
+        indexed = self.inventory()
+        self.assertNotEqual(changed["manifest_sha256"], indexed["manifest_sha256"])
+        self.assertEqual(indexed["sources"][0]["published_at"], "2026-02-19")
+        self.assertEqual(indexed["sources"][0]["supplied_metadata"]["reporting_basis"], "restated")
+        self.assertEqual(indexed["sources"][0]["url"], "https://example.com/results")
+
+    def test_local_archive_rejects_unsupported_files_and_modified_claimed_hash(self):
+        path = self.report()
+        unsupported = self.archive / "financial_reports" / "report.docx"
+        unsupported.write_bytes(b"not a supported original")
+        with self.assertRaisesRegex(ValueError, "Unsupported local source"):
+            self.inventory()
+        unsupported.unlink()
+        (self.archive / "sources.csv").write_text(
+            "relative_filename,sha256\n" + f"financial_reports/{path.name},{'0' * 64}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "hash disagrees"):
+            self.inventory()
+
+    def test_local_paths_cannot_escape_archive_or_read_hidden_configuration(self):
+        self.report()
+        hidden = self.archive / ".private"
+        hidden.write_text("synthetic secret must not be indexed", encoding="utf-8")
+        manifest = self.inventory()
+        self.assertEqual(len(manifest["sources"]), 1)
+        spec = dict(manifest["sources"][0], local_path="../outside.html")
+        with self.assertRaisesRegex(ValueError, "relative"):
+            SourceStore(self.root / "run").add_local(spec, root=self.archive)
+        (self.archive / "sources.csv").write_text("relative_filename\n../outside.html\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "relative filenames"):
+            self.inventory()
+
+    def test_local_history_can_archive_and_restore_more_than_twelve_documents(self):
+        for year in range(2010, 2024):
+            self.report(f"company_{year}-fy.html", str(year))
+        manifest = self.inventory()
+        store = SourceStore(self.root / "run" / "sources")
+        restored = SourceStore(self.root / "resumed")
+        for spec in manifest["sources"]:
+            descriptor = store.add_local(spec, root=self.archive)
+            restored.restore(descriptor, archive_root=self.root / "run")
+        self.assertEqual(len(store.sources), 14)
+        self.assertEqual(restored.catalog(), store.catalog())
+
+    def test_vendor_formula_without_cached_result_is_an_explicit_failure(self):
+        folder = self.archive / "visible_alpha"
+        folder.mkdir()
+        book = Workbook()
+        sheet = book.active
+        sheet.append(["Historical sales", "2025 Actual"])
+        sheet.append(["Revenue", "=100+2"])
+        book.save(folder / "original.xlsx")
+        book.close()
+        manifest = self.inventory()
+        store = SourceStore(self.root / "run")
+        with self.assertRaisesRegex(ValueError, "no cached result.*B2"):
+            store.add_local(manifest["sources"][0], root=self.archive)
+        self.assertEqual(store.sources[0]["status"], "unreadable")
+        self.assertTrue(Path(store.sources[0]["path"]).is_file())
+
+    def test_cached_vendor_formula_is_read_without_recalculation_and_is_flagged(self):
+        import zipfile
+
+        folder = self.archive / "visible_alpha"
+        folder.mkdir()
+        path = folder / "original.xlsx"
+        book = Workbook()
+        book.active.append(["Revenue", "=100+2"])
+        book.save(path)
+        book.close()
+        # openpyxl deliberately does not calculate formulas. This fixture emulates
+        # the cache written by Excel, independently of the reader under test.
+        rewritten = io.BytesIO()
+        with zipfile.ZipFile(path) as original, zipfile.ZipFile(rewritten, "w") as output:
+            for entry in original.infolist():
+                payload = original.read(entry.filename)
+                if entry.filename == "xl/worksheets/sheet1.xml":
+                    payload = re.sub(rb"<f>100\+2</f><v(?:\s*/>|></v>)", b"<f>100+2</f><v>102</v>", payload)
+                output.writestr(entry, payload)
+        path.write_bytes(rewritten.getvalue())
+        spec = self.inventory()["sources"][0]
+        store = SourceStore(self.root / "run")
+        descriptor = store.add_local(spec, root=self.archive)
+        reference = {"source_id": spec["id"], "unit_id": "Sheet!R1", "number_index": 0,
+                     "number_format": "dot_decimal"}
+        self.assertEqual(store.resolve(reference), 102)
+        self.assertIn("not recalculated", descriptor["extraction_warnings"][0]["messages"][0])
+        self.assertEqual(Path(descriptor["path"]).read_bytes(), path.read_bytes())
+
+    def test_local_csv_and_transcript_have_exact_numeric_citations(self):
+        vendor = self.archive / "visible_alpha"
+        vendor.mkdir()
+        (vendor / "actuals.csv").write_text("Concept,2025 Actual\nRevenue,100\n", encoding="utf-8")
+        transcripts = self.archive / "transcripts"
+        transcripts.mkdir()
+        (transcripts / "remarks.txt").write_text("Management: Sales were 100.\nQ&A: definition follows.", encoding="utf-8")
+        store = SourceStore(self.root / "run")
+        manifest = self.inventory()
+        for spec in manifest["sources"]:
+            store.add_local(spec, root=self.archive)
+        vendor_spec = next(spec for spec in manifest["sources"] if spec["category"] == "visible_alpha")
+        reference = {"source_id": vendor_spec["id"], "unit_id": "row:2", "number_index": 0,
+                     "number_format": "dot_decimal"}
+        self.assertEqual(store.resolve(reference), 100)
+        self.assertEqual(store.read([reference])[0]["numbers"][0]["locator"], "B2")
+        self.assertEqual(len(store.sources), 2)
+
+    def test_apostrophe_grouping_is_one_token_and_bad_grouping_is_not_split(self):
+        from research_platform.evidence import _tokens
+        for raw, expected, number_format in (("8'639", 8639, "dot_decimal"),
+                                              ("(1\u2019234.50)", -1234.5, "dot_decimal"),
+                                              ("1\u2018234,50", 1234.5, "comma_decimal")):
+            with self.subTest(raw=raw):
+                self.assertEqual(parse_number(raw, number_format), expected)
+                self.assertEqual([token["raw"] for token in _tokens("Revenue  " + raw)], [raw])
+        for invalid in ("1'23", "12\u201934", "1'234\u201956"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    parse_number(invalid)
+                self.assertEqual(_tokens(invalid), [])
+
+
+class LocalInitiationTests(unittest.TestCase):
+    """Synthetic local originals exercise the full no-browser initiation route."""
+
+    class LocalProvider(ScriptedProvider):
+        def __init__(self, company, **kwargs):
+            super().__init__(company, **kwargs)
+            self.full_company = copy.deepcopy(company)
+            self.web_flags = []
+
+        @staticmethod
+        def scope(company, periods):
+            scoped = copy.deepcopy(company)
+            scoped.discovery["periods"] = [item for item in scoped.discovery["periods"] if item["id"] in periods]
+            fiscal_years = {item["year"] for item in scoped.discovery["periods"]}
+            scoped.discovery["period_coverage"] = [item for item in scoped.discovery["period_coverage"]
+                                                    if item["year"] in fiscal_years]
+            for row in scoped.rows:
+                for field in ("observations", "unavailable", "period_bases", "period_terms"):
+                    row[field] = [item for item in row[field] if item["period"] in periods]
+            scoped.candidate["rows"] = scoped.rows
+            scoped.candidate["coverage"] = [item for item in scoped.candidate["coverage"] if item["period"] in periods]
+            scoped.candidate["cash_continuity"] = [item for item in scoped.candidate["cash_continuity"]
+                                                    if item["period"] in periods and item["previous_period"] in periods]
+            for equation in scoped.candidate["equations"]:
+                equation["periods"] = [period for period in equation["periods"] if period in periods]
+            return scoped
+
+        def complete(self, *, role, instructions, payload, schema, web=False):
+            self.web_flags.append(web)
+            if web:
+                raise AssertionError("Local initiation must never request browser search")
+            stage = payload["stage"]
+            if stage == "discover_local":
+                self.calls.append(copy.deepcopy(payload))
+                self.last_response = self.synthetic_response(stage)
+                if not payload.get("evidence"):
+                    return {"search_query": "", "read_requests": [
+                        {"source_id": source["id"], "unit_id": source["units"][0]["id"]}
+                        for source in payload["catalog"] if source.get("category") == "financial_reports"],
+                        "discovery": None}
+                return {"search_query": "", "read_requests": [],
+                        "discovery": copy.deepcopy(self.full_company.discovery)}
+            if stage == "history_review":
+                self.calls.append(copy.deepcopy(payload))
+                self.last_response = self.synthetic_response(stage)
+                result = {"search_query": "", "read_requests": [], "checks": [], "references": [], "issues": []}
+                if not payload["evidence"]:
+                    result["read_requests"] = [{"source_id": source["id"], "unit_id": source["units"][0]["id"]}
+                                               for source in payload["catalog"]]
+                else:
+                    result["checks"] = [{"topic": topic, "passed": True, "reason": "Synthetic documented history checked."}
+                                        for topic in payload["required_topics"]]
+                    result["references"] = [{"source_id": unit["source_id"], "unit_id": unit["unit_id"]}
+                                            for unit in payload["evidence"]]
+                return result
+            discovery = payload.get("discovery", self.full_company.discovery)
+            periods = {item["id"] for item in discovery["periods"]}
+            self.company = self.scope(self.full_company, periods)
+            if stage == "extract":
+                self.read_requested = bool(payload["evidence"])
+            result = super().complete(role=role, instructions=instructions, payload=payload, schema=schema, web=False)
+            if stage == "source_review":
+                for fact in result["facts"]:
+                    for observation in fact["observations"]:
+                        observation["reporting_basis"] = self.company.candidate["reporting_basis"]
+            if stage == "model_review" and result["checks"]:
+                result["checks"] = [{"topic": topic, "passed": True,
+                                     "reason": "Synthetic documentary structure and basis checked."}
+                                    for topic in payload.get("required_topics", REVIEW_TOPICS)]
+            return result
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.archive = self.root / "local_store" / "synthetic"
+        reports = self.archive / "financial_reports"
+        reports.mkdir(parents=True)
+        self.original = reports / "synthetic_2025-fy_financial-statements_pub-2026-02-10.xlsx"
+        self.prepare_company(SyntheticCompany())
+
+    def prepare_company(self, company):
+        from research_platform.evidence import inventory_local_sources
+
+        self.company = company
+        self.original.write_bytes(self.company.payload())
+        source = inventory_local_sources(self.archive)["sources"][0]
+
+        def remap(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key == "source_id" and item == "annual":
+                        value[key] = source["id"]
+                    elif key == "source_ids":
+                        value[key] = [source["id"] if source_id == "annual" else source_id for source_id in item]
+                    else:
+                        remap(item)
+            elif isinstance(value, list):
+                for item in value:
+                    remap(item)
+
+        remap(self.company.discovery)
+        remap(self.company.candidate)
+        self.company.source = {key: source[key] for key in ("id", "url", "title", "published_at", "reason")}
+        self.company.source["kind"] = source["kind"]
+        self.company.discovery["sources"] = [self.company.source]
+        context = {"source_id": source["id"], "unit_id": f"{self.company.sheet}!R1"}
+        candidate = self.company.candidate
+        candidate["reporting_bases"] = [{"id": "original", "label": "Synthetic unchanged reporting basis",
+            "accounting_standard": "Synthetic accounting", "consolidation_scope": "Consolidated group",
+            "segment_structure": "Alpha and Beta operating segments", "measurement_basis": "reported",
+            "vintage_date": "2026-02-10", "references": [context]}]
+        candidate["basis_changes"] = []
+        for row in self.company.rows:
+            row["period_terms"] = []
+            row["period_bases"] = [{"period": observation["period"], "basis_id": "original"}
+                                   for observation in row["observations"]]
+            for observation in row["observations"]:
+                observation.update(actual_or_estimate="actual", scale=row["scale"], sign=row["sign"])
+        for equation in candidate["equations"]:
+            relevant = {equation["target"], *(term["row_id"] for term in equation["terms"])}
+            common = set.intersection(*({observation["period"] for observation in row["observations"]}
+                                        for row in self.company.rows if row["id"] in relevant))
+            equation.update(periods=sorted(common), basis_bridge_refs=[])
+        for continuity in candidate["cash_continuity"]:
+            continuity["basis_treatment"] = "same_basis"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def run_local(self, *, company=None, provider=None, **kwargs):
+        company = company or self.company
+        provider = provider or self.LocalProvider(company)
+        with patch("research_platform.ai.urlopen") as ai_network, \
+                patch("research_platform.evidence.download") as browser:
+            directory = initiate_company(self.root, company.name, provider=provider,
+                                         source_directory=self.archive, **kwargs)
+            ai_network.assert_not_called()
+            browser.assert_not_called()
+        return directory, read_json(directory / "record.json"), provider
+
+    def test_single_year_uses_local_originals_full_documents_and_independent_checks(self):
+        company = self.LocalProvider.scope(self.company, {"2025"})
+        directory, record, provider = self.run_local(company=company, years=[2025])
+        self.assertEqual(record["status"], "accepted", record["issues"])
+        self.assertTrue((directory / "model.xlsx").is_file())
+        self.assertEqual(record["request"]["input_mode"], "local")
+        self.assertTrue(record["request"]["source_manifest_sha256"])
+        self.assertTrue(all(check["passed"] for check in record["checks"]))
+        self.assertFalse(any(provider.web_flags))
+        self.assertNotIn("discover", [call["stage"] for call in provider.calls])
+        self.assertIn("discover_local", [call["stage"] for call in provider.calls])
+        self.assertEqual(next(row for row in record["rows"] if row["id"] == "revenue")["values"], {"2025": 1100.0})
+        for stage in ("extract", "source_review", "coverage_inventory", "model_review"):
+            evidence_calls = [call for call in provider.calls if call["stage"] == stage and call.get("evidence")]
+            self.assertTrue(evidence_calls, stage)
+            self.assertTrue(all(len(call["evidence"]) == len(self.company.rows) + 2 for call in evidence_calls), stage)
+        self.assertEqual(record["usage"]["web_search_calls"], 0)
+
+    def test_two_year_scopes_merge_and_preserve_cited_actuals(self):
+        directory, record, provider = self.run_local(years=[2024, 2025])
+        self.assertEqual(record["status"], "accepted", record["issues"])
+        self.assertEqual(next(row for row in record["rows"] if row["id"] == "revenue")["values"],
+                         {"2024": 1000.0, "2025": 1100.0})
+        self.assertEqual({tuple(call["request"]["years"]) for call in provider.calls if call["stage"] == "extract"},
+                         {(2024,), (2025,)})
+        self.assertTrue(any(check["name"] == "cash_continuity:2025" and check["passed"] for check in record["checks"]))
+        self.assertTrue((directory / "model.xlsx").exists())
+
+    def test_default_ten_year_request_does_not_silently_accept_two_year_archive(self):
+        _, record, provider = self.run_local()
+        discovery = next(call for call in provider.calls if call["stage"] == "discover_local")
+        self.assertEqual(discovery.get("request", discovery)["historical_years"], 10)
+        self.assertEqual(record["request"]["historical_years"], 10)
+        self.assertEqual(record["status"], "incomplete")
+        self.assertIn("historical years", "; ".join(record["issues"]))
+        self.assertFalse(any(call["stage"] == "extract" for call in provider.calls))
+
+    def test_ten_year_local_history_accepts_with_reported_interims_and_separate_history_review(self):
+        company = SyntheticCompany().include_interims()
+        earlier = list(range(2016, 2024))
+        company.column_periods = [str(year) for year in earlier] + company.column_periods
+        earlier_cash_values = {"cash_close": 70, "balance_sheet_cash": 70, "cash_open": 70,
+                               "cash_change": 0, "financing": -40, "net_debt": 230}
+        for row in company.rows:
+            current = company.display_values[row["id"]]
+            company.display_values[row["id"]] = [earlier_cash_values.get(row["id"], current[0])] * len(earlier) + current
+            reference = copy.deepcopy(row["observations"][0]["reference"])
+            for observation in row["observations"]:
+                observation["reference"]["number_index"] += len(earlier)
+            row["observations"] = [{"period": str(year), "reference": dict(reference, number_index=index)}
+                                   for index, year in enumerate(earlier)] + row["observations"]
+        company.discovery["periods"] = [
+            {"id": str(year), "year": year, "kind": "annual", "start": f"{year}-01-01", "end": f"{year}-12-31"}
+            for year in earlier] + company.discovery["periods"]
+        old_coverage = [item for item in company.discovery["period_coverage"] if item["year"] == 2024]
+        company.discovery["period_coverage"] = [dict(copy.deepcopy(item), year=year)
+            for year in earlier for item in old_coverage] + company.discovery["period_coverage"]
+        old_sections = [item for item in company.candidate["coverage"] if item["period"] == "2024"]
+        company.candidate["coverage"] = [dict(copy.deepcopy(item), period=str(year))
+            for year in earlier for item in old_sections] + company.candidate["coverage"]
+        self.prepare_company(company)
+        directory, record, provider = self.run_local()
+        self.assertEqual(record["status"], "accepted", record["issues"])
+        self.assertEqual(record["request"]["historical_years"], 10)
+        annuals = [period["year"] for period in record["discovery"]["periods"] if period["kind"] == "annual"]
+        self.assertEqual(annuals, list(range(2016, 2026)))
+        self.assertEqual(len(record["historical_scopes"]), 10)
+        revenue = next(row for row in record["rows"] if row["id"] == "revenue")
+        self.assertEqual(len(revenue["values"]), 13)
+        self.assertEqual(revenue["values"]["2025-9M"], 825.0)
+        self.assertEqual(revenue["values"]["2025-Q1"], 220.0)
+        self.assertNotIn("2025-Q3", revenue["values"])
+        net_debt = next(row for row in record["rows"] if row["id"] == "net_debt")
+        self.assertNotIn("2025-9M", net_debt["values"])
+        self.assertIn("2025-H1", net_debt["values"])
+        checks = {check["name"]: check for check in record["checks"]}
+        self.assertTrue(all(checks[f"cash_continuity:{year}"]["passed"] for year in range(2017, 2026)))
+        historical_review = [call for call in provider.calls if call["stage"] == "history_review"]
+        self.assertEqual(len(historical_review), 2)
+        self.assertEqual(historical_review[0]["evidence"], [])
+        self.assertTrue(historical_review[1]["evidence"])
+        self.assertTrue(all("reviews" not in call and "checks" not in call for call in historical_review))
+        structural_calls = [call for call in provider.calls if call["stage"] == "model_review"]
+        self.assertTrue(structural_calls)
+        self.assertTrue(all(call["catalog"] and "sources" not in call for call in structural_calls))
+        self.assertTrue(all(len(call["request"]["years"]) == 1 for call in provider.calls if call["stage"] == "extract"))
+        self.assertFalse(any(provider.web_flags))
+        self.assertTrue((directory / "model.xlsx").is_file())
+
+    def test_estimated_observation_cannot_be_accepted_as_history(self):
+        company = self.LocalProvider.scope(self.company, {"2025"})
+        def insert_estimate(candidate):
+            candidate["rows"][0]["observations"][0]["actual_or_estimate"] = "estimate"
+        provider = self.LocalProvider(company, mutate=insert_estimate)
+        directory, record, _ = self.run_local(company=company, provider=provider, years=[2025])
+        self.assertEqual(record["status"], "incomplete")
+        self.assertFalse((directory / "model.xlsx").exists())
+        self.assertTrue(any("estimates cannot enter historical actuals" in "; ".join(call.get("feedback", []))
+                            for call in provider.calls if call["stage"] == "extract"), record["issues"])
+
+    def test_accepted_archive_reuses_without_calls_and_changed_bytes_block_resume(self):
+        company = self.LocalProvider.scope(self.company, {"2025"})
+        first, record, _ = self.run_local(company=company, years=[2025])
+        self.assertEqual(record["status"], "accepted", record["issues"])
+        reused = self.LocalProvider(company)
+        second, _, _ = self.run_local(company=company, provider=reused, years=[2025])
+        self.assertEqual(first, second)
+        self.assertEqual(reused.calls, [])
+        book = load_workbook(self.original)
+        book.active["A1"] = "Changed source context"
+        book.save(self.original)
+        with self.assertRaisesRegex(ValueError, "changed|fresh"), \
+                patch.object(reused, "complete", side_effect=AssertionError("No call may be dispatched")):
+            self.run_local(company=company, provider=reused, years=[2025])
+
+    def test_preflight_allowance_stops_before_charged_or_pending_request(self):
+        class ExpensiveProvider(self.LocalProvider):
+            def estimate_request_cost(self, **kwargs):
+                return {"estimated_cost_usd": 21.0, "estimated_input_tokens": 10000000,
+                        "max_output_tokens": 16000, "is_exact": False, "method": "synthetic allowance"}
+        provider = ExpensiveProvider(self.company)
+        directory, record, _ = self.run_local(provider=provider, years=[2024, 2025])
+        self.assertEqual(record["status"], "incomplete")
+        self.assertEqual(provider.calls, [])
+        self.assertIsNone(record["pending_call"])
+        self.assertEqual(record["usage"]["calls"], 0)
+        self.assertEqual(record["usage"]["estimated_cost_usd"], 0)
+        self.assertFalse((directory / "model.xlsx").exists())
+
+    def test_identical_archive_at_another_location_cannot_reset_existing_budget(self):
+        import shutil
+
+        company = self.LocalProvider.scope(self.company, {"2025"})
+        first, record, _ = self.run_local(company=company, years=[2025])
+        self.assertEqual(record["status"], "accepted", record["issues"])
+        moved = self.root / "local_store" / "same_documents_elsewhere"
+        shutil.copytree(self.archive, moved)
+        provider = self.LocalProvider(company)
+        with self.assertRaisesRegex(ValueError, "Source archive or intake mode differs"), \
+                patch.object(provider, "complete", side_effect=AssertionError("No AI request may be sent")):
+            initiate_company(self.root, company.name, provider=provider,
+                             source_directory=moved, years=[2025])
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(list((self.root / "outputs").glob("initiate_*")), [first])
+        self.assertEqual(read_json(first / "record.json"), record)
+
+    def test_switching_saved_injected_research_to_local_requires_explicit_fresh(self):
+        company = SyntheticCompany()
+        legacy_provider = ScriptedProvider(company)
+        first = initiate_company(self.root, company.name, provider=legacy_provider,
+                                 fetcher=company.fetch, years=[2024, 2025])
+        record = read_json(first / "record.json")
+        self.assertEqual(record["status"], "accepted", record["issues"])
+        provider = self.LocalProvider(self.company)
+        with self.assertRaisesRegex(ValueError, "Source archive or intake mode differs"), \
+                patch.object(provider, "complete", side_effect=AssertionError("No AI request may be sent")):
+            self.run_local(provider=provider, years=[2024, 2025])
+        self.assertEqual(provider.calls, [])
+        self.assertEqual(list((self.root / "outputs").glob("initiate_*")), [first])
+        self.assertEqual(read_json(first / "record.json"), record)
+
+    def test_changing_saved_numeric_reference_is_real_progress_with_same_row_identity(self):
+        class EditingProvider(self.LocalProvider):
+            saved_revisions = 0
+            def complete(self, **kwargs):
+                payload = kwargs["payload"]
+                if payload["stage"] == "extract" and payload["evidence"] and self.saved_revisions < 2:
+                    self.calls.append(copy.deepcopy(payload))
+                    self.last_response = self.synthetic_response("extract")
+                    scoped = self.scope(self.full_company, {item["id"] for item in payload["discovery"]["periods"]})
+                    row = copy.deepcopy(next(row for row in scoped.rows if row["id"] == "revenue"))
+                    if self.saved_revisions == 0:
+                        row["observations"][0]["reference"]["number_index"] = 0
+                    self.saved_revisions += 1
+                    return {"action": "save_rows", "read_requests": [], "sources": [], "rows": [row],
+                            "delete_row_ids": [], "search_query": "", "candidate": None}
+                return super().complete(**kwargs)
+        company = self.LocalProvider.scope(self.company, {"2025"})
+        provider = EditingProvider(company)
+        _, record, _ = self.run_local(company=company, provider=provider, years=[2025])
+        self.assertEqual(record["status"], "accepted", record["issues"])
+        self.assertEqual(provider.saved_revisions, 2)
+        revenue = next(row for row in record["rows"] if row["id"] == "revenue")
+        self.assertEqual(revenue["values"], {"2025": 1100.0})
+
+    def test_unreadable_primary_archive_stops_before_ai_and_preserves_failed_original(self):
+        invalid_xlsx = b"PK\x03\x04SYNTHETIC INVALID XLSX ORIGINAL"
+        self.original.write_bytes(invalid_xlsx)
+        directory, record, provider = self.run_local(years=[2024, 2025])
+        self.assertEqual(record["status"], "incomplete")
+        self.assertIn("No readable original financial_reports", "; ".join(record["issues"]))
+        self.assertEqual(provider.calls, [])
+        self.assertIsNone(record["pending_call"])
+        self.assertEqual(record["usage"]["calls"], 0)
+        self.assertEqual(record["usage"]["estimated_cost_usd"], 0)
+        self.assertTrue(record["archive_errors"])
+        self.assertEqual(record["sources"][0]["status"], "unreadable")
+        self.assertEqual(Path(record["sources"][0]["path"]).read_bytes(), invalid_xlsx)
+        self.assertFalse((directory / "model.xlsx").exists())
+
+
+    def test_interrupted_local_extraction_reuses_saved_discovery_and_charges_once(self):
+        company = self.LocalProvider.scope(self.company, {"2025"})
+        original_provider = self.LocalProvider(company)
+        def stop_after_saved_read(message):
+            if message.startswith("Stage extract:"):
+                raise KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_local(company=company, provider=original_provider, years=[2025], progress=stop_after_saved_read)
+        original_directory = next((self.root / "outputs").glob("initiate_*"))
+        saved = read_json(original_directory / "record.json")
+        self.assertEqual(saved["status"], "incomplete")
+        self.assertIsNone(saved["pending_call"])
+        continuation = self.LocalProvider(company)
+        directory, record, _ = self.run_local(company=company, provider=continuation, years=[2025])
+        self.assertEqual(record["status"], "accepted", record["issues"])
+        self.assertNotEqual(directory, original_directory)
+        self.assertEqual(record["parent_run"], str(original_directory))
+        self.assertFalse(any(call["stage"] == "discover_local" for call in continuation.calls))
+        self.assertEqual(continuation.calls[0]["stage"], "extract")
+        self.assertTrue(continuation.calls[0]["evidence"])
+        self.assertEqual(record["usage"]["calls"], len(original_provider.calls) + len(continuation.calls))
+        self.assertAlmostEqual(record["usage"]["estimated_cost_usd"], record["usage"]["calls"] * 0.003)
+        self.assertEqual(read_json(original_directory / "record.json"), saved)
+
+
+class HistoricalBasisTests(unittest.TestCase):
+    """Versioned financial history must not quietly splice unlike observations."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.company = SyntheticCompany()
+        self.store = SourceStore(Path(self.temporary.name), fetcher=self.company.fetch)
+        self.store.add(self.company.source)
+        self.store.sources[0]["category"] = "financial_reports"
+        self.ref = {"source_id": "annual", "unit_id": "Statements!R1"}
+        self.read_units = {(item["source_id"], item["unit_id"])
+                           for item in self.store.read_documents([self.ref])}
+        self.candidate = copy.deepcopy(self.company.candidate)
+        self.candidate["reporting_bases"] = [{
+            "id": "reported", "label": "Synthetic consolidated reporting framework",
+            "accounting_standard": "Synthetic accounting policies", "consolidation_scope": "Synthetic group",
+            "segment_structure": "Synthetic Alpha and Beta business segmentation", "measurement_basis": "reported",
+            "vintage_date": "2026-02-10", "references": [copy.deepcopy(self.ref)]}]
+        self.candidate["basis_changes"] = []
+        for row in self.candidate["rows"]:
+            row["period_bases"] = [{"period": str(year), "basis_id": "reported"} for year in (2024, 2025)]
+            row["period_terms"] = []
+            for obs in row["observations"]:
+                obs.update(actual_or_estimate="actual", scale=row["scale"], sign=row["sign"])
+        for equation in self.candidate["equations"]:
+            equation.update(periods=[], basis_bridge_refs=[])
+        for bridge in self.candidate["cash_continuity"]:
+            bridge["basis_treatment"] = "same_basis"
+
+    def materialize(self, candidate=None):
+        return materialize_and_check(candidate or self.candidate, self.company.discovery,
+                                     self.store, self.read_units)
+
+    def second_basis(self):
+        basis = copy.deepcopy(self.candidate["reporting_bases"][0])
+        basis.update(id="revised", label="Synthetic revised framework", vintage_date="2026-03-01")
+        self.candidate["reporting_bases"].append(basis)
+
+    def test_local_history_requires_actuals_complete_basis_assignments_and_primary_context(self):
+        _, checks = self.materialize()
+        self.assertTrue(all(check["passed"] for check in checks))
+        for mutation in ("estimate", "missing_basis", "unknown_basis", "vendor_only_basis"):
+            candidate = copy.deepcopy(self.candidate)
+            if mutation == "estimate":
+                candidate["rows"][0]["observations"][0]["actual_or_estimate"] = "estimate"
+            elif mutation == "missing_basis":
+                candidate["rows"][0]["period_bases"].pop()
+            elif mutation == "unknown_basis":
+                candidate["rows"][0]["period_bases"][0]["basis_id"] = "invented"
+            else:
+                self.store.sources[0]["category"] = "visible_alpha"
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                self.materialize(candidate)
+            self.store.sources[0]["category"] = "financial_reports"
+
+    def test_basis_transition_requires_ledger_even_when_amounts_are_unchanged(self):
+        self.second_basis()
+        shares = next(row for row in self.candidate["rows"] if row["id"] == "shares")
+        shares["period_bases"][1]["basis_id"] = "revised"
+        with self.assertRaisesRegex(ValueError, "change ledger"):
+            self.materialize()
+        self.candidate["basis_changes"] = [{
+            "from_basis": "reported", "to_basis": "revised", "effective_date": "2025-01-01",
+            "kind": "definition", "treatment": "explicit_break", "affected_rows": ["shares"],
+            "explanation": "Synthetic share definition changed; equal amounts do not prove comparability.",
+            "references": [copy.deepcopy(self.ref)]}]
+        rows, checks = self.materialize()
+        self.assertTrue(all(check["passed"] for check in checks))
+        self.assertEqual(next(row for row in rows if row["id"] == "shares")["values"], {"2024": 100, "2025": 100})
+
+    def test_mixed_basis_equation_needs_explicit_cited_bridge_and_core_identity_cannot_be_waived(self):
+        self.second_basis()
+        expenses = next(row for row in self.candidate["rows"] if row["id"] == "expenses")
+        for assignment in expenses["period_bases"]:
+            assignment["basis_id"] = "revised"
+        with self.assertRaisesRegex(ValueError, "incompatible reporting bases"):
+            self.materialize()
+        equation = next(item for item in self.candidate["equations"] if item["target"] == "net_income")
+        equation["basis_bridge_refs"] = [copy.deepcopy(self.ref)]
+        _, checks = self.materialize()
+        self.assertTrue(all(check["passed"] for check in checks))
+        assets = next(row for row in self.candidate["rows"] if row["id"] == "assets")
+        for assignment in assets["period_bases"]:
+            assignment["basis_id"] = "revised"
+        with self.assertRaisesRegex(ValueError, "incompatible reporting bases"):
+            self.materialize()
+
+    def test_segment_reconciliation_uses_each_periods_actual_segment_rows(self):
+        for old_id, new_id in (("segment_a", "segment_a_v2"), ("profit_a", "profit_a_v2")):
+            old = next(row for row in self.candidate["rows"] if row["id"] == old_id)
+            new = copy.deepcopy(old)
+            # The disclosed segment label may stay identical after a reorganization;
+            # the row ID and dated framework, not an invented entity name, distinguish it.
+            new.update(id=new_id)
+            old["observations"] = [old["observations"][0]]
+            old["period_bases"] = [old["period_bases"][0]]
+            old["unavailable"] = [{"period": "2025", "explanation": "Synthetic later version separately represented.", "references": [copy.deepcopy(self.ref)]}]
+            new["observations"] = [new["observations"][1]]
+            new["period_bases"] = [new["period_bases"][1]]
+            new["unavailable"] = [{"period": "2024", "explanation": "Synthetic later version not reported in earlier period.", "references": [copy.deepcopy(self.ref)]}]
+            self.candidate["rows"].append(new)
+        originals = [item for item in self.candidate["equations"] if item["target"] in ("revenue", "segment_group_profit")]
+        for original in originals:
+            original["periods"] = ["2024"]
+            later = copy.deepcopy(original)
+            later["periods"] = ["2025"]
+            for term in later["terms"]:
+                if term["row_id"] in ("segment_a", "profit_a"):
+                    term["row_id"] += "_v2"
+            self.candidate["equations"].append(later)
+        _, checks = self.materialize()
+        self.assertTrue(all(check["passed"] for check in checks), [check for check in checks if not check["passed"]])
+        originals[0]["periods"] = []
+        with self.assertRaises(ValueError):
+            self.materialize()
+
+    def test_period_specific_calculations_export_formulas_and_ledger(self):
+        row = next(row for row in self.candidate["rows"] if row["id"] == "net_debt")
+        self.candidate["equations"] = [item for item in self.candidate["equations"] if item["target"] != "net_debt"]
+        row["observations"] = []
+        ordinary = [{"row_id": "debt", "coefficient": 1}, {"row_id": "cash_close", "coefficient": -1}]
+        row["period_terms"] = [{"period": "2024", "terms": ordinary},
+                               {"period": "2025", "terms": ordinary + [{"row_id": "minority_interest", "coefficient": 1}]}]
+        rows, checks = self.materialize()
+        self.assertTrue(all(check["passed"] for check in checks))
+        calculated = next(item for item in rows if item["id"] == "net_debt")
+        self.assertEqual(calculated["kind"], "calculated")
+        self.assertEqual(calculated["values"], {"2024": 200, "2025": 245})
+        path = Path(self.temporary.name) / "model.xlsx"
+        export_workbook(path, {"request": {"forecast_years": 5}, "discovery": self.company.discovery,
+                               "candidate": self.candidate, "rows": rows, "checks": checks,
+                               "status": "accepted", "reviews": [], "sources": self.store.sources})
+        book = load_workbook(path, data_only=False)
+        self.addCleanup(book.close)
+        self.assertIn("Reporting basis", book.sheetnames)
+        self.assertEqual(book["net_debt"]["D5"].data_type, "f")
+        self.assertEqual(book["net_debt"]["E5"].data_type, "f")
+        self.assertNotIn("'equity'!", book["net_debt"]["D5"].value)
+        self.assertIn("'equity'!", book["net_debt"]["E5"].value)
+        self.assertIn("reporting basis=reported", book["net_debt"]["E5"].comment.text)
+
+    def test_source_scale_is_observation_specific_and_display_scale_is_separate(self):
+        row = next(row for row in self.candidate["rows"] if row["id"] == "shares")
+        row["observations"][1]["scale"] = 1000
+        rows, _ = self.materialize()
+        result = next(item for item in rows if item["id"] == "shares")
+        self.assertEqual(result["values"], {"2024": 100, "2025": 100000})
+        self.assertEqual(result["scale"], 1)
+
+    def test_review_scope_omits_unavailable_subtotal_equations_without_broadening_periods(self):
+        from research_platform.initiation import _scope_model
+
+        subtotal = copy.deepcopy(next(row for row in self.candidate["rows"] if row["id"] == "expenses"))
+        subtotal.update(id="old_subtotal", label="Earlier disclosed expense subtotal",
+                        definition="Synthetic reported supporting subtotal available only in 2024.")
+        subtotal["observations"] = [subtotal["observations"][0]]
+        subtotal["period_bases"] = [subtotal["period_bases"][0]]
+        subtotal["unavailable"] = [{"period": "2025", "explanation": "The later report does not disclose this supporting subtotal.",
+                                    "references": [copy.deepcopy(self.ref)]}]
+        self.candidate["rows"].append(subtotal)
+        equation = {"target": "old_subtotal", "terms": [{"row_id": "expenses", "coefficient": 1}],
+                    "explanation": "Synthetic supporting composition", "periods": [], "basis_bridge_refs": []}
+        self.candidate["equations"].append(equation)
+        rows, checks = self.materialize()
+        self.assertTrue(all(check["passed"] for check in checks))
+        check = next(check for check in checks if check["name"] == "equation:old_subtotal:2025")
+        self.assertEqual(check["basis"], "not_applicable")
+
+        later, later_rows = _scope_model(self.candidate, rows, {"2025"})
+        self.assertNotIn("old_subtotal", {row["id"] for row in later_rows})
+        self.assertNotIn("old_subtotal", {item["target"] for item in later["equations"]})
+        self.assertTrue(all(item["periods"] == ["2025"] for item in later["equations"]))
+        both, _ = _scope_model(self.candidate, rows, {"2024", "2025"})
+        scoped = next(item for item in both["equations"] if item["target"] == "old_subtotal")
+        self.assertEqual(scoped["periods"], ["2024"])
+        self.assertEqual(scoped["terms"], equation["terms"])
+        self.assertEqual(equation["periods"], [])
+
+    def test_cross_basis_cash_needs_documented_no_effect_not_equality_alone(self):
+        self.second_basis()
+        # The immutable synthetic source explicitly documents the lack of cash
+        # impact; a reviewer must still check this claim in a real initiation.
+        content = (b"<h1>SYNTHETIC accounting policy transition</h1>"
+                   b"<p>Effective 1 January 2025, the synthetic reporting policy changes. "
+                   b"The change has no effect on opening cash or the preceding closing cash balance. "
+                   b"No cash adjustment is required.</p><p>A separate synthetic control balance is 101</p>")
+        self.store.fetcher = lambda url: (content, url, "text/html")
+        self.store.add({"id": "policy", "url": "https://example.invalid/policy.html", "title": "Synthetic policy note",
+                        "published_at": "2026-02-10", "reason": "Explicit cash treatment for a policy transition", "kind": "filing"})
+        self.store.sources[-1]["category"] = "financial_reports"
+        catalog = next(item for item in self.store.catalog() if item["id"] == "policy")
+        ref = {"source_id": "policy", "unit_id": catalog["units"][0]["id"]}
+        self.read_units.update((item["source_id"], item["unit_id"]) for item in self.store.read_documents([ref]))
+        for row in self.candidate["rows"]:
+            row["period_bases"][1]["basis_id"] = "revised"
+        self.candidate["basis_changes"] = [{
+            "from_basis": "reported", "to_basis": "revised", "effective_date": "2025-01-01",
+            "kind": "accounting_policy", "treatment": "explicit_break",
+            "affected_rows": [row["id"] for row in self.candidate["rows"]],
+            "explanation": "The synthetic policy changes, with explicitly disclosed no effect on cash.", "references": [ref]}]
+        bridge = self.candidate["cash_continuity"][0]
+        bridge.update(explanation="The original policy note explicitly states that opening and preceding closing cash are unchanged.",
+                      references=[ref])
+        with self.assertRaisesRegex(ValueError, "explicit treatment"):
+            self.materialize()
+        bridge["basis_treatment"] = "reported_adjustment"
+        with self.assertRaisesRegex(ValueError, "reported adjustment terms"):
+            self.materialize()
+        bridge["basis_treatment"] = "documented_no_effect"
+        _, checks = self.materialize()
+        self.assertTrue(all(check["passed"] for check in checks))
+        wrong = copy.deepcopy(self.candidate)
+        control_unit = next(unit for unit in self.store.read_documents([ref])
+                            if any(str(token["raw"]).rstrip(".") == "101" for token in unit["numbers"]))
+        number_index = next(index for index, token in enumerate(control_unit["numbers"])
+                            if str(token["raw"]).rstrip(".") == "101")
+        opening = next(row for row in wrong["rows"] if row["id"] == "cash_open")
+        opening["observations"][1]["reference"] = {"source_id": "policy", "unit_id": control_unit["unit_id"],
+                                                    "number_index": number_index, "number_format": "dot_decimal"}
+        _, wrong_checks = self.materialize(wrong)
+        no_effect = next(check for check in wrong_checks if check["name"] == "cash_continuity:2025")
+        self.assertFalse(no_effect["passed"])
+        self.assertEqual(no_effect["tolerance"], 0)
+        self.store.sources[-1]["category"] = "transcripts"
+        with self.assertRaisesRegex(ValueError, "financial-report context"):
+            self.materialize()
+
+
+class VisibleAlphaTests(unittest.TestCase):
+    """Vendor layout and column evidence constrain AI claims about historical cells."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.archive = self.root / "company"
+        (self.archive / "visible_alpha").mkdir(parents=True)
+        self.path = self.archive / "visible_alpha" / "synthetic_vendor.xlsx"
+        self.addresses = self.make_workbook(self.path)
+        from research_platform.evidence import inventory_local_sources
+        self.spec = inventory_local_sources(self.archive)["sources"][0]
+        self.store = SourceStore(self.root / "originals")
+        self.descriptor = self.store.add_local(self.spec, root=self.archive)
+
+    @staticmethod
+    def make_workbook(path, *, recognized=True):
+        """A vendor-format fixture with deliberately interleaved actuals/estimates."""
+        book = Workbook()
+        sheet = book.active
+        sheet.title = "Vendor data"
+        sheet["C2"] = "SYNTHETIC Manufacturing Group"
+        periods = ["FY-2024", "FY-2026E", "FY-2024", "FY-2025", "FY-2025E",
+                   "1HFY-2024", "1QFY-2024"]
+        series = ["VA Actuals", "Consensus", "Filings", "Filings", "VA Actuals",
+                  "Filings", "Filings"]
+
+        def headers(first):
+            for column, (period, source) in enumerate(zip(periods, series), 7):
+                sheet.cell(first, column, period)
+                sheet.cell(first + 1, column, source)
+            sheet.cell(first + 1, 5, "Units")
+
+        def metric(row, label, values):
+            sheet.cell(row, 4, label)
+            sheet.cell(row, 5, "USDM")
+            sheet.cell(row, 6, "Analytics")
+            for column, value in enumerate(values, 7):
+                if value is not None:
+                    sheet.cell(row, column, value)
+
+        headers(4)
+        sheet["D6"] = "Income statement"
+        metric(7, "Standard revenue", [777777, 900001, 777777, 888888, 900002, 444444, 222222])
+        headers(10)
+        sheet["D12"] = "Ratios" if recognized else "Other analytics"
+        metric(13, "Standard margin", [123456, 900003, 123456, 234567, 900004, 345678, 456789])
+        headers(16)
+        sheet["D18"] = "Company business divisions"
+        metric(19, "Manufacturing sales", [100, 900005, 100, 110, 900006, 45, 20])
+        sheet["F20"] = "YoY Growth"
+        for column in range(7, 14):
+            sheet.cell(20, column, 555555)
+        metric(21, "Discontinued division: no reported observation", [None] * 7)
+        sheet["D23"] = "Reporting note: legacy division definitions remain distinct."
+        headers(25)
+        sheet["D27"] = "Income statement"
+        metric(28, "Group sales", [100, 900007, 100, 110, 900008, 45, 20])
+        key = book.create_sheet("Key")
+        key["C3"] = "Legend"
+        key["D4"] = "Direct Inferred means additional non-analyst source information was used."
+        key["C6"] = "Source Information"
+        key["D6"] = "Historical data is provided by VA Actuals"
+        book.save(path)
+        book.close()
+        return {"standard": "I7", "ratio": "I13", "actual": "G19", "filing": "I19",
+                "future": "H19", "conflicting_estimate": "K19", "later_actual": "J19",
+                "half_year": "L19", "quarter": "M19", "helper": "I20", "group": "I28"}
+
+    def reference(self, name, *, store=None, descriptor=None):
+        store = store or self.store
+        descriptor = descriptor or self.descriptor
+        address = self.addresses.get(name, name)
+        row = int(re.search(r"\d+$", address).group())
+        ref = {"source_id": descriptor["id"], "unit_id": f"Vendor data!R{row}"}
+        unit = store.read([ref])[0]
+        token = next(token for token in unit["numbers"] if token["locator"] == address)
+        return dict(ref, number_index=token["index"], number_format="dot_decimal")
+
+    @staticmethod
+    def period(year=2024, slot=None):
+        value = {"id": str(year) if slot is None else f"{year}-{slot}", "year": year,
+                 "kind": "annual" if slot is None else "half_year" if slot == "H1" else "quarter",
+                 "start": f"{year}-01-01", "end": f"{year}-12-31" if slot is None else
+                 f"{year}-06-30" if slot == "H1" else f"{year}-03-31"}
+        if slot is not None:
+            value.update(fiscal_year_start=f"{year}-01-01", fiscal_year_end=f"{year}-12-31")
+        return value
+
+    def test_recognized_layout_preserves_original_bytes_and_reconstructs_on_restore(self):
+        original = self.path.read_bytes()
+        self.assertEqual(self.descriptor["vendor_layout"]["status"], "recognized")
+        self.assertEqual(Path(self.descriptor["path"]).read_bytes(), original)
+        self.assertEqual(self.descriptor["sha256"], hashlib.sha256(original).hexdigest())
+        reference = self.reference("filing")
+        before = self.store.read_documents([reference], historical_years=[2024])
+        restored = SourceStore(self.root / "unused")
+        restored.restore(self.descriptor, archive_root=self.root)
+        self.assertEqual(restored.read_documents([reference], historical_years=[2024]), before)
+        self.assertEqual(restored.resolve(reference), 100)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_historical_view_retains_original_numeric_indexes_and_full_read_is_unchanged(self):
+        reference = self.reference("filing")
+        full = self.store.read_documents([reference])
+        unit = next(item for item in full if item["unit_id"] == reference["unit_id"])
+        self.assertEqual(reference["number_index"], 2)
+        self.assertEqual(unit["numbers"][1]["raw"], 900005)
+        view = self.store.read_documents([reference], historical_years=[2024])
+        historical = next(item for item in view if item["unit_id"] == reference["unit_id"])
+        token = next(token for token in historical["numbers"] if token["locator"] == "I19")
+        self.assertEqual(token["index"], reference["number_index"])
+        self.assertEqual(token["raw"], 100)
+        self.assertNotIn("H19", {token["locator"] for token in historical["numbers"]})
+        self.assertEqual(self.store.resolve(reference), token["raw"])
+        historical["text"] = "MUTATED PROMPT COPY"
+        token["raw"] = -123
+        self.assertEqual(self.store.read_documents([reference]), full)
+
+    def test_historical_view_keeps_notes_legends_and_empty_company_rows_without_estimate_values(self):
+        view = self.store.read_documents([self.reference("filing")], historical_years=[2024])
+        text = "\n".join(item["text"] for item in view)
+        self.assertIn("legacy division definitions remain distinct", text)
+        self.assertIn("Discontinued division: no reported observation", text)
+        self.assertIn("Direct Inferred", text)
+        self.assertIn("Historical data is provided by VA Actuals", text)
+        actuals = [token["raw"] for unit in view for token in unit["numbers"]]
+        for excluded in (777777, 123456, 555555, 900005, 900006, 900007, 900008, 110):
+            self.assertNotIn(excluded, actuals)
+            self.assertNotIn(str(excluded), text)
+        self.assertIn(100, actuals)
+        self.assertIn(45, actuals)
+        self.assertIn(20, actuals)
+
+    def test_eligible_company_actuals_and_filings_have_exact_numeric_support(self):
+        for name in ("actual", "filing", "group"):
+            with self.subTest(name=name):
+                reference = self.reference(name)
+                self.assertIsInstance(self.store.validate_historical_reference(reference, self.period()), dict)
+                self.assertEqual(self.store.resolve(reference), 100)
+        self.store.validate_historical_reference(self.reference("half_year"), self.period(slot="H1"))
+        self.store.validate_historical_reference(self.reference("quarter"), self.period(slot="Q1"))
+
+    def test_standardized_ratios_consensus_conflicting_estimates_and_helpers_are_ineligible(self):
+        for name in ("standard", "ratio", "future", "conflicting_estimate", "helper"):
+            with self.subTest(name=name):
+                # A manually supplied hidden citation must not bypass the view.
+                with self.assertRaises(ValueError):
+                    self.store.validate_historical_reference(self.reference(name), self.period())
+
+    def test_year_and_quarter_half_year_confusions_are_rejected(self):
+        cases = (("later_actual", self.period()), ("filing", self.period(2025)),
+                 ("half_year", self.period(slot="Q1")), ("quarter", self.period(slot="H1")),
+                 ("half_year", self.period()), ("filing", self.period(slot="H1")))
+        for name, period in cases:
+            with self.subTest(name=name, period=period["id"]):
+                with self.assertRaises(ValueError):
+                    self.store.validate_historical_reference(self.reference(name), period)
+
+    def test_unrecognized_vendor_layout_cannot_supply_historical_cells(self):
+        path = self.archive / "visible_alpha" / "unrecognized.xlsx"
+        self.make_workbook(path, recognized=False)
+        from research_platform.evidence import inventory_local_sources
+        spec = next(item for item in inventory_local_sources(self.archive)["sources"]
+                    if item["local_path"].endswith("unrecognized.xlsx"))
+        descriptor = self.store.add_local(spec, root=self.archive)
+        self.assertEqual(descriptor["vendor_layout"]["status"], "unsupported")
+        with self.assertRaises(ValueError):
+            self.store.validate_historical_reference(self.reference("filing", descriptor=descriptor), self.period())
+        self.assertEqual(Path(descriptor["path"]).read_bytes(), path.read_bytes())
+
+    def test_unclassified_forecast_sheet_is_preserved_but_excluded_from_historical_prompt(self):
+        book = load_workbook(self.path)
+        book.create_sheet("Forecasts").append(["Consensus FY2027", 900009])
+        book.save(self.path)
+        book.close()
+        from research_platform.evidence import inventory_local_sources
+        spec = inventory_local_sources(self.archive)["sources"][0]
+        descriptor = self.store.add_local(spec, root=self.archive)
+        reference = self.reference("filing", descriptor=descriptor)
+        full = self.store.read_documents([reference])
+        self.assertIn("Forecasts!R1", {unit["unit_id"] for unit in full})
+        view = self.store.read_documents([reference], historical_years=[2024])
+        self.assertNotIn("Forecasts!R1", {unit["unit_id"] for unit in view})
+        self.assertNotIn("900009", json.dumps(view))
+        forecast = {"source_id": descriptor["id"], "unit_id": "Forecasts!R1",
+                    "number_index": 0, "number_format": "dot_decimal"}
+        self.assertEqual(self.store.resolve(forecast), 900009)
+        with self.assertRaises(ValueError):
+            self.store.validate_historical_reference(forecast, self.period())
+        self.assertEqual(Path(descriptor["path"]).read_bytes(), self.path.read_bytes())
+
+    def test_vendor_dash_is_not_zero_and_nonnumeric_cell_explanations_remain_visible(self):
+        book = load_workbook(self.path)
+        book["Vendor data"]["I19"] = "-"
+        book["Vendor data"]["G19"] = "Not disclosed: refer to reporting note"
+        book.save(self.path)
+        book.close()
+        from research_platform.evidence import inventory_local_sources
+        spec = inventory_local_sources(self.archive)["sources"][0]
+        descriptor = self.store.add_local(spec, root=self.archive)
+        reference = self.reference("filing", descriptor=descriptor)
+        # The generic reader retains its original semantics. Vendor initiation
+        # must separately reject ambiguous missing markers before calculation.
+        self.assertEqual(self.store.resolve(reference), 0)
+        with self.assertRaises(ValueError):
+            self.store.validate_historical_reference(reference, self.period())
+        view = self.store.read_documents([reference], historical_years=[2024])
+        row = next(unit for unit in view if unit["unit_id"] == reference["unit_id"])
+        self.assertNotIn("I19", {token["locator"] for token in row["numbers"]})
+        self.assertNotIn("G19", {token["locator"] for token in row["numbers"]})
+        self.assertIn("Not disclosed: refer to reporting note", row["text"])
+        self.assertIn("-", row["text"])
+        self.assertEqual(Path(descriptor["path"]).read_bytes(), self.path.read_bytes())
+
+    def test_interim_dates_use_discovered_fiscal_year_not_an_assumed_december_year_end(self):
+        period = {"id": "2024-H1", "year": 2024, "kind": "half_year",
+                  "start": "2023-07-01", "end": "2023-12-31",
+                  "fiscal_year_start": "2023-07-01", "fiscal_year_end": "2024-06-30"}
+        reference = self.reference("half_year")
+        self.assertIsInstance(self.store.validate_historical_reference(reference, period), dict)
+        wrong_half = dict(period, start="2024-01-01", end="2024-06-30")
+        with self.assertRaises(ValueError):
+            self.store.validate_historical_reference(reference, wrong_half)
+
+    def test_materialization_cannot_accept_a_vendor_forecast_by_calling_it_an_actual(self):
+        fixture = HistoricalBasisTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        vendor = fixture.store.add_local(self.spec, root=self.archive)
+        reference = self.reference("future", store=fixture.store, descriptor=vendor)
+        fixture.read_units.update((unit["source_id"], unit["unit_id"])
+                                  for unit in fixture.store.read_documents([reference]))
+        shares = next(row for row in fixture.candidate["rows"] if row["id"] == "shares")
+        observation = next(item for item in shares["observations"] if item["period"] == "2024")
+        observation["reference"] = reference
+        observation["actual_or_estimate"] = "actual"
+        with self.assertRaises(ValueError):
+            fixture.materialize()
+
+    def test_workflow_preloads_vendor_history_but_keeps_blind_reviews_on_primary_sources(self):
+        fixture = LocalInitiationTests()
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        vendor_folder = fixture.archive / "visible_alpha"
+        vendor_folder.mkdir()
+        self.make_workbook(vendor_folder / "vendor.xlsx")
+        company = fixture.LocalProvider.scope(fixture.company, {"2024"})
+        primary_id = company.source["id"]
+
+        class PreloadedProvider(fixture.LocalProvider):
+            def complete(self, **kwargs):
+                payload = kwargs["payload"]
+                if payload["stage"] == "extract" and not any(
+                        unit["source_id"] == primary_id for unit in payload["evidence"]):
+                    self.calls.append(copy.deepcopy(payload))
+                    self.last_response = self.synthetic_response("extract")
+                    return {"action": "read", "read_requests": [{"source_id": primary_id,
+                            "unit_id": f"{self.company.sheet}!R1"}], "sources": [],
+                            "rows": [], "delete_row_ids": [], "search_query": "", "candidate": None}
+                return super().complete(**kwargs)
+
+        provider = PreloadedProvider(company)
+        _, record, _ = fixture.run_local(company=company, provider=provider, years=[2024])
+        self.assertEqual(record["status"], "accepted", record["issues"])
+        first = next(call for call in provider.calls if call["stage"] == "extract")
+        self.assertTrue(first["evidence"])
+        self.assertTrue(any("vendor_view" in unit for unit in first["evidence"]))
+        self.assertFalse(any(unit["source_id"] == primary_id for unit in first["evidence"]))
+        vendor_id = next(source["id"] for source in record["sources"] if source["category"] == "visible_alpha")
+        for call in provider.calls:
+            if call["stage"] in ("source_review", "coverage_inventory"):
+                self.assertNotIn(vendor_id, {item["id"] for item in call["catalog"]})
+                self.assertNotIn(vendor_id, {item["source_id"] for item in call["evidence"]})
+
+    def test_primary_company_spreadsheet_does_not_need_vendor_classification(self):
+        reports = self.archive / "financial_reports"
+        reports.mkdir()
+        path = reports / "original.xlsx"
+        book = Workbook()
+        book.active.append(["SYNTHETIC original company sales", 2024, 100])
+        book.save(path)
+        book.close()
+        from research_platform.evidence import inventory_local_sources
+        spec = next(item for item in inventory_local_sources(self.archive)["sources"]
+                    if item["category"] == "financial_reports")
+        descriptor = self.store.add_local(spec, root=self.archive)
+        reference = {"source_id": descriptor["id"], "unit_id": "Sheet!R1",
+                     "number_index": 1, "number_format": "dot_decimal"}
+        self.assertIsNone(self.store.validate_historical_reference(reference, self.period()))
+        self.assertEqual(self.store.read_documents([reference], historical_years=[2024]),
+                         self.store.read_documents([reference]))
 
 
 if __name__ == "__main__":
