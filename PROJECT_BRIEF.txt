@@ -1,6 +1,6 @@
 PROBABILISTIC FUNDAMENTAL RESEARCH PLATFORM
 Project ambition and handoff for Codex in VS Code
-Consolidated: 11 October 2026
+Consolidated: 23 October 2026
 
 READ THIS BEFORE CHOOSING OR IMPLEMENTING A MAJOR TASK
 
@@ -21,6 +21,51 @@ Nestlé is the first implementation case. Success means proving an end-to-end
 process that can be reused for another company without duplicating the research
 engine. The architecture should support a shared engine, sector templates and
 company configurations, while allowing real differences in business economics.
+
+Period construction is part of that reuse boundary: fiscal calendars, reporting
+frequency, entity versions, source definitions, currencies and policy choices are
+company inputs. Shared calculation logic enforces compatible flow arithmetic,
+closing-stock timing and ratio definitions. Historical changes retain original
+and restated views with cited bridges; context for a successor business includes
+its predecessors without implying those predecessors consolidate twice. Shared
+FX observations remain separate from independently supported company exposure.
+Shared FX evidence now has an authorized local SQLite store. Import originals
+once, preserve provider-native observations and revisions, and pin an immutable
+snapshot in each company run. Broker updates, spot-held period projections and
+company refreshes are deterministic and use no LLM. Company currency baskets,
+revenue/cost distinctions, proxies and calibration remain separately cited inputs;
+geographic footprint estimates are provisional exposure hypotheses, not disclosures.
+Sales and financial-statement modelling frequencies may differ within one company.
+Do not create unsupported quarterly financial statements to serve a shared factor.
+Assumptions is the authoritative forecast input/formula layer; Excel Model boxes
+display those controls and the same equations used by Python.
+
+Financial causality is a construction contract: independent spending, activity,
+unit costs and evidenced currency exposures determine operating expenses and profit.
+Presentation allocations cannot masquerade as economic drivers. Scope changes
+enter the affected operation once, with separate dates and accounting effects;
+reporting reorganisations do not create growth. Translation, transaction and
+balance-sheet currency effects retain separate bases and timing. Detail can end
+after a configured fiscal horizon, with later statements calculated directly at
+annual frequency and opening balances carried from the prior closing snapshot.
+These interfaces support future research agents without presuming calibrated
+relationships, precise undisclosed exposures or complete FX accounting.
+
+Every company model has an explicit information date, separate from fiscal-period
+dates and source publication dates. Availability and coverage apply to individual
+metrics, entities and reporting bases: a sales release cannot certify unreported
+profits or balances. A failed official-source freshness check leaves an incomplete
+update; cached work cannot certify that no newer facts exist. Deliberate historical
+vintages require evidence of availability at that date.
+
+The project owns a versioned financial-model renderer. Example company workbooks
+may inform design but cannot remain runtime dependencies. Normal analyst exports
+stay compact, with detailed technical provenance retained in machine-readable run
+artifacts. Shared FX refresh is deterministic and independent of company research;
+imported rates do not establish company exposure. Review routing starts cheaply,
+repairs context and contracts first, and escalates only a justified unresolved
+financial interpretation under the same cumulative budget. New company builds
+generate their own cited mappings and escalation evidence.
 
 The user wants speed, substantial AI involvement and continuous improvement. Those
 are product goals. They do not establish that a relationship is predictive or that
@@ -211,9 +256,9 @@ need evidence. Research agents must not silently rewrite production models or hi
 - Development: the existing Windows VS Code project and its virtual environment.
 - Code organization: one shared repository initially, with company configurations
   and reusable modules. Keep secrets and raw research/output stores out of Git.
-- Build locally first. SQLite is a proposed initial evidence registry, not an
-  installed capability. A shared database, object storage and cloud execution can
-  follow concrete concurrency, durability or coverage needs.
+- Build locally first. SQLite is implemented for the specifically authorized shared
+  FX evidence store. A general research registry, object storage and cloud execution
+  still require concrete concurrency, durability or coverage needs.
 - The older playbook's Django, PostgreSQL, worker and deployment choices are earlier
   proposals. Do not re-scaffold the project or require them merely because they
   appear in that document. Preserve the economic and provenance principles.
@@ -226,6 +271,36 @@ Git's initial setup checkpoint is commit 12a43be; do not infer current remote st
 or privacy from local references. Never invent the user's Git identity.
 
 10. DELIVER SMALL COMPLETE STEPS THAT SERVE THE WHOLE SYSTEM
+
+Scope update authorized on 22 October 2026: construct the financial model and its
+forecasting interfaces now. The reusable workflow ingests local vendor/company
+originals, reconciles supported history, identifies material company/segment drivers,
+defines their financial dependencies, calculates a clearly labelled temporary annual
+baseline, validates behaviour and exports an editable, portable Excel workbook.
+The historical-only initiation command remains a stricter acceptance route; partial
+construction outputs preserve supported numbers and precise gaps without claiming
+accepted history or a complete three-statement model.
+
+A driver input has a stable ID, entity, period, unit/scale, scenario identity, value
+and provenance. Its source may be reported/derived, a temporary manual assumption,
+a separately labelled consensus reference, or a later external forecasting model.
+Replacing that input source must not rewrite financial equations. Python calculates;
+one restricted expression specification also generates Excel formulas. Physical
+quantities are preferred when disclosed; otherwise use cited growth conventions or
+explicit indices. Unknown exposures, lags and elasticities remain unresolved.
+Do not add the future econometric/qualitative driver models, probabilities, Monte
+Carlo or valuation engine in this milestone. Their place in the wider cycle remains.
+
+Operating cost is a design requirement: start with GPT-6 Luna throughout construction.
+Evaluate low/medium reasoning by task; improve evidence, task structure and bounded
+repairs before a more expensive route. Record failing cases and same-case comparisons,
+including low/medium Luna and another inexpensive supported supplier if available.
+Do not silently fall back to Sol. Keep provider boundaries changeable within OpenAI,
+Anthropic and Google; additional accounts are not prerequisites. Save intermediate
+work, settings, versions, token usage, durations, costs and unresolved reviews.
+
+The historical foundation below describes the retained initiation workflow. Its
+blank-forecast restriction does not prohibit the newly authorized construction path.
 
 The immediate scope, corrected on 10 October and updated on 11 October 2026, is
 reusable historical initiation from a company query and local source archive.
@@ -333,15 +408,15 @@ not the initiation architecture. Later segment restatements are separate reporti
 versions, not silent relabelings. README distinguishes offline workflow tests from
 live AI research, provider configuration and outstanding accuracy validation.
 
-Implementation sequence, with later stages remaining roadmap rather than current scope:
+Implementation sequence, with driver interfaces and temporary forecasts now authorized; probabilistic forecasting and valuation remain later work:
 1. Establish a requested company's identity, reporting periods, authoritative evidence,
    financial rows and definitions from its local archive through the reusable AI workflow.
 2. Preserve originals, extract cited history with whole-document context, independently review sources
    and structure, reconcile accounting and revise within bounds. Export accepted
    history with blank forecasts, or explicit incomplete results. Validate first on
    Nestlé and then unrelated real companies; synthetic fixtures prove mechanics only.
-3. Develop supported operating drivers and linked forecast equations, then a separate
-   DCF. Do not impose forecast policies while still establishing reported history.
+3. Develop supported operating drivers and linked forecast equations with temporary
+   assumptions now. DCF follows as a separate milestone; preserve historical evidence.
 4. Add defensible uncertainty to selected drivers, with shared coherent factor paths.
 5. Record provisional forecasts as soon as meaningful targets and resolution rules
    exist; add reverse valuation alongside or afterward. Its completion must not
@@ -406,6 +481,23 @@ This brief retains the broad vision while distinguishing later roadmap proposals
 current decisions and verified implementation.
 
 13. IMPLEMENTATION BOUNDARIES
+
+Construction clarification, 23 October 2026: the immediate deliverable is an
+executable segment-driven company model, not a historical table with forecast
+labels. Bunzl supplies reusable analytical and presentation principles: operating
+blocks, corporate reconciliation, three linked statements, supporting schedules,
+inline assumption boxes and live checks. Its company numbers and economic
+assumptions must not enter Nestle. Future quantitative and qualitative research
+will feed the same driver interfaces now populated with explicit temporary inputs.
+Construction uses cached source indexes and targeted original sections with enough
+context, expanding retrieval when needed. The older whole-document and blind-first
+requirements describe the separate historical-initiation workflow, not a mandatory
+gate before making this real company model useful. Actual source comparisons,
+financial identities, independent expectations, sensitivity behaviour and Excel
+inspection remain required; balanced statements and synthetic tests are insufficient.
+The construction budget follows one cumulative attempt ledger. Unknown requests
+retain conservative reservations and may coexist with further work inside the
+authorized allowance; they are never assumed free or silently reset by migration.
 
 Consolidated from the former architecture document during the 10 October 2026
 cleanup. These are implementation principles and proposals, not built capabilities.

@@ -3,7 +3,8 @@
 Set OPENAI_API_KEY, RESEARCH_MODEL, EXTRACTION_MODEL and REVIEW_MODEL in the
 environment or an explicitly selected local settings file before a live run.
 Optional per-role REASONING_EFFORT settings default explicitly to medium.
-No models or credentials are silently selected.
+Luna is the initial model; credentials are never inferred. Stage overrides are
+explicit settings, with no automatic fallback or paid transport retries.
 Alternative providers implement AIProvider without changing the research workflow.
 """
 
@@ -31,6 +32,11 @@ ROLE_SETTINGS = {
     "extractor": "EXTRACTION_MODEL",
     "reviewer": "REVIEW_MODEL",
 }
+DEFAULT_MODEL = "gpt-6-luna"
+STAGE_EFFORTS = {"construction_select": "low", "construction_map": "low",
+                 "construction_history": "medium", "construction_drivers": "medium",
+                 "construction_formulas": "medium", "construction_review": "medium"}
+EXTRA_SETTINGS = {"STAGE_MODELS", "STAGE_REASONING_EFFORTS", "MODEL_PRICING_JSON", "OPENAI_TIMEOUT_SECONDS"}
 REASONING_SETTINGS = {
     "researcher": "RESEARCH_REASONING_EFFORT",
     "extractor": "EXTRACTION_REASONING_EFFORT",
@@ -41,7 +47,7 @@ REASONING_SETTINGS = {
 REASONING_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 PROMPT_LAYOUT = "catalog-and-whole-document-prefix-v2"
 
-PRICING_DATE = "2026-10-10"
+PRICING_DATE = "2026-10-23"
 PRICING_SOURCE = "https://developers.openai.com/api/docs/pricing"
 # Standard USD per million tokens: ordinary input, cache read, cache write, output.
 # Verified against the pricing, model and prompt-caching documentation on this date.
@@ -68,7 +74,7 @@ def _local_settings(path: Path | None) -> dict[str, str]:
         return {}
     except (OSError, UnicodeError):
         raise AIError("The local API settings file could not be read as UTF-8.") from None
-    allowed = {"OPENAI_API_KEY", *ROLE_SETTINGS.values(), *REASONING_SETTINGS.values()}
+    allowed = {"OPENAI_API_KEY", *ROLE_SETTINGS.values(), *REASONING_SETTINGS.values(), *EXTRA_SETTINGS}
     settings: dict[str, str] = {}
     for line_number, line in enumerate(content.splitlines(), 1):
         line = line.strip()
@@ -110,7 +116,7 @@ def has_known_pricing(model: str) -> bool:
     return _model_rates(model) is not None
 
 
-def response_usage(response: dict | None, model: str) -> dict:
+def response_usage(response: dict | None, model: str, pricing: dict | None = None) -> dict:
     """Normalize reported usage and estimate standard pricing, never an invoice.
 
     Cache reads/writes are subsets of input tokens; reasoning is already included
@@ -163,7 +169,9 @@ def response_usage(response: dict | None, model: str) -> dict:
         return result
     result.update(counts)
     result["reported"] = True
-    rates = _model_rates(actual_model)
+    rates = (pricing.get("rates", {}).get(actual_model) if pricing else _model_rates(actual_model))
+    if pricing:
+        result.update(pricing_date=pricing["date"], pricing_source=pricing["source"])
     if rates is None or not tool_pricing_known or response.get("service_tier", "default") != "default":
         return result
     input_rate, cache_rate, write_rate, output_rate = rates
@@ -432,15 +440,25 @@ class OpenAIProvider:
         reasoning_efforts: dict[str, str] | None = None,
         base_url: str = "https://api.openai.com/v1", timeout: float = 120,
         max_output_tokens: int = 16000,
+        stage_models: dict[str, str] | None = None,
+        stage_efforts: dict[str, str] | None = None,
+        pricing: dict | None = None,
     ) -> None:
         self._api_key = api_key.strip()
-        self.models = dict(models or {})
+        self.models = dict.fromkeys(ROLE_SETTINGS, DEFAULT_MODEL) if models is None else dict(models)
+        self.stage_models = dict(stage_models or {})
+        self.stage_efforts = dict(STAGE_EFFORTS)
+        self.stage_efforts.update(stage_efforts or {})
+        self.pricing = pricing
         self.reasoning_efforts = dict.fromkeys(ROLE_SETTINGS, "medium")
         self.reasoning_efforts.update(reasoning_efforts or {})
         self.endpoint = base_url.rstrip("/") + "/responses"
         self.timeout = timeout
         self.max_output_tokens = max_output_tokens
         self.last_response: dict[str, Any] | None = None
+        # The application reserves and saves this ID before dispatch. urllib
+        # performs one POST; any retry must obtain its own ledger reservation.
+        self.next_client_request_id: str | None = None
 
     @classmethod
     def from_env(cls, env_file: Path | None = None) -> OpenAIProvider:
@@ -450,18 +468,34 @@ class OpenAIProvider:
         empty process setting overrides a local value and fails validation.
         """
         settings = _local_settings(env_file)
-        for name in ("OPENAI_API_KEY", *ROLE_SETTINGS.values(), *REASONING_SETTINGS.values()):
+        for name in ("OPENAI_API_KEY", *ROLE_SETTINGS.values(), *REASONING_SETTINGS.values(), *EXTRA_SETTINGS):
             if name in os.environ:
                 settings[name] = os.environ[name]
         return cls(
             api_key=settings.get("OPENAI_API_KEY", ""),
-            models={role: settings.get(name, "").strip()
+            models={role: settings.get(name, DEFAULT_MODEL).strip()
                     for role, name in ROLE_SETTINGS.items()},
             reasoning_efforts={role: settings.get(name, "medium").strip()
                                for role, name in REASONING_SETTINGS.items()},
+            stage_models=json.loads(settings.get("STAGE_MODELS", "{}")),
+            stage_efforts=json.loads(settings.get("STAGE_REASONING_EFFORTS", "{}")),
+            pricing=json.loads(settings["MODEL_PRICING_JSON"]) if settings.get("MODEL_PRICING_JSON") else None,
+            timeout=float(settings.get("OPENAI_TIMEOUT_SECONDS", "120")),
         )
 
     def validate_configuration(self) -> None:
+        if any(not isinstance(k, str) or not isinstance(v, str) or not v.strip()
+               for k, v in self.stage_models.items()):
+            raise AIError("Stage model overrides must map stage names to nonempty model IDs.")
+        if any(v not in REASONING_EFFORTS for v in self.stage_efforts.values()):
+            raise AIError("Invalid stage reasoning effort.")
+        if self.pricing is not None:
+            if (not isinstance(self.pricing, dict) or set(self.pricing) != {"date", "source", "rates"}
+                    or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", self.pricing.get("date", ""))
+                    or not self.pricing.get("source") or not isinstance(self.pricing["rates"], dict)
+                    or any(not isinstance(r, list) or len(r) != 4 or any(type(x) not in (int, float)
+                           or not math.isfinite(x) or x < 0 for x in r) for r in self.pricing["rates"].values())):
+                raise AIError("Pricing needs date, source and model rates [input, cached, write, output].")
         missing = ([] if self._api_key else ["OPENAI_API_KEY"])
         missing += [name for role, name in ROLE_SETTINGS.items()
                     if not isinstance(self.models.get(role), str)
@@ -487,11 +521,22 @@ class OpenAIProvider:
     def metadata(self) -> dict[str, Any]:
         """Safe run provenance; API keys and authorization headers are excluded."""
         return {"provider": "openai_responses", "models": dict(self.models),
+                "stage_models": self.stage_models, "stage_reasoning_efforts": self.stage_efforts,
+                "pricing": self.pricing or {"date": PRICING_DATE, "source": PRICING_SOURCE,
+                    "rates": {model: list(rates) for model, rates in _STANDARD_RATES.items()}},
                 "reasoning_efforts": dict(self.reasoning_efforts),
                 "reasoning_mode": "standard", "prompt_layout": PROMPT_LAYOUT,
                 "endpoint": self.endpoint,
                 "max_output_tokens": self.max_output_tokens, "timeout": self.timeout,
-                "service_tier": "default"}
+                "service_tier": "default", "transport_attempts_per_call": 1,
+                "sdk_retries": 0, "stored_responses": False}
+
+    def route(self, role, stage=None):
+        return (self.stage_models.get(stage, self.models[role]),
+                self.stage_efforts.get(stage, self.reasoning_efforts[role]))
+
+    def usage(self, response, model):
+        return response_usage(response, model, self.pricing)
 
     def _request_body(
         self, *, role: str, instructions: str, payload: dict,
@@ -501,11 +546,12 @@ class OpenAIProvider:
             raise AIError("Unknown AI role; expected researcher, extractor or reviewer.")
         if not isinstance(payload, dict) or not isinstance(schema, dict):
             raise AIError("AI payload and response schema must be JSON objects.")
+        model, effort = self.route(role, payload.get("stage"))
         body: dict[str, Any] = {
-            "model": self.models[role], "store": False, "service_tier": "default",
+            "model": model, "store": False, "service_tier": "default",
             "instructions": instructions,
             "input": _input_messages(payload),
-            "reasoning": {"effort": self.reasoning_efforts[role], "mode": "standard"},
+            "reasoning": {"effort": effort, "mode": "standard"},
             "text": {"format": {"type": "json_schema", "name": "research_result",
                                   "schema": schema, "strict": True}},
             "max_output_tokens": self.max_output_tokens,
@@ -535,11 +581,16 @@ class OpenAIProvider:
         input_allowance = len(_compact_json(body).encode("utf-8")) + 2048 + 128 * len(body["input"])
         result = {"estimated_cost_usd": None, "estimated_input_tokens": input_allowance,
                   "max_output_tokens": self.max_output_tokens,
+                  "output_limit_includes_reasoning": True, "paid_tool_calls_max": 0 if not web else None,
+                  "transport_attempts": 1, "sdk_retries": 0, "model": body["model"],
                   "method": "utf8-bytes-plus-framing-allowance-v1",
                   "cache_assumption": "No cache hit; maximum ordinary-input/cache-write rate",
                   "is_exact": False, "pricing_date": PRICING_DATE,
-                  "pricing_source": PRICING_SOURCE}
-        rates = _model_rates(self.models[role])
+                  "pricing_source": PRICING_SOURCE,
+                  "pricing": self.pricing or {"date": PRICING_DATE, "source": PRICING_SOURCE, "rates": _STANDARD_RATES}}
+        if self.pricing:
+            result.update(pricing_date=self.pricing["date"], pricing_source=self.pricing["source"])
+        rates = self.pricing["rates"].get(body["model"]) if self.pricing else _model_rates(body["model"])
         if web or rates is None:
             result["limitation"] = ("Web tool inputs cannot be bounded locally." if web
                                     else "The model has no known pricing.")
@@ -549,6 +600,8 @@ class OpenAIProvider:
         if input_allowance > 272000:
             input_rate *= 2
             output_rate *= 1.5
+        result.update(input_rate_per_million=input_rate, output_rate_per_million=output_rate,
+                      pricing_tier="long_context" if input_allowance > 272000 else "short_context")
         result["estimated_cost_usd"] = round(
             (input_allowance * input_rate + self.max_output_tokens * output_rate) / 1_000_000, 10)
         return result
@@ -561,7 +614,12 @@ class OpenAIProvider:
         self.validate_configuration()
         body = self._request_body(role=role, instructions=instructions,
                                   payload=payload, schema=schema, web=web)
-        transport = {"client_request_id": str(uuid4()), "timeout_seconds": self.timeout}
+        request_id = self.next_client_request_id or str(uuid4())
+        self.next_client_request_id = None
+        if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id):
+            raise AIError("Invalid preassigned client request ID.")
+        transport = {"client_request_id": request_id, "timeout_seconds": self.timeout,
+                     "attempts": 1, "sdk_retries": 0}
         request = Request(
             self.endpoint, data=json.dumps(body, allow_nan=False).encode("utf-8"),
             headers={"Authorization": "Bearer " + self._api_key,
@@ -572,6 +630,11 @@ class OpenAIProvider:
         self.last_response = {"status": "transport_error", "_transport": transport}
         try:
             with urlopen(request, timeout=self.timeout) as response:
+                headers = getattr(response, "headers", None)
+                if headers is not None:
+                    provider_request_id = headers.get("x-request-id")
+                    if isinstance(provider_request_id, str):
+                        transport["provider_request_id"] = provider_request_id
                 raw = response.read(16 * 1024 * 1024 + 1)
             if len(raw) > 16 * 1024 * 1024:
                 self.last_response["status"] = "response_error"
@@ -635,3 +698,29 @@ class OpenAIProvider:
         if not isinstance(data, dict):
             raise AIError("AI output must be a JSON object.")
         return data
+
+    def retrieve_response(self, response_id: str) -> dict:
+        """Retrieve a known provider Response ID without creating/retrying work.
+
+        A client UUID or x-request-id is not a Response ID. Old store=False calls
+        may be unavailable; an error never clears the outstanding reservation.
+        """
+        if not isinstance(response_id, str) or not re.fullmatch(r"resp_[A-Za-z0-9_-]+", response_id):
+            raise AIError("Response retrieval requires a saved provider resp_ ID; client request IDs cannot recover results.")
+        self.validate_configuration()
+        request = Request(self.endpoint + "/" + response_id,
+                          headers={"Authorization": "Bearer " + self._api_key}, method="GET")
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                raw = response.read(16 * 1024 * 1024 + 1)
+            if len(raw) > 16 * 1024 * 1024:
+                raise AIError("Retrieved response exceeded the 16 MiB safety limit.")
+            result = _strict_json(raw.decode("utf-8"))
+        except HTTPError as exc:
+            raise AIError(f"Saved response retrieval returned HTTP {exc.code}; reservation remains unresolved.") from None
+        except (URLError, OSError, HTTPException, ValueError, UnicodeDecodeError):
+            raise AIError("Saved response retrieval failed; reservation remains unresolved.") from None
+        if not isinstance(result, dict) or result.get("id") != response_id:
+            raise AIError("Retrieved response ID did not match the saved request.")
+        self.last_response = result
+        return result

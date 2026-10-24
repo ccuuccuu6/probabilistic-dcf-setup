@@ -12,6 +12,7 @@ import ipaddress
 import json
 import logging
 import math
+import os
 import re
 import socket
 import struct
@@ -77,6 +78,7 @@ def _xls_formula_cells(workbook, sheet_index):
 
 def _local_file(root: Path, relative: str) -> Path:
     """Resolve an explicit archive member, refusing links and paths outside it."""
+    root = _archive_path(root)
     relative_path = Path(relative)
     if relative_path.is_absolute() or not relative_path.parts or ".." in relative_path.parts:
         raise ValueError("Local source paths must stay relative to the supplied archive.")
@@ -102,6 +104,15 @@ def _local_payload(path: Path) -> bytes:
     return payload
 
 
+def _archive_path(path: Path) -> Path:
+    """Windows extended paths keep deeply nested originals readable, unchanged."""
+    path = Path(path).absolute()
+    if os.name == "nt" and not str(path).startswith("\\\\?\\"):
+        raw = str(path)
+        path = Path("\\\\?\\UNC\\" + raw[2:] if raw.startswith("\\\\") else "\\\\?\\" + raw)
+    return path
+
+
 def inventory_local_sources(root: Path) -> dict:
     """Inventory user-supplied originals without network or model requests.
 
@@ -109,7 +120,7 @@ def inventory_local_sources(root: Path) -> dict:
     historical model. Its statements remain supplied metadata, not verified facts.
     Content hashes and this manifest are frozen before any paid work starts.
     """
-    supplied_root = Path(root).expanduser()
+    supplied_root = _archive_path(Path(root).expanduser())
     if supplied_root.is_symlink() or (hasattr(supplied_root, "is_junction") and supplied_root.is_junction()):
         raise ValueError("The source archive must be a real directory, not a link.")
     root = supplied_root.resolve(strict=True)
@@ -184,6 +195,18 @@ def inventory_local_sources(root: Path) -> dict:
                       "kind": "vendor_export" if child.name == "visible_alpha" else
                               "transcript" if child.name == "transcripts" else "company_document",
                       "supplied_metadata": row, "metadata_verification": "user_supplied_not_verified"}
+            if child.name=='visible_alpha':
+                role=row.get('dataset_role') or row.get('source_role')
+                if role:role=role.casefold().replace('-','_').replace(' ','_').replace('standardised','standardized')
+                # User-labelled dataset filenames are role designations only.
+                # Actual issuer, periods, definitions and numbers still need evidence.
+                if not role:
+                    label=path.stem.casefold().replace('-',' ')
+                    role='company_reported' if 'company reported' in label else 'standardized' if 'standardised' in label or 'standardized' in label else None
+                if role:
+                    if role not in ('company_reported','standardized','combined'):raise ValueError('Unsupported vendor dataset role')
+                    source['dataset_role']=role
+                    source['dataset_role_origin']='sources.csv' if row.get('dataset_role') or row.get('source_role') else 'user_dataset_filename_label'
             sources.append(source)
             members.append({"local_path": relative, "sha256": digest})
     if not sources:
@@ -535,14 +558,13 @@ def _vendor_period(value):
     return {"year": int(match["year"]), "slot": slot, "estimate": bool(match["estimate"])}
 
 
-def _vendor_profile(payload, file_format, units):
-    """Recognise the supplied vendor template, retaining user-origin semantics.
+def _vendor_profile(payload, file_format, units, dataset_role=None):
+    """Classify explicit dataset/section roles after validating vendor schemas.
 
-    The export has no explicit standardised/company-reported marker. The user's
-    designation applies only to a recognised repeated-header layout after Ratios;
-    an unfamiliar layout remains unusable as historical numeric evidence.
+    A file role designates its dataset, not the economic meaning of every metric.
+    Combined exports require named section labels; row position alone is invalid.
     """
-    summary = {"status": "unsupported", "version": 1, "origin": "user_instruction",
+    summary = {"status": "unsupported", "version": 2, "origin": "explicit_dataset_or_section_labels",
                "reason": "Unrecognised vendor layout; use company originals for historical numbers.",
                "exclusions": "Historical AI views omit standardised tables, estimates and analytics helper values; originals remain complete."}
     profile = {"header_sets": {}, "sheets": []}
@@ -576,22 +598,27 @@ def _vendor_profile(payload, file_format, units):
                 headers.append({"row": n, "period_row": n - 1, "unit_col": unit_col,
                                 "label_col": unit_col - 1, "analytics_col": unit_col + 1,
                                 "columns": columns})
-            if len(headers) < 2:
+            if not headers:continue
+            markers=[]
+            aliases={'company reported':'company_reported','company-reported':'company_reported',
+                     'company reported data':'company_reported','standardised':'standardized','standardized':'standardized',
+                     'standardised data':'standardized','standardized data':'standardized'}
+            for n,values in rows.items():
+                found={aliases[str(v).strip().casefold()] for v in values.values() if str(v).strip().casefold() in aliases}
+                if len(found)>1:raise ValueError('Conflicting vendor section labels')
+                if found:markers.append((n,next(iter(found))))
+            role=dataset_role or aliases.get(sheet.title.casefold())
+            if role not in (None,'company_reported','standardized','combined'):
+                raise ValueError('Unknown vendor dataset_role')
+            if role in ('company_reported','standardized'):
+                if any(label!=role for n,label in markers):raise ValueError('Dataset role contradicts workbook section labels')
+                markers=[(0,role)]
+            elif not markers or {label for n,label in markers}!={'company_reported','standardized'}:
                 continue
-            ratios = [n for n, values in rows.items() for header in headers
-                      if header["row"] < n and str(values.get(header["label_col"], "")).strip().casefold() == "ratios"]
-            ratios = sorted(set(ratios))
-            if len(ratios) != 1:
-                continue
-            following = [h for h in headers if h["row"] > ratios[0]]
-            preceding = [h for h in headers if h["row"] < ratios[0]]
-            if not following or not preceding:
-                continue
-            boundary = following[0]["period_row"]
-            sheet_info = {"sheet": sheet.title, "company_start": boundary,
-                          "ratios_reference": f"{sheet.title}!R{ratios[0]}",
-                          "boundary_references": [f"{sheet.title}!R{boundary}", f"{sheet.title}!R{boundary + 1}"]}
-            profile["sheets"].append(sheet_info)
+            sheet_info={'sheet':sheet.title,'dataset_role':role or 'combined',
+                        'section_labels':[dict(row=n,role=label) for n,label in markers],
+                        'boundary_references':[f'{sheet.title}!R{n}' for n,label in markers]}
+            profile['sheets'].append(sheet_info)
             active = None
             for n, values in rows.items():
                 if n in {h["period_row"] for h in headers}:
@@ -609,7 +636,7 @@ def _vendor_profile(payload, file_format, units):
                 label = str(values.get(active["label_col"], "")).strip()
                 unit = str(values.get(active["unit_col"], "")).strip()
                 analytics = str(values.get(active["analytics_col"], "")).strip()
-                section = "company_reported" if n >= boundary else "standardized"
+                section = next((label for start,label in reversed(markers) if n>=start),'metadata')
                 if n in (active["row"], active["period_row"]):
                     role = "header"
                 elif label and unit and analytics.casefold() == "analytics":
@@ -634,7 +661,7 @@ def _vendor_profile(payload, file_format, units):
                     "header_id": active["id"], "label": label, "unit": unit, "context": context,
                     "missing_markers": missing}
         if profile["sheets"]:
-            summary.update(status="recognized", reason="User-designated company tables begin at the repeated header after Ratios.",
+            summary.update(status="recognized", reason="Explicit dataset or labelled section role, validated period/series/unit schema; no positional company mapping.",
                            sheets=profile["sheets"],
                            caveat="VA Actuals/Filings are vendor channels, not independent proof of company reporting or historical availability.")
             unclassified = set()
@@ -685,7 +712,7 @@ class SourceStore:
             raise ValueError("Invalid source ID.")
 
     @staticmethod
-    def _index(payload: bytes, file_format: str, source_id: str, category=None):
+    def _index(payload: bytes, file_format: str, source_id: str, category=None, dataset_role=None):
         """Use the same bounded parser for new and restored originals."""
         units, text_length = {}, 0
         for unit in _units(payload, file_format):
@@ -701,7 +728,7 @@ class SourceStore:
                     "extraction_warnings": [{"unit_id": key, "messages": unit["warnings"]}
                                             for key, unit in units.items() if unit.get("warnings")]}
         if category == "visible_alpha":
-            metadata["vendor_layout"], metadata["vendor_profile"] = _vendor_profile(payload, file_format, units)
+            metadata["vendor_layout"], metadata["vendor_profile"] = _vendor_profile(payload, file_format, units, dataset_role)
         return units, metadata
 
     def add(self, spec: dict) -> dict:
@@ -787,7 +814,7 @@ class SourceStore:
                            "acquisition": "local_copy", "status": "unreadable"})
         self.sources.append(descriptor)
         try:
-            units, metadata = self._index(payload, file_format, source_id, spec.get("category"))
+            units, metadata = self._index(payload, file_format, source_id, spec.get("category"), spec.get("dataset_role"))
         except Exception as exc:
             descriptor["error"] = str(exc)
             raise
@@ -838,7 +865,7 @@ class SourceStore:
         if descriptor["status"] == "ready":
             if isinstance(descriptor.get("unit_count"), bool) or not isinstance(descriptor.get("unit_count"), int):
                 raise ValueError("Archived source unit count is invalid.")
-            units, metadata = self._index(payload, file_format, source_id, descriptor.get("category"))
+            units, metadata = self._index(payload, file_format, source_id, descriptor.get("category"), descriptor.get("dataset_role"))
             if any(descriptor.get(key) != value for key, value in metadata.items()):
                 raise ValueError("Archived source extraction metadata changed; saved evidence cannot be replayed.")
         elif not isinstance(descriptor.get("error"), str) or not descriptor["error"]:
@@ -1062,3 +1089,241 @@ class SourceStore:
         except (KeyError, IndexError) as exc:
             raise ValueError("Numeric reference does not exist in the archived source.") from exc
         return parse_number(token["raw"], reference["number_format"])
+
+
+def source_selection_audit(data,spec,frozen_sources,values=None):
+    """Trace active historical cells to exact originals, never infer from Excel output."""
+    from collections import Counter
+    sources={s['id']:s for s in frozen_sources};books={};records=[];counts=Counter()
+    observations={o['id']:o for o in spec.get('observations',[])}
+    try:
+        for row in spec['rows']:
+            if row['section']=='fx' or row.get('evidence_role')=='shared_factor_diagnostic':continue
+            for pid,cell in row.get('cells',{}).items():
+                if cell.get('status') not in ('actual','reported','derived_actual'):continue
+                if cell.get('value') is None and not cell.get('expression'):continue
+                observation=observations.get(cell.get('observation_id'),{})
+                refs=cell.get('source_refs',observation.get('source_refs',[]));bindings=[]
+                for ref in refs:
+                    source=sources.get(ref.get('source_id'),{});entry=dict(ref)
+                    entry.update(file=source.get('local_path'),sha256=source.get('sha256'),publication=source.get('published_at'),
+                        dataset_role=source.get('dataset_role'),category=source.get('category'))
+                    if source.get('category')=='visible_alpha' and ref.get('cell') and source.get('path'):
+                        if source['id'] not in books:books[source['id']]=load_workbook(source['path'],data_only=True)
+                        sheet=books[source['id']][ref['sheet']];number=sheet[ref['cell']].row
+                        entry['row_labels']=[str(c.value) for c in sheet[number][:6] if c.value is not None]
+                    bindings.append(entry)
+                origin='calculation' if cell.get('expression') else '+'.join(sorted({
+                    ('VA '+(b.get('dataset_role') or 'legacy combined; role requires saved designation')) if b.get('category')=='visible_alpha' else
+                    'company document' if b.get('category')=='financial_reports' else str(b.get('category')) for b in bindings})) or 'unresolved'
+                if row['id']=='period_year_fraction':
+                    origin='fiscal calendar calculation'
+                    bindings=[dict(period=next(p for p in spec['periods'] if p['id']==pid),method='Inclusive period days divided by fiscal-year days')]
+                counts[origin]+=1
+                records.append(dict(row_id=row['id'],metric=row['label'],period=pid,status=cell['status'],
+                    unit=row['unit'],currency=data['currency'],reporting_basis=cell.get('basis',observation.get('basis')),
+                    definition=observation.get('definition',row.get('definition',row['label'])),
+                    value=(values or {}).get(row['id'],{}).get(pid,cell.get('value')),origin=origin,bindings=bindings,
+                    derivation=dict(expression=cell.get('expression'),bindings=cell.get('bindings',{}),observation_derivation=cell.get('derivation'))))
+    finally:
+        for book in books.values():book.close()
+    return dict(method='Active cell graph and preserved original input bindings; calculations retain dependency IDs.',
+        counts=dict(counts),records=records,standardized_policy='Secondary comparison only; never a missing primary substitute',
+        measure_policy='Underlying/trading/statutory profits have distinct IDs and definitions; accounting identities retain explicit adjustment bridges')
+
+
+def migrate_vendor_bindings(data,frozen_sources,new_sources):
+    """Move unchanged active vendor facts to an explicitly company-reported file.
+
+    Exact label, unit, fiscal slot and cached number must agree. Missing or changed
+    data is an exception for research, never a standardized fallback or a zero.
+    """
+    books={};profiles={};audit=[];sources={s['id']:s for s in frozen_sources}
+    try:
+        candidates=[]
+        for source in new_sources:
+            if source.get('dataset_role')!='company_reported':continue
+            payload=Path(source['path']).read_bytes();book=load_workbook(io.BytesIO(payload),data_only=True)
+            books[source['id']]=book
+            units,metadata=SourceStore._index(payload,'xlsx',source['id'],'visible_alpha','company_reported')
+            if metadata['vendor_layout']['status']!='recognized':raise ValueError('Unsupported separated company-reported VA file')
+            profiles[source['id']]=metadata
+            for unit in units.values():
+                row=unit['vendor_row']
+                if row['role']!='metric' or row['section']!='company_reported':continue
+                sheet,number=unit['unit_id'].rsplit('!R',1)
+                candidates.append((source,sheet,int(number),row,metadata['vendor_profile']['header_sets'][row['header_id']]['columns']))
+        def replace(ref,pid):
+            source=sources.get(ref.get('source_id'))
+            if not source or source.get('category')!='visible_alpha' or not ref.get('cell'):return ref
+            if source.get('dataset_role')=='company_reported':return ref
+            if source['id'] not in books:books[source['id']]=load_workbook(source['path'],data_only=True)
+            sheet=books[source['id']][ref['sheet']];oldrow=sheet[ref['cell']].row
+            # Unit/metric columns are located from labelled Units headers.
+            headers=[c for row in sheet.iter_rows(max_row=oldrow) for c in row[:10] if str(c.value).strip().casefold()=='units']
+            if not headers:raise ValueError('Original vendor binding has no Units schema')
+            header=headers[-1];label=sheet.cell(oldrow,header.column-1).value;unit=sheet.cell(oldrow,header.column).value
+            year,kind=(pid.split('-',1)+['FY'])[:2] if '-' in pid else (pid,'FY')
+            options=[]
+            for new,sname,n,row,columns in candidates:
+                if row['label']!=label or row['unit']!=unit:continue
+                for col,info in columns.items():
+                    if info['year']!=int(year) or info['slot']!=kind or not info['eligible']:continue
+                    value=books[new['id']][sname][col+str(n)].value
+                    if type(value) not in (int,float):continue
+                    options.append((info['series'].casefold()!='filings',new,sname,col+str(n),value,info))
+            if not options:raise ValueError('Missing company-reported equivalent for '+str(label)+' '+pid)
+            options.sort(key=lambda x:x[0]);_,new,sname,cell,value,info=options[0]
+            if value!=ref['raw']:raise ValueError('Changed vendor observation needs source reconciliation: '+str(label)+' '+pid)
+            revised=dict(ref,source_id=new['id'],sheet=sname,cell=cell,series=info['series'],row_label=label,
+                dataset_role='company_reported',basis_note='Exact-label/unit/period/cache migration from preserved combined company-reported binding; original financial definition unchanged')
+            audit.append(dict(period=pid,label=label,before=ref,after=revised));return revised
+        for collection in ('historical','schedule_controls'):
+            for role in data.get(collection,{}).values():
+                for year,refs in role.get('sources',{}).items():role['sources'][year]=[replace(ref,str(year)+'-FY') for ref in refs]
+        for observation in data.get('observations',[]):
+            if observation.get('status') not in ('actual','reported','derived_actual'):continue
+            observation['source_refs']=[replace(ref,observation['period_id']) for ref in observation.get('source_refs',[])]
+        return audit
+    finally:
+        for book in books.values():book.close()
+
+
+def verify_model_input_sources(data: dict, archive: Path) -> list[dict]:
+    """Audit a frozen company input specification against unchanged originals.
+
+    Spreadsheet checks read cached values, retain signs and apply the recorded
+    multiplier once. PDF checks establish only that the signed numeric token
+    occurs on the specified complete page, not that the concept/period mapping
+    is correct. Derived observations must retain weighted original references.
+    Workbook/PDF objects and page tokens are cached by content hash for this audit.
+    """
+    checks, payloads, books, pages = [], {}, {}, {}
+    sources = data.get("sources", {})
+    if isinstance(sources, list):
+        sources = {source["id"]: source for source in sources}
+    tolerance = 1e-8
+
+    def check(name, status, detail, difference=None, area="source_data"):
+        checks.append(dict(area=area, name=name, status=status, detail=detail,
+                           difference=difference, tolerance=tolerance))
+
+    for source_id, source in sources.items():
+        try:
+            path = _local_file(Path(archive), source["local_path"])
+            payload = path.read_bytes()
+            digest = hashlib.sha256(payload).hexdigest()
+            if not source.get("sha256") or digest != source["sha256"]:
+                raise ValueError("Original source bytes do not match the frozen SHA-256.")
+            payloads[source_id] = (digest, payload, source.get("format", path.suffix.lstrip(".")))
+            check("source_hash:" + source_id, "PASS", source["local_path"], area="source_integrity")
+        except (OSError, ValueError, KeyError) as exc:
+            check("source_hash:" + source_id, "FAIL", str(exc), area="source_integrity")
+
+    def reference_value(reference):
+        if "source_refs" in reference and "source_id" not in reference:
+            return sum(reference_value(item) * parse_number(item.get("contribution_weight", 1))
+                       for item in reference["source_refs"])
+        if "raw" not in reference or reference["raw"] is None:
+            raise ValueError("Numeric source reference is missing its raw value; blank is not zero.")
+        source_id = reference.get("source_id")
+        if source_id not in payloads:
+            raise ValueError("Source is unknown, unreadable or failed its content hash check.")
+        digest, payload, format_name = payloads[source_id]
+        raw = reference["raw"]
+        raw_value = parse_number(raw, reference.get("number_format", "dot_decimal"))
+        multiplier = parse_number(reference.get("multiplier", 1))
+        if format_name in {"xlsx", "xls"}:
+            if digest not in books:
+                books[digest] = (load_workbook(io.BytesIO(payload), data_only=True)
+                                 if format_name == "xlsx" else xlrd.open_workbook(file_contents=payload))
+            book = books[digest]
+            sheet, cell = reference.get("sheet"), reference.get("cell")
+            if not sheet or not isinstance(cell, str) or not re.fullmatch(r"[A-Z]+[1-9]\d*", cell):
+                raise ValueError("Spreadsheet numeric reference requires an exact sheet and cell.")
+            if format_name == "xlsx":
+                saved = book[sheet][cell].value
+            else:
+                from openpyxl.utils.cell import coordinate_to_tuple
+                row, column = coordinate_to_tuple(cell)
+                saved = book.sheet_by_name(sheet).cell_value(row - 1, column - 1)
+            if saved is None or saved == "":
+                raise ValueError("Referenced source cell is blank or lacks a saved formula value.")
+            saved_value = parse_number(saved, reference.get("number_format", "dot_decimal"))
+            if abs(saved_value - raw_value) > tolerance:
+                raise ValueError(f"Source cell differs from recorded raw value: {saved_value} versus {raw_value}.")
+        elif format_name == "pdf":
+            match = re.fullmatch(r"page:([1-9]\d*)(?::plain)?", reference.get("unit_id", ""))
+            if not match:
+                raise ValueError("PDF numeric reference requires a complete numbered page.")
+            page_number = int(match[1]) - 1
+            key = digest, page_number
+            if key not in pages:
+                if digest not in books:
+                    books[digest] = PdfReader(io.BytesIO(payload))
+                page = books[digest].pages[page_number]
+                # Retain both layouts: either parser representation may preserve a
+                # table's signed numeric token better. No page/text truncation.
+                texts = [page.extract_text(extraction_mode="layout"), page.extract_text()]
+                values = []
+                for text in texts:
+                    for token in _tokens(text or ""):
+                        try:
+                            values.append(parse_number(token["raw"], reference.get("number_format", "dot_decimal")))
+                        except ValueError:
+                            continue
+                pages[key] = values
+            if not any(abs(number - raw_value) <= tolerance for number in pages[key]):
+                raise ValueError("The signed numeric value does not occur in the specified PDF page text.")
+        else:
+            raise ValueError("Unsupported numeric source format; no implicit parsing fallback.")
+        return raw_value * multiplier
+
+    def observation(name, expected, references, optional=False, missing_reason=None):
+        if expected is None:
+            detail = missing_reason or "Observation is explicitly missing; it has not been converted to zero."
+            check(name, "WARNING" if optional else "MISSING", detail)
+            return
+        try:
+            if not references:
+                raise ValueError("Populated observation has no original numeric references.")
+            expected_number = parse_number(expected)
+            resolved = sum(reference_value(reference) * parse_number(reference.get("contribution_weight", 1))
+                           for reference in references)
+            difference = resolved - expected_number
+            pdf = any(reference.get("unit_id", "").startswith("page:") for reference in references)
+            detail = ("Signed numeric occurrence on complete PDF page and recorded conversion agree; semantic mapping is unverified."
+                      if pdf else "Original cached cell values, signs, multipliers and weighted contributions agree.")
+            check(name, "PASS" if abs(difference) <= tolerance else "FAIL", detail, difference)
+        except (KeyError, IndexError, TypeError, ValueError, OSError) as exc:
+            check(name, "FAIL", str(exc))
+
+    try:
+        for section in ("historical", "schedule_controls"):
+            for role, metric in data.get(section, {}).items():
+                for period, value in metric.get("values", {}).items():
+                    observation(f"{section}:{role}:{period}", value, metric.get("sources", {}).get(period, []),
+                                optional=metric.get("optional") is True, missing_reason=metric.get("missing_reason"))
+        for section in ("segments", "historical_segments"):
+            for index, segment in enumerate(data.get(section, [])):
+                for metric, reference in segment.get("source_refs", {}).items():
+                    observation(f"{section}:{index}:{metric}", segment.get(metric), [reference])
+        for metric, reference in data.get("corporate", {}).get("source_refs", {}).items():
+            observation("corporate:" + metric, data["corporate"].get(metric), [reference])
+        for index, interim in enumerate(data.get("interims", [])):
+            observation(f"interims:{index}:{interim.get('period')}", interim.get("value"),
+                        [interim["source_ref"]] if interim.get("source_ref") else [])
+        for item in data.get("observations", []):
+            if item.get("status") in ("unverified", "conflict", "excluded", "vendor_unverified", "primary_conflict") or not item.get("eligible", True):
+                check("observation_excluded:" + item["id"], "WARNING",
+                      item.get("reason", "Candidate retained for audit but excluded from model inputs."))
+                continue
+            observation("observation:" + item["id"], item.get("value"), item.get("source_refs", []),
+                        optional=item.get("optional", False), missing_reason=item.get("reason"))
+    finally:
+        for book in books.values():
+            if hasattr(book, "close"):
+                book.close()
+            elif hasattr(book, "release_resources"):
+                book.release_resources()
+    return checks

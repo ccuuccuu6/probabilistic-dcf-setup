@@ -570,6 +570,7 @@ def validate_shape(value, schema, path="response"):
     kinds = schema["type"]
     kinds = kinds if isinstance(kinds, list) else [kinds]
     matches = {"null": value is None, "string": isinstance(value, str),
+               "number": type(value) in (int, float) and math.isfinite(value),
                "integer": type(value) is int, "boolean": type(value) is bool,
                "array": isinstance(value, list), "object": isinstance(value, dict)}
     if not any(matches.get(kind, False) for kind in kinds):
@@ -2278,10 +2279,12 @@ def _run_initiation(root, request, provider, provider_metadata, fetcher, progres
                 raise AIError("Next request's conservative cost allowance exceeds the remaining budget (or is unknown); stopped before dispatch. Saved usage is unchanged")
         calls += 1
         logical_call = calls
-        requested_model = record["provider"].get("models", {}).get(role, "unknown")
+        requested_model, requested_effort = (provider.route(role, stage) if hasattr(provider, "route") else
+            (record["provider"].get("models", {}).get(role, "unknown"), "medium"))
         if progress:
             progress(f"Call {calls}: {stage} ({requested_model}); estimated spend limit ${max_cost_usd:.2f}")
-        entry = {"call": calls, "call_id": uuid4().hex, "started_at": _now(), **signature}
+        entry = {"call": calls, "call_id": uuid4().hex, "started_at": _now(), **signature,
+                 "model": requested_model, "reasoning_effort": requested_effort}
         record["pending_call"] = copy.deepcopy(entry)
         save()  # Durable before dispatch: an unseen response is an unknown charge.
         error = None
@@ -2303,7 +2306,8 @@ def _run_initiation(root, request, provider, provider_metadata, fetcher, progres
             entry["finished_at"] = _now()
             entry["elapsed_seconds"] = round(monotonic() - call_started, 6)
             entry["provider_response"] = provider.last_response
-            entry["usage"] = response_usage(provider.last_response, requested_model)
+            entry["usage"] = (provider.usage(provider.last_response, requested_model) if hasattr(provider, "usage")
+                              else response_usage(provider.last_response, requested_model))
             usage_entries.append({"stage": stage, "usage": entry["usage"]})
             record["usage"] = aggregate_usage(usage_entries)
             try:

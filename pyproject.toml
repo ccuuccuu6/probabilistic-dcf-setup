@@ -9,6 +9,23 @@ description = "Local AI-driven historical company initiation with source checks 
 requires-python = ">=3.11"
 dependencies = ["openpyxl==3.1.5", "pypdf[crypto]==6.20.0", "xlrd==2.0.2"]
 
+[project.optional-dependencies]
+ibkr = ["ib_async==2.1.0"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.research-platform]
+fx-source = "local_store/FX/FX model.xlsx"
+fx-database = "local_store/FX/fx.sqlite"
+cheap-review-repairs = 1
+
+[tool.research-platform.ibkr]
+host = "127.0.0.1"
+port = 7496
+client-id = 71
+session-timezone = "Europe/London"
+overlap-days = 7
+max-recent-days = 90
+pairs = ["EUR/USD", "USD/CHF", "GBP/USD", "USD/JPY", "USD/CAD", "AUD/USD", "USD/MXN", "USD/CNH", "USD/SGD", "USD/HKD", "USD/SEK", "USD/NOK", "USD/PLN", "USD/ZAR"]
 

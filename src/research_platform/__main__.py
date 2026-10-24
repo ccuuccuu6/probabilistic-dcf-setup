@@ -60,6 +60,52 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Research, check and export a company's historical financial model.")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor", help="Check the project, Python and installed dependencies without API calls")
+    saved_review = commands.add_parser("review-saved", help="Export saved partial work or recalculate saved forecasts without AI/credentials")
+    saved_review.add_argument("run")
+    saved_review.add_argument("--assumptions", help="Changed JSON driver inputs; requires a completed saved forecast specification")
+    saved_review.add_argument("--recalculate", action="store_true")
+    refresh = commands.add_parser("refresh-fx", help="Refresh shared FX and recalculate a saved model; zero AI calls")
+    refresh.add_argument("run", help="Saved run directory or its name in outputs")
+    refresh.add_argument("--fx-source", help="Override the stable shared FX path in pyproject.toml")
+    refresh.add_argument("--fx-database", help="Shared SQLite database; no broker requests are made")
+    refresh.add_argument("--snapshot", help="Use an exact immutable FX snapshot ID")
+    refresh.add_argument("--fx-as-of", help="Explicit FX timestamp with timezone; defaults to now, independently of company history")
+    refresh.add_argument("--model-inputs", help="Versioned company exposure/policy configuration; historical facts must remain unchanged")
+    for name,description in (("fx-import","Import a supplied FX workbook once into the shared database"),
+                             ("fx-update","Read-only incremental IBKR FX update"),
+                             ("fx-update-ecb","Update ECB reference fixings from its official 90-day XML"),
+                             ("fx-status","Show shared FX database coverage and freshness")):
+        command=commands.add_parser(name,help=description)
+        command.add_argument("--database",help="Shared SQLite path; defaults to pyproject.toml")
+        if name=="fx-import":command.add_argument("workbook",nargs="?")
+        if name=="fx-update":
+            command.add_argument("--host");command.add_argument("--port",type=int);command.add_argument("--client-id",type=int)
+            command.add_argument("--pairs",nargs="+");command.add_argument("--overlap-days",type=int)
+            command.add_argument("--max-recent-days",type=int);command.add_argument("--session-timezone")
+            command.add_argument("--diagnostic",action="store_true")
+    export = commands.add_parser("export", help="Re-export and recalculate saved validated inputs; zero AI calls")
+    export.add_argument("run", help="Saved run directory or its name in outputs")
+    update = commands.add_parser("update", help="Discover newer official actuals, preserve history and rebuild the saved company model")
+    update.add_argument("run", help="Saved run directory or its name in outputs")
+    update.add_argument("--as-of", help="Information date, YYYY-MM-DD; defaults to today")
+    construct = commands.add_parser("construct", help="Construct history, company drivers and executable temporary forecasts from local originals")
+    construct.add_argument("company")
+    construct.add_argument("--as-of", help="Model information date, YYYY-MM-DD; defaults to today's date and is saved")
+    construct.add_argument("--historical-vintage", action="store_true", help="Require every source to have verified publication by the as-of date")
+    construct.add_argument("--sources", required=True)
+    construct.add_argument("--model-inputs", help="Saved sourced company research specification for the integrated segment/three-statement workflow")
+    construct.add_argument("--resume", metavar="RUN", help="Explicit verified ancestor for integrated construction recovery; all newer charges remain in the cumulative ledger")
+    construct.add_argument("--fx-source", help="Local shared FX workbook; source dates and actual/estimate status are preserved")
+    construct.add_argument("--fx-database", help="Shared FX database snapshot, consumed without broker downloads")
+    construct.add_argument("--reference-workbook", help="Local analyst workbook used as architecture/presentation reference; never a company numeric input")
+    construction_history = construct.add_mutually_exclusive_group()
+    construction_history.add_argument("--years", nargs="+", type=int)
+    construction_history.add_argument("--history-years", type=int, default=10)
+    construct.add_argument("--forecast-years", type=int, default=5)
+    construct.add_argument("--budget-usd", type=float, default=20.)
+    construct.add_argument("--fresh", action="store_true")
+    construct.add_argument("--recalculate", action="store_true", help="Use hidden Microsoft Excel if available, compare formula outputs with Python")
+    construct.add_argument("--escalation-evidence", help="Stage-specific evidence supporting an explicitly configured non-Luna model")
     api_check = commands.add_parser("api-check", help="Make one small paid API call and show reported token usage")
     api_check.add_argument("--role", choices=["researcher", "extractor", "reviewer"], default="extractor")
     initiate = commands.add_parser("initiate", help="Build and check historical accounts from a local company archive using configured AI APIs")
@@ -112,6 +158,120 @@ def main() -> int:
                 print("PASS: API access and structured output work. This does not test financial extraction or web search.")
             finally:
                 print(format_usage(aggregate_usage([response_usage(provider.last_response, model)])))
+        elif arguments.command in ("fx-import","fx-update","fx-update-ecb","fx-status"):
+            from research_platform.fx_store import fx_command
+            return fx_command(root,arguments)
+        elif arguments.command == "review-saved":
+            from research_platform.construction import review_saved
+            directory = review_saved(root, arguments.run, assumptions_file=arguments.assumptions,
+                                     recalculate=arguments.recalculate)
+            print(f"Offline review workbook: {directory / 'model.xlsx'}")
+            print("No API calls. Missing forecast stages remain unmodelled; source/AI acceptance is unchanged.")
+        elif arguments.command in ("refresh-fx", "export", "update"):
+            from research_platform.workflow import offline_export
+            import tomllib
+            defaults = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8")).get("tool", {}).get("research-platform", {})
+            fx = None;fx_database=None
+            if arguments.command == "refresh-fx":
+                fx = arguments.fx_source
+                if fx and arguments.fx_database:raise ValueError('Choose the shared FX database or the legacy workbook adapter, not both')
+                fx_database=arguments.fx_database or (None if fx else defaults.get('fx-database'))
+                if not fx and not fx_database:raise ValueError("Import the shared FX database first with fx-import")
+                from pathlib import Path
+                fx = (Path(fx) if Path(fx).is_absolute() else root / fx) if fx else None
+            if arguments.command == "update":
+                from research_platform.workflow import update_company_inputs
+                from research_platform.integrated import construct_integrated
+                from research_platform.project import read_json
+                from datetime import date
+                from pathlib import Path
+                parent = Path(arguments.run)
+                if not parent.is_absolute() and not parent.exists():parent=root/"outputs"/parent
+                config=read_json(parent/"record.json")["configuration"]
+                as_of=arguments.as_of or date.today().isoformat()
+                inputs=update_company_inputs(root,parent,as_of=as_of,progress=TerminalProgress())
+                directory=construct_integrated(root,config['company'],config['sources'],inputs,
+                    fx_database=root/defaults['fx-database'] if defaults.get('fx-database') else None,as_of=as_of,
+                    forecast_years=config.get('forecast_years',5),progress=TerminalProgress())
+            else:
+                directory = offline_export(root, arguments.run, fx_file=fx,
+                    fx_database=root/fx_database if fx_database else None,
+                    snapshot_id=getattr(arguments,'snapshot',None),fx_as_of=getattr(arguments,'fx_as_of',None),inputs_file=getattr(arguments,'model_inputs',None),progress=TerminalProgress())
+            print(f"Workbook: {directory / 'model.xlsx'}")
+            from research_platform.project import read_json
+            return 0 if read_json(directory / "record.json")["status"] == "complete_provisional" else 1
+        elif arguments.command == "construct":
+            from research_platform.project import read_json
+            from research_platform.ai import format_usage, format_stage_usage
+            print("Constructing a provisional model from company originals. Python reads source numbers; unknown inputs remain missing.", flush=True)
+            if arguments.model_inputs:
+                from research_platform.integrated import construct_integrated
+                directory = construct_integrated(root, arguments.company, arguments.sources, arguments.model_inputs,
+                    reference_workbook=arguments.reference_workbook, budget_usd=arguments.budget_usd,
+                    forecast_years=arguments.forecast_years, recalculate=arguments.recalculate, progress=TerminalProgress(),
+                    escalation_file=arguments.escalation_evidence,fx_file=arguments.fx_source,fx_database=arguments.fx_database,resume=arguments.resume,
+                    as_of=arguments.as_of,historical_vintage=arguments.historical_vintage)
+            else:
+                from research_platform.workflow import research_company_inputs
+                from research_platform.integrated import construct_integrated
+                from datetime import date
+                import tomllib
+                from pathlib import Path
+                from research_platform.evidence import inventory_local_sources
+                from research_platform.workflow import update_company_inputs
+                from research_platform.budget import company_key
+                defaults=tomllib.loads((root/'pyproject.toml').read_text(encoding='utf-8')).get('tool',{}).get('research-platform',{})
+                as_of=arguments.as_of or date.today().isoformat()
+                matching=[]
+                for record_path in (root/'outputs').glob('construct_*/record.json'):
+                    saved=read_json(record_path)
+                    if company_key(saved.get('configuration',{}).get('company','unknown'))==company_key(arguments.company):matching.append(saved)
+                latest=max(matching,key=lambda r:Path(r['directory']).stat().st_mtime_ns) if matching and not arguments.fresh else None
+                if arguments.resume:
+                    if arguments.fresh:raise ValueError('--fresh and --resume cannot be combined')
+                    from research_platform.integrated import verified_integrated_record
+                    selected=Path(arguments.resume)
+                    if not selected.is_absolute():selected=root/'outputs'/selected
+                    latest=verified_integrated_record(selected,root/'outputs')
+                    if company_key(latest['configuration']['company'])!=company_key(arguments.company):
+                        raise ValueError('Resume company differs from requested company')
+                    if Path(latest['configuration']['sources']).resolve()!=Path(arguments.sources).resolve():
+                        raise ValueError('Resume source archive differs; use an explicit fresh research run under the same company budget')
+                inputs=Path(latest['directory'])/'company_model_inputs.json' if latest else None
+                if inputs is not None and inputs.exists():
+                    from research_platform.integrated import verified_integrated_record
+                    verified_integrated_record(latest['directory'],root/'outputs')
+                    saved_data=read_json(inputs)
+                    same_date=saved_data.get('model_configuration',{}).get('as_of')==as_of
+                    same_archive=latest['configuration'].get('manifest')==inventory_local_sources(Path(arguments.sources))['manifest_sha256']
+                    requested=sorted(set(arguments.years)) if arguments.years else None
+                    if requested and requested!=saved_data['history_years']:
+                        raise ValueError('Requested years differ from saved research; use --fresh for a different history scope')
+                    if not same_date or not same_archive:
+                        inputs=update_company_inputs(root,latest['directory'],as_of=as_of,progress=TerminalProgress())
+                else:
+                    inputs=research_company_inputs(root,arguments.company,arguments.sources,as_of=as_of,
+                        historical_years=arguments.history_years,years=arguments.years,budget_usd=arguments.budget_usd,
+                        historical_vintage=arguments.historical_vintage,progress=TerminalProgress())
+                fx=arguments.fx_source
+                if fx and arguments.fx_database:raise ValueError('Choose the shared FX database or the legacy workbook adapter, not both')
+                fx_database=arguments.fx_database or (None if fx else defaults.get('fx-database'))
+                directory=construct_integrated(root,arguments.company,arguments.sources,inputs,
+                    fx_file=root/fx if fx else None,fx_database=root/fx_database if fx_database else None,as_of=as_of,historical_vintage=arguments.historical_vintage,
+                    forecast_years=arguments.forecast_years,budget_usd=arguments.budget_usd,
+                    recalculate=True,resume=arguments.resume,progress=TerminalProgress())
+            record = read_json(directory / "record.json")
+            print(f"Status: {record['status']}; outputs: {directory}")
+            print(format_usage(record["usage"]))
+            print(format_stage_usage(record["usage"]))
+            if "budget" in record:
+                print("Cumulative budget:", record["budget"])
+            for issue in record["issues"]:
+                print("Unresolved: " + issue)
+            if (directory / "model.xlsx").exists():
+                print(f"Open {directory / 'model.xlsx'}; inspect Model's validation summary and editable Assumptions. Detailed checks and source records are in the adjacent audit files.")
+                print(record.get("summary", {}))
+            return 0 if record["status"] == "complete_provisional" else 1
         else:
             from research_platform.initiation import initiate_company
             from research_platform.project import read_json

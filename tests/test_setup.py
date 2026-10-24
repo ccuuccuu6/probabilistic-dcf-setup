@@ -2577,10 +2577,9 @@ class AIAdapterTests(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True), patch("research_platform.ai.urlopen") as network:
                 env_file.write_text("OPENAI_API_KEY=SYNTHETIC-SECRET\n", encoding="utf-8")
                 provider = OpenAIProvider.from_env(env_file)
-                with self.assertRaises(AIError) as raised:
-                    provider.validate_configuration()
-                self.assertIn("RESEARCH_MODEL", str(raised.exception))
-                self.assertNotIn("SYNTHETIC-SECRET", str(raised.exception))
+                provider.validate_configuration()
+                self.assertEqual(set(provider.models.values()), {"gpt-6-luna"})
+                self.assertNotIn("SYNTHETIC-SECRET", json.dumps(provider.metadata()))
                 for invalid in ('OPENAI_API_KEY="SYNTHETIC-SECRET\n',
                                 'UNRECOGNIZED_SETTING=SYNTHETIC-SECRET\n',
                                 'OPENAI_API_KEY=SYNTHETIC-SECRET\nOPENAI_API_KEY=duplicate\n'):
@@ -3949,11 +3948,13 @@ class VisibleAlphaTests(unittest.TestCase):
                     sheet.cell(row, column, value)
 
         headers(4)
+        sheet["D3"] = "Standardized" if recognized else "Unknown tables"
         sheet["D6"] = "Income statement"
         metric(7, "Standard revenue", [777777, 900001, 777777, 888888, 900002, 444444, 222222])
         headers(10)
         sheet["D12"] = "Ratios" if recognized else "Other analytics"
         metric(13, "Standard margin", [123456, 900003, 123456, 234567, 900004, 345678, 456789])
+        sheet["D15"] = "Company Reported" if recognized else "Unclassified section"
         headers(16)
         sheet["D18"] = "Company business divisions"
         metric(19, "Manufacturing sales", [100, 900005, 100, 110, 900006, 45, 20])
