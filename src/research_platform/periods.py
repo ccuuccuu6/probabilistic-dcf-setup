@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta
 import hashlib
 import json
 import math
+import re
 
 from .construction import (check, dependencies, dimension, expression_tree,
                            formula_excel, unit_dimension)
@@ -112,13 +113,14 @@ def cell_formula_excel(cell,pid,resolve):
     """Return an Excel formula including '=', using the same restricted AST."""
     if not cell.get('expression'):raise ValueError('Cell has no expression')
     tree=expression_tree(cell['expression'])
-    if any(isinstance(n,ast.Call) and n.func.id=='if_zero' for n in ast.walk(tree)):
+    if any(isinstance(n,ast.Call) and n.func.id in ('if_zero','if_positive') for n in ast.walk(tree)):
         # A dormant financing control may legitimately be missing. Guard only
         # the selected branch, so Excel and Python share lazy missing semantics.
         def guarded(node):
-            if isinstance(node,ast.Call) and node.func.id=='if_zero':
+            if isinstance(node,ast.Call) and node.func.id in ('if_zero','if_positive'):
                 test=guarded(node.args[0]);a=guarded(node.args[1]);b=guarded(node.args[2])
-                return f'IF(ISNUMBER({test}),IF({test}=0,{a},{b}),IF(ISERROR({test}),{test},""))'
+                comparison='=0' if node.func.id=='if_zero' else '>0'
+                return f'IF(ISNUMBER({test}),IF({test}{comparison},{a},{b}),IF(ISERROR({test}),{test},""))'
             if isinstance(node,ast.BinOp):
                 left,right=guarded(node.left),guarded(node.right)
                 op={ast.Add:'+',ast.Sub:'-',ast.Mult:'*',ast.Div:'/'}[type(node.op)]
@@ -157,9 +159,9 @@ def _evaluate(tree,resolve):
     """Missing propagates; numeric errors remain exceptions, never implicit zero."""
     if isinstance(tree,ast.Name):return resolve(tree.id,0)
     if isinstance(tree,ast.Call):
-        if tree.func.id=='if_zero':
+        if tree.func.id in ('if_zero','if_positive'):
             test=_evaluate(tree.args[0],resolve)
-            return None if test is None else _evaluate(tree.args[1 if test==0 else 2],resolve)
+            return None if test is None else _evaluate(tree.args[1 if (test==0 if tree.func.id=='if_zero' else test>0) else 2],resolve)
         return resolve(tree.args[0].value,tree.args[1].value)
     if isinstance(tree,ast.Constant):return tree.value
     if isinstance(tree,ast.UnaryOp):
@@ -181,7 +183,7 @@ def _cell_dimension(cell,pid,rows):
             key=f'bound_{len(units)}';row,_=_binding(cell,pid,node.id,0);units[key]=rows[row]['unit']
             return ast.copy_location(ast.Name(id=key,ctx=ast.Load()),node)
         def visit_Call(self,node):
-            if node.func.id=='if_zero':
+            if node.func.id in ('if_zero','if_positive'):
                 node.args=[self.visit(argument) for argument in node.args]
                 return node
             key=f'bound_{len(units)}';row,_=_binding(cell,pid,node.args[0].value,node.args[1].value);units[key]=rows[row]['unit']
@@ -234,7 +236,11 @@ def _plan(spec):
 def calculate_periodic(spec,overrides=None):
     """Evaluate declared cells; override only authoritative editable inputs."""
     rows,periods,cells,order=_plan(spec);changes={}
+    merged=copy.deepcopy(spec.get('assumption_overrides',{}))
     for key,value in (overrides or {}).items():
+        if isinstance(value,dict):merged.setdefault(key,{}).update(value)
+        else:merged[key]=value
+    for key,value in merged.items():
         if isinstance(key,tuple) and len(key)==2:changes[key]=value
         elif isinstance(value,dict):changes.update({(key,pid):v for pid,v in value.items()})
         else:raise ValueError('Overrides require (row_id,period_id) keys or nested row/period mappings')
@@ -254,6 +260,168 @@ def calculate_periodic(spec,overrides=None):
             raise ValueError(f'Non-finite calculation at {row}:{pid}')
         values[row][pid]=value
     return values
+
+
+def model_logic_digest(spec):
+    """Identity of the financial graph and immutable history, excluding scenarios."""
+    return hashlib.sha256(json.dumps(dict(company=spec['company'],periods=spec['periods'],
+        rows=spec['rows'],identities=spec.get('identities',[])),sort_keys=True,ensure_ascii=False).encode()).hexdigest()
+
+
+def assumption_contract(spec):
+    """Project stable business inputs from the compiled graph, never Excel cells.
+
+    Classification belongs to each period cell: a reported historical observation
+    and a provisional forecast may occupy the same business row.
+    """
+    registry={r.get('driver_id',r.get('id')):r for r in spec.get('driver_registry',spec.get('financial_contracts',{}).get('drivers',[]))}
+    periods={p['id']:p for p in spec['periods']};fields=[];classes={}
+    for row in spec['rows']:
+        rid=row['id'];meta=registry.get(rid,{})
+        for pid,cell in row.get('cells',{}).items():
+            period=periods[pid];status=cell.get('status','');expr=cell.get('expression')
+            historical=status in ('actual','reported','derived_actual','estimated_historical')
+            structural=cell.get('data_role',row.get('data_role')) in ('structural_absence','structural_parameter')
+            reference=(rid.endswith('_seed') or row.get('classification')=='estimated_historical_baseline'
+                or cell.get('data_role',cell.get('classification'))=='estimated_historical_baseline'
+                or cell.get('calibration_eligible') is False or structural)
+            writable=bool(cell.get('editable') and row.get('kind') in ('assumption','driver') and not historical and not reference)
+            if structural:classification='structural_parameter'
+            elif status=='estimated_historical' or cell.get('data_role',cell.get('classification'))=='estimated_historical_baseline' or cell.get('calibration_eligible') is False:classification='estimated_historical_baseline'
+            elif status in ('actual','reported'):classification='reported_fact' if not expr else 'derived_history'
+            elif status=='derived_actual':classification='derived_history'
+            elif writable:
+                role=meta.get('parameter_role',meta.get('role',meta.get('classification','')))
+                classification=role if role in ('structural_parameter','policy_control','forecast_assumption') else 'forecast_assumption'
+                if role=='allocation' or role=='exposure_assumption' and row.get('unit')=='ratio' or any(s in rid for s in ('sensitivity','allocation','_weight')):classification='structural_parameter'
+                elif any(s in rid for s in ('policy','payout','buyback','borrowing','repayment','seasonality')):classification='policy_control'
+            else:classification='calculated_result' if expr or row.get('kind')=='calculated' else 'structural_parameter'
+            classes.setdefault(rid,{})[pid]=classification
+            if not writable:continue
+            unit=row.get('unit','ratio');is_ratio=unit=='ratio'
+            convention=meta.get('value_type') or ('percentage_point_contribution' if rid.endswith(('_pricing','_rig','_fx')) else
+                'growth_rate' if is_ratio and any(s in rid for s in ('growth','change','organic','inflation')) else
+                'incremental_amount' if not is_ratio and any(s in rid for s in ('budget_change','scope_')) else 'level')
+            deps=[dict(driver_id=d['row_id'],period_id=d['period_id']) for d in cell_dependencies(cell,pid)] if expr else []
+            anchors=[x for x in deps if periods[x['period_id']]['end']<period['start']]
+            for anchor_pid in cell.get('initialization_anchor_periods',row.get('initialization_anchor_periods',[])):
+                source=row.get('cells',{}).get(anchor_pid,{})
+                if (anchor_pid in periods and periods[anchor_pid]['end']<period['start']
+                        and (source.get('value') is not None or source.get('expression'))
+                        and not any(x['period_id']==anchor_pid for x in anchors)):
+                    anchors.append(dict(driver_id=rid,period_id=anchor_pid))
+            constraints=copy.deepcopy(row.get('constraints',{}))
+            if row.get('nonnegative'):constraints.setdefault('minimum',0)
+            if convention=='growth_rate':constraints.setdefault('minimum',-1)
+            if any(s in rid for s in ('effective_activity_sensitivity','_weight','hedge_ratio')):constraints.setdefault('minimum',0)
+            if '_weight' in rid or 'hedge_ratio' in rid:constraints.setdefault('maximum',1)
+            if rid.startswith('scope_') and rid.endswith(('_tax_rate','_nci_share')):
+                constraints.setdefault('minimum',0);constraints.setdefault('maximum',1)
+            # Money can be denominated in a native currency rather than the
+            # company reporting currency. Shares and dimensionless ratios have
+            # no monetary denomination; generic money units use explicit data.
+            monetary_unit=re.fullmatch(r'([A-Z]{3})m(?:/shares_m)?',unit)
+            currency=meta.get('currency',row.get('currency'))
+            if currency is None:
+                currency=monetary_unit.group(1) if monetary_unit else spec.get('currency') if unit in ('money','money/shares_m') else None
+            fields.append(dict(driver_id=rid,period_id=pid,classification=classification,meaning=row.get('label',rid),
+                company=spec['company'],entity=meta.get('entity_id',row.get('section')),cost_pool=meta.get('cost_pool'),
+                frequency=period['kind'],period_start=period['start'],period_end=period['end'],unit=unit,
+                currency=currency,
+                sign='nonnegative' if constraints.get('minimum')==0 else 'signed; follow economic meaning',value_type=convention,
+                basis=meta.get('currency_basis',row.get('basis','See stated economic method')),
+                historical_anchor=anchors,anchor_date=max((periods[x['period_id']]['end'] for x in anchors),default=None),
+                dependencies=deps,constraints=constraints,default=cell.get('value'),default_expression=expr,
+                evidence=cell.get('source_refs',row.get('source_refs',{})),method=cell.get('reason') or row.get('note') or row.get('initialization',''),
+                provisional=True,override_precedence='Validated scenario > saved model default; summary periods are derived'))
+    return dict(schema='financial_input_contract_v1',model_digest=model_logic_digest(spec),company=spec['company'],
+        as_of=spec.get('model_configuration',{}).get('as_of'),fields=fields,classifications=classes,
+        authority='Saved backend model and validated scenario payload; Excel is an export',
+        history_calibration='Use reported_fact and compatible derived_history only; estimated baselines are not independent observations')
+
+
+def apply_assumption_payload(spec,payload,*,allow_model_refresh=False):
+    """Validate a dated scenario atomically; preserve all observations/formulas."""
+    if payload.get('schema')!='financial_assumptions_v1':raise ValueError('Expected financial_assumptions_v1 payload')
+    if not payload.get('scenario_id'):raise ValueError('Scenario requires a stable scenario_id')
+    as_of=payload.get('as_of');date.fromisoformat(as_of or '')
+    model_as_of=spec.get('model_configuration',{}).get('as_of')
+    if model_as_of and as_of<model_as_of:raise ValueError('Scenario information date precedes saved model information date')
+    contract=assumption_contract(spec)
+    if not allow_model_refresh and payload.get('model_digest')!=contract['model_digest']:raise ValueError('Scenario model_digest does not match saved financial graph')
+    if payload.get('company')!=spec['company']:raise ValueError('Scenario company does not match saved model')
+    lookup={(x['driver_id'],x['period_id']):x for x in contract['fields']};seen=set();changes={};inputs=[];intervals={}
+    supplied_inputs=payload.get('inputs',[])
+    requested_keys=[(x.get('driver_id'),x.get('period_id')) for x in supplied_inputs]
+    if len(requested_keys)!=len(set(requested_keys)):raise ValueError('Duplicate scenario input')
+    retained={ (x['driver_id'],x['period_id']):copy.deepcopy(x) for x in spec.get('assumption_payload',{}).get('inputs',[]) }
+    if payload.get('replace_existing',False):retained={}
+    retained.update({(x.get('driver_id'),x.get('period_id')):x for x in supplied_inputs})
+    for supplied in retained.values():
+        item=copy.deepcopy(supplied);rid=item.get('driver_id');pid=item.get('period_id')
+        if allow_model_refresh:rid=spec.get('input_migrations',{}).get(rid,rid);item['driver_id']=rid
+        key=(rid,pid)
+        if key in seen:raise ValueError('Duplicate scenario input '+str(key))
+        seen.add(key);field=lookup.get(key)
+        if field is None:raise ValueError('Input is not an authoritative writable business field: '+str(key))
+        for attr in ('unit','currency','frequency','value_type'):
+            if item.get(attr)!=field[attr]:raise ValueError('Input '+attr+' does not match contract: '+str(key))
+        value=item.get('value')
+        if type(value) not in (int,float) or not math.isfinite(value):raise ValueError('Scenario values must be finite numbers')
+        for bound,op in (('minimum',lambda a,b:a<b),('maximum',lambda a,b:a>b)):
+            if bound in field['constraints'] and op(value,field['constraints'][bound]):raise ValueError('Input violates '+bound+': '+str(key))
+        for start,end in intervals.setdefault(rid,[]):
+            if max(start,field['period_start'])<=min(end,field['period_end']):raise ValueError('Overlapping authoritative input periods: '+rid)
+        intervals[rid].append((field['period_start'],field['period_end']))
+        changes.setdefault(rid,{})[pid]=value;inputs.append(item)
+    spec['assumption_overrides']=changes
+    spec['assumption_payload']=dict(payload,model_digest=contract['model_digest'],inputs=inputs)
+    spec['input_contract']=contract
+    return spec
+
+
+def evaluate_saved_model(root,run,payload_file=None,*,valuation_payload_file=None):
+    """Version a backend scenario, without importing Excel, credentials or an AI client."""
+    from pathlib import Path
+    import shutil
+    from uuid import uuid4
+    from .integrated import verified_integrated_record
+    from .construction import write_json
+    root=Path(root).resolve();parent=Path(run)
+    if not parent.is_absolute():parent=root/'outputs'/parent
+    record=verified_integrated_record(parent,root/'outputs')
+    spec=json.loads((parent/'model_specification.json').read_text(encoding='utf-8'))
+    before=model_logic_digest(spec)
+    if payload_file:apply_assumption_payload(spec,json.loads(Path(payload_file).read_text(encoding='utf-8')))
+    spec['input_contract']=assumption_contract(spec)
+    values=calculate_periodic(spec);checks=validate_periodic(spec,values)
+    if model_logic_digest(spec)!=before:raise ValueError('Scenario evaluation changed model logic/history')
+    directory=root/'outputs'/('evaluate_'+datetime.now().strftime('%Y%m%dT%H%M%S')+'_'+uuid4().hex[:8]);directory.mkdir()
+    # The small evidence/configuration journals are preserved so this scenario can
+    # itself be refreshed. Originals remain at their verified immutable locations.
+    for name in ('company_model_inputs.json','calls.jsonl','code_snapshot.json','fx_snapshot.json'):
+        if (parent/name).is_file():shutil.copyfile(parent/name,directory/name)
+    write_json(directory/'model_specification.json',spec);write_json(directory/'forecast.json',values)
+    write_json(directory/'input_contract.json',spec['input_contract'])
+    if spec.get('assumption_payload'):write_json(directory/'assumptions.json',spec['assumption_payload'])
+    if (parent/'valuation_inputs.json').is_file() or valuation_payload_file:
+        from .workflow import valuation_snapshot
+        prior_valuation=json.loads((parent/'valuation_inputs.json').read_text(encoding='utf-8')) if (parent/'valuation_inputs.json').is_file() else None
+        data=json.loads((parent/'company_model_inputs.json').read_text(encoding='utf-8'))
+        valuation=valuation_snapshot(spec,values,data,previous_inputs=prior_valuation,inputs_file=valuation_payload_file)
+        checks+=valuation['checks']
+        for name,content in valuation['artifacts'].items():write_json(directory/name,content)
+    status='scenario_evaluated_provisional' if not any(c['status'] in ('FAIL','MISSING') for c in checks) else 'incomplete_model'
+    write_json(directory/'validation.json',dict(status=status,checks=checks))
+    write_json(directory/'evaluation.json',dict(parent_run=str(parent),ai_calls=0,excel_used=False,
+        model_digest=before,history_and_formulas_unchanged=True,scenario_id=spec.get('assumption_payload',{}).get('scenario_id'),
+        status=status,source_acceptance='Preserved parent evidence; no renewed source review'))
+    record.pop('_reuse_verified',None)
+    record.update(directory=str(directory),parent_run=str(parent),status=status,
+        operation=dict(kind='backend_scenario',ai_calls=0,excel_used=False),
+        artifacts={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.iterdir() if p.is_file()})
+    write_json(directory/'record.json',record)
+    return directory
 
 
 def iter_identity_cells(spec):
@@ -338,7 +506,9 @@ def derive_observations(observations,periods):
         # Original exclusions remain effective through every derived generation.
         # A status rewrite must never turn unverified or rejected evidence into
         # a reported fact; estimates may derive only other estimates.
-        if not item.get('eligible',True) or item['status'] not in ('actual','derived_actual','estimate','estimated','forecast'):
+        # Retained alternative versions are evidence, not active period inputs.
+        if (not item.get('eligible',True) or not item.get('model_selection_eligible',True)
+                or item['status'] not in ('actual','derived_actual','estimate','estimated','forecast')):
             continue
         pid=item.get('period_id');period=calendar_by_id.get(pid)
         if not period:
@@ -396,6 +566,19 @@ def derive_observations(observations,periods):
                 value=value,status='estimate' if any(o['status'] in ('estimate','estimated','forecast') for o in inputs) else 'derived_actual',
                 source_status='derived',expression=expression,bindings=bindings,source_refs=refs,
                 input_observation_ids=[o['id'] for o in inputs],derivation='closing-date alias' if stock else 'compatible additive flow',is_derived=True)
+            # A derived quarter cannot become available before the latest
+            # contributing disclosure; retain every source's publication status.
+            vintages=[];classification_refs=[]
+            for original in inputs:
+                for vintage in original.get('source_vintage',[]):
+                    if vintage not in vintages:vintages.append(copy.deepcopy(vintage))
+                for reference in original.get('classification_source_refs',[]):
+                    if reference not in classification_refs:classification_refs.append(copy.deepcopy(reference))
+            if vintages:item['source_vintage']=vintages
+            if classification_refs:item['classification_source_refs']=classification_refs
+            if all(original.get('published_at') for original in inputs):
+                item['published_at']=max(original['published_at'] for original in inputs)
+            else:item.pop('published_at',None)
             if stock:item['measurement_date']=target['end'] if group[4]=='closing' else (_date(target['start'])-timedelta(days=1)).isoformat()
             known[kind]=item;derived.append(item)
         if stock:

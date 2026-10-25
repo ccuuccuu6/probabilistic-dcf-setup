@@ -4,6 +4,7 @@ Numbers already use their display units. This module owns presentation only: the
 same restricted financial AST used by Python creates every calculation formula.
 """
 import json
+import ast
 import copy
 import hashlib
 import math
@@ -23,6 +24,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.styles.differential import DifferentialStyle
 from openpyxl.styles.numbers import NumberFormat
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.pagebreak import Break
 
 from .construction import dependencies, expression_tree, formula_excel, formula_value
 
@@ -194,15 +196,24 @@ def _missing_value_audit(workbook, audit):
     return sheet
 
 
-def export_integrated(path, spec, values, checks):
+def export_integrated(path, spec, values, checks, *, valuation=None):
     """Export a reusable integrated specification and return Excel check targets.
 
     ``values`` is {row_id: {period: number_or_none}} in displayed units.
-    Assumptions owns forecast controls; Model boxes are linked displays.
+    Saved backend inputs own forecast controls; Excel projects a review copy.
     Identity expressions are residuals, with explicit source-precision tolerance.
     """
     if spec.get("periods"):
-        return _export_periodic(path, spec, values, checks)
+        if spec.get('assumption_overrides'):
+            import copy
+            spec=copy.deepcopy(spec)
+            by_id={r['id']:r for r in spec['rows']}
+            for rid,period_values in spec['assumption_overrides'].items():
+                for pid,value in period_values.items():
+                    cell=by_id[rid]['cells'][pid]
+                    cell.pop('expression',None);cell.pop('bindings',None)
+                    cell.update(value=value,reason='Validated saved backend scenario override; Excel edits remain local to this export.')
+        return _export_periodic(path, spec, values, checks, valuation=valuation)
     path = Path(path)
     historical = list(spec["historical_years"])
     future = list(spec["forecast_years"])
@@ -485,6 +496,8 @@ def export_integrated(path, spec, values, checks):
                       ("reporting_changes", "Reporting Changes")):
         if spec.get(key):
             _supporting(workbook, name, spec[key])
+    valuation_inspection = _valuation_sheet(workbook, spec, values, valuation,
+        lambda key, pid: reference(key, int(str(pid).split('-')[0]), qualified=True)) if valuation is not None else {}
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(path)
     workbook.close()
@@ -500,7 +513,266 @@ def export_integrated(path, spec, values, checks):
     return dict(status="structure_and_formula_syntax_checked", recalculation="not_run", formula_count=formula_count,
                 expected_model_cells=expected_model, expected_check_cells=expected_checks,
                 model_rows=positions, year_columns={str(year): get_column_letter(column) for year, column in columns.items()},
-                section_rows=section_positions, assumption_count=len(assumptions), assumption_cells=assumption_cells)
+                section_rows=section_positions, assumption_count=len(assumptions), assumption_cells=assumption_cells, **valuation_inspection)
+
+
+def _valuation_formula(name, references):
+    """Render the valuation backend's restricted expression, without new rules."""
+    from .valuation import VALUATION_EQUATIONS
+    def render(node):
+        if isinstance(node, ast.Expression): return render(node.body)
+        if isinstance(node, ast.Name): return references[node.id]
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float): return str(node.value)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            return '('+('+' if isinstance(node.op, ast.UAdd) else '-')+render(node.operand)+')'
+        if isinstance(node, ast.BinOp):
+            signs={ast.Add:'+',ast.Sub:'-',ast.Mult:'*',ast.Div:'/',ast.Pow:'^'}
+            if type(node.op) in signs:return '('+render(node.left)+signs[type(node.op)]+render(node.right)+')'
+        raise ValueError('Unsupported valuation display arithmetic')
+    return '='+render(ast.parse(VALUATION_EQUATIONS[name], mode='eval'))
+
+
+def _valuation_sheet(workbook, spec, values, valuation, source_reference):
+    """Audit projection: live ordinary equations; dated timing stays a snapshot."""
+    from .valuation import valuation_input_contract
+    sheet=workbook.create_sheet('Valuation');_style_sheet(sheet, 'D8')
+    detail=valuation.get('detailed_cashflows', []);transition=valuation.get('transition_cashflows', [])
+    last=max(10, 3+len(detail), 3+len(transition));last_letter=get_column_letter(last)
+    sheet.column_dimensions['A'].width=3;sheet.column_dimensions['B'].width=54;sheet.column_dimensions['C'].width=13
+    for column in range(4,last+1):sheet.column_dimensions[get_column_letter(column)].width=16
+    expected={};locations={};assumption_cells={};formula_count=0;section_starts=[]
+    def section(row, title):
+        section_starts.append(row);_bar(sheet,row,title,last)
+    def scaled_unit(unit, scale=1):
+        if unit=='ratio':return '%'
+        if unit=='multiple':return 'x'
+        suffix={1:'',1e3:'k',1e6:'m',1e9:'bn'}.get(scale)
+        if suffix is None:return str(unit)+' × '+format(scale,',g')
+        return (suffix+' shares').strip() if unit=='shares' else str(unit)+suffix
+    def status(row, column, value):
+        text=str(value or '').replace('_',' ')
+        cell=_cell(sheet,row,column,text,color=GREY)
+        cell.alignment=Alignment(wrap_text=True,vertical='center')
+        cell.comment=Comment(str(value or ''),'Refractive')
+        return 15*max(1,len(textwrap.wrap(text,width=18)))
+    def note(row, text):
+        sheet.merge_cells(start_row=row,start_column=2,end_row=row,end_column=last)
+        cell=_cell(sheet,row,2,str(text),color=GREY);cell.alignment=Alignment(wrap_text=True,vertical='center')
+        sheet.row_dimensions[row].height=min(72,max(30,15*math.ceil(len(str(text))/130)))
+    def put(row,column,value,target=None,unit=None,comment=None,input_cell=False):
+        nonlocal formula_count
+        cell=_cell(sheet,row,column,value,color=BLUE if input_cell else GREEN if isinstance(value,str) and "'Model'!" in value else INK,
+                   fill=YELLOW if input_cell else None,number_format=RATE if unit=='ratio' else NUMBER.replace('0.0','0.00') if unit=='per_share' else NUMBER)
+        if isinstance(value,str) and value.startswith('='):formula_count+=1
+        wanted=value if target is None and _number(value) else target
+        if _number(wanted):expected[cell.coordinate]=wanted
+        if comment:cell.comment=Comment(_text(comment),'Refractive')
+        if input_cell:cell.border=BOX
+        return cell.coordinate
+    def label(row,text,unit=None):
+        cell=_cell(sheet,row,2,text);cell.alignment=Alignment(wrap_text=True,vertical='center')
+        if len(text)>60:sheet.row_dimensions[row].height=30
+        _cell(sheet,row,3,unit or '',color=GREY)
+    def equation(row,column,name,refs,target):
+        return put(row,column,_valuation_formula(name,refs),target)
+    _bar(sheet,2,str(spec.get('company',''))+' — discounted cash flow',last)
+    note(3,'Fair value as of '+str(valuation.get('valuation_date','not specified'))+' | Information cutoff '+str(valuation.get('information_cutoff','not specified'))+' | '+str(valuation.get('status','incomplete')).upper())
+    note(4,'Saved backend inputs own this valuation. Yellow cells are local review controls; save a typed backend scenario to preserve changes. Source financial inputs link to Model.')
+    note(5,('INCOMPLETE: conditional arithmetic only; unresolved valuation inputs block acceptance. ' if valuation.get('status')=='incomplete' else '')+
+        'Operating cash leases; lease debt excluded. SBC remains expensed. Timing, opening-balance bridges, transition paths and sensitivity tables are dated backend snapshots; rerun the backend after changing operating scenarios.')
+    sheet.print_title_rows='2:5'
+    inputs=valuation.get('input_snapshot') or {}
+    if not detail or not inputs:
+        _bar(sheet,7,'VALUATION INCOMPLETE',last)
+        diagnostics=valuation.get('diagnostics') or [dict(message=valuation.get('detail') or valuation.get('reason') or 'Required dated valuation inputs or complete operating cash-flow components are missing.')]
+        for row,item in enumerate(diagnostics,9):note(row,item.get('message',item.get('detail',str(item))) if isinstance(item,dict) else item)
+        sheet.print_area=f'B2:{last_letter}{sheet.max_row}'
+        return dict(expected_valuation_cells=expected,valuation_cells=locations,valuation_assumption_cells={},
+                    valuation_print_area=f'B2:{last_letter}{sheet.max_row}',valuation_status='incomplete',valuation_formula_count=0)
+    roles=inputs['row_roles'];unit=scaled_unit(valuation['currency'],valuation.get('money_scale',1))
+    share_unit=scaled_unit('shares',valuation.get('share_scale',1))
+    # Allocate scalar controls before rendering formulas that reference them.
+    row=43;section(row,'DATED VALUATION ASSUMPTIONS');row+=1
+    for column,text in ((2,'Assumption'),(3,'Unit'),(4,'Value'),(5,'As of'),(6,'Evidence status'),(7,'Method')):_cell(sheet,row,column,text,bold=True)
+    refs={};contract=valuation_input_contract(spec,inputs)
+    for field in [f for f in contract['fields'] if f['id'].startswith('assumptions.')]:
+        row+=1;key=field['id'].split('.')[1]
+        label(row,key.replace('_',' ').capitalize(),scaled_unit(field['unit'],field.get('scale',1)))
+        refs[key]=put(row,4,field.get('value'),unit='ratio' if field['unit']=='ratio' else None,comment=field,input_cell=True)
+        assumption_cells[field['id']]=refs[key]
+        _cell(sheet,row,5,field.get('as_of'));status_height=status(row,6,field.get('status',''))
+        sheet.merge_cells(start_row=row,start_column=7,end_row=row,end_column=last)
+        method=_cell(sheet,row,7,field.get('method',''),color=GREY);method.alignment=Alignment(wrap_text=True,vertical='center')
+        sheet.row_dimensions[row].height=min(72,max(30,status_height,15*math.ceil(len(str(field.get('method','')))/65)))
+    row+=1;label(row,'Discount-rate sensitivity shift (baseline)','%');refs['wacc_shift']=put(row,4,0.,unit='ratio')
+    for key,title in (('cost_of_equity','Cost of equity'),('pre_tax_cost_of_debt','Pre-tax cost of debt'),('wacc','Weighted average cost of capital')):
+        row+=1;label(row,title,'%');target=valuation['wacc']['value'] if key=='wacc' else valuation['wacc'][key]
+        refs[key]=equation(row,4,key,refs,target);sheet[refs[key]].number_format=RATE
+    wacc_ref=refs['wacc'];locations['wacc']=wacc_ref
+    # Detailed operating cash-flow bridge, generated from the same expressions.
+    section(7,'OPERATING FORECAST TO UNLEVERED FREE CASH FLOW')
+    for column,item in enumerate(detail,4):_cell(sheet,8,column,item['period_id'],bold=True,color='FFFFFF',fill=NAVY)
+    row_keys=[('revenue','Revenue'),('operating_profit','Statutory operating profit'),
+        ('noncash_portfolio_reversal','Reverse noncash portfolio gains / losses'),('normalized_operating_profit','Operating profit excluding portfolio gains / losses'),
+        ('rou_depreciation_reversal','Reverse right-of-use depreciation'),('lease_principal','Cash lease principal'),('lease_interest','Lease interest'),
+        ('cash_lease_cost','Cash lease cost'),('operating_profit_after_cash_leases','Operating profit after cash leases'),
+        ('tax_rate','Unlevered tax rate'),('unlevered_tax','Unlevered operating tax'),('nopat','Net operating profit after tax'),
+        ('owned_depreciation','Owned-asset depreciation'),('amortization','Amortization'),('eligible_da','Eligible depreciation and amortization'),
+        ('capex_ppe','Cash investment in owned assets'),('capex_intangibles','Cash investment in intangible assets'),
+        ('operating_working_capital_cash','Operating working-capital cash movement'),('other_cash_adjustments','Other evidenced operating cash adjustments'),
+        ('sbc_addback','SBC addback — retained as an economic cost'),('full_period_fcff','Full-period unlevered free cash flow'),
+        ('remaining_fraction','Proportion after valuation date'),('scope_timing_adjustment','Dated operating-scope timing adjustment'),
+        ('remaining_fcff','Remaining unlevered free cash flow'),('discount_years','Mid-period discount duration'),
+        ('discount_factor','Discount factor'),('present_value','Present value of remaining cash flow')]
+    detail_rows={key:9+index for index,(key,_) in enumerate(row_keys)}
+    ratios={'tax_rate','remaining_fraction','discount_factor'}
+    sources=dict(revenue='revenue',operating_profit='operating_profit',noncash_portfolio_reversal='portfolio_noncash',
+        rou_depreciation_reversal='rou_depreciation',lease_principal='lease_principal',lease_interest='lease_interest',
+        owned_depreciation='owned_depreciation',amortization='amortization',capex_ppe='capex_ppe',capex_intangibles='capex_intangibles',
+        operating_working_capital_cash='working_capital_cash')
+    calc={'normalized_operating_profit','cash_lease_cost','operating_profit_after_cash_leases','unlevered_tax','nopat','eligible_da','full_period_fcff','remaining_fcff','discount_factor','present_value'}
+    detail_pv=[]
+    for key,title in row_keys:label(detail_rows[key],title,'%' if key in ratios else 'years' if key=='discount_years' else unit)
+    for column,item in enumerate(detail,4):
+        local={key:f'{get_column_letter(column)}{detail_rows[key]}' for key,_ in row_keys};local['wacc']=wacc_ref
+        for key,_ in row_keys:
+            target=item.get(key,0.);rr=detail_rows[key]
+            if key in calc:equation(rr,column,key,local,target)
+            elif key=='tax_rate':put(rr,column,'='+refs['tax_rate'],target)
+            elif key in sources and roles.get(sources[key]) in values and values[roles[sources[key]]].get(item['period_id']) is not None:
+                put(rr,column,'='+source_reference(roles[sources[key]],item['period_id']),target)
+            else:put(rr,column,target,comment=dict(status='backend_snapshot',method=item.get('scope_timing_details') if key=='scope_timing_adjustment' else 'Dated backend input or allocation; rerun evaluation to refresh.'))
+            if key in ratios:sheet[local[key]].number_format=RATE
+            if key in ('nopat','full_period_fcff','remaining_fcff','present_value'):
+                sheet[local[key]].border=TOTAL;sheet[local[key]].font=Font(name='Aptos',size=10,bold=True,color=INK)
+        detail_pv.append(local['present_value'])
+        locations[item['period_id']]=local
+    note(37,'The scope timing adjustment uses existing event economics and control dates. Undisclosed event-specific lease, capex, working-capital and FX timing remains provisional. No elapsed operating cash flow is discounted again.')
+    # Transition paths are snapshots; their NOPAT/reinvestment/discount equations remain inspectable.
+    row+=3;section(row,'ANNUAL TRANSITION TO SUSTAINABLE ECONOMICS');row+=1
+    for column,item in enumerate(transition,4):_cell(sheet,row,column,item['end'][:4],bold=True,color='FFFFFF',fill=NAVY)
+    tkeys=[('revenue','Revenue'),('revenue_growth','Revenue growth'),('operating_margin','Operating margin after cash leases'),('tax_rate','Unlevered tax rate'),
+           ('nopat','Net operating profit after tax'),('reinvestment_rate','Reinvestment / NOPAT'),('economic_reinvestment','Economic reinvestment'),
+           ('full_period_fcff','Unlevered free cash flow'),('discount_years','Discount duration'),('discount_factor','Discount factor'),('present_value','Present value')]
+    trows={key:row+1+index for index,(key,_) in enumerate(tkeys)};transition_pv=[];transition_refs=[]
+    for key,title in tkeys:label(trows[key],title,'%' if key in ('revenue_growth','operating_margin','tax_rate','reinvestment_rate','discount_factor') else 'years' if key=='discount_years' else unit)
+    for column,item in enumerate(transition,4):
+        local={key:f'{get_column_letter(column)}{trows[key]}' for key,_ in tkeys};local.update(wacc=wacc_ref,next_year_revenue=local['revenue'],reinvestment=local['economic_reinvestment'],remaining_fcff=local['full_period_fcff'])
+        for key,_ in tkeys:
+            target=valuation['wacc']['tax_rate'] if key=='tax_rate' else item[key]
+            if key=='tax_rate':put(trows[key],column,'='+refs['tax_rate'],target)
+            elif key in ('nopat','economic_reinvestment','full_period_fcff','discount_factor','present_value'):
+                equation(trows[key],column,dict(nopat='terminal_nopat',economic_reinvestment='reinvestment',full_period_fcff='terminal_fcff',discount_factor='discount_factor',present_value='present_value')[key],local,target)
+            else:put(trows[key],column,target,comment='Backend transition snapshot: growth/margin/reinvestment fade is rebuilt by evaluation, not by editing this cell.')
+            if key in ('revenue_growth','operating_margin','tax_rate','reinvestment_rate','discount_factor'):sheet[local[key]].number_format=RATE
+        transition_pv.append(local['present_value']);transition_refs.append(local)
+    row+=len(tkeys)+2;note(row,'Transition length and paths come from typed inputs. Changing terminal assumptions locally updates terminal equations; rerun the backend to regenerate the intervening transition path.');row+=2
+    section(row,'TERMINAL VALUE');terminal_rows={};terminal=valuation['terminal'];row+=1
+    terminal_items=[('base_revenue','Revenue entering terminal year'),('growth','Perpetual growth'),('next_year_revenue','Next-year revenue'),
+        ('operating_margin','Sustainable operating margin'),('tax_rate','Unlevered tax rate'),('nopat','Sustainable next-year NOPAT'),
+        ('roic','Sustainable return on invested capital'),('reinvestment_rate','Reinvestment / NOPAT'),('reinvestment','Required reinvestment'),
+        ('fcff','Sustainable next-year free cash flow'),('value','Terminal value at final year end'),('discount_years','Discount years to final year end'),('present_value','Present value of terminal value')]
+    for key,title in terminal_items:terminal_rows[key]=row;label(row,title,'%' if key in ('growth','operating_margin','tax_rate','roic','reinvestment_rate') else 'years' if key=='discount_years' else unit);row+=1
+    tr={key:'D'+str(rr) for key,rr in terminal_rows.items()};tr['wacc']=wacc_ref
+    for key,_ in terminal_items:
+        target=valuation['wacc']['tax_rate'] if key=='tax_rate' else terminal[key]
+        if key in ('growth','operating_margin','tax_rate','roic'):
+            ar={'growth':'terminal_growth','operating_margin':'terminal_margin','tax_rate':'tax_rate','roic':'terminal_roic'}[key]
+            put(terminal_rows[key],4,'='+refs[ar],target,unit='ratio')
+        elif key=='base_revenue' and transition_refs:put(terminal_rows[key],4,'='+transition_refs[-1]['revenue'],target)
+        elif key=='base_revenue':
+            annual=next((p['id'] for p in spec.get('periods',[]) if p.get('kind')=='FY' and p['end']==detail[-1]['end']),detail[-1]['period_id'])
+            put(terminal_rows[key],4,'='+source_reference(roles['revenue'],annual),target)
+        elif key=='discount_years':put(terminal_rows[key],4,target,comment='Dated backend snapshot; valuation date and fiscal endpoint determine this duration.')
+        else:equation(terminal_rows[key],4,{'next_year_revenue':'next_year_revenue','nopat':'terminal_nopat','reinvestment_rate':'reinvestment_rate','reinvestment':'reinvestment','fcff':'terminal_fcff','value':'terminal_value','present_value':'terminal_present_value'}[key],tr,target)
+        if key in ('growth','operating_margin','tax_rate','roic','reinvestment_rate'):sheet[tr[key]].number_format=RATE
+    note(row,'Terminal growth requires reinvestment = NOPAT × growth / ROIC. The mid-period perpetuity includes (1 + WACC)^0.5 and is discounted to the valuation date. WACC must exceed growth; backend evaluation rejects invalid cases.');row+=2
+    # Event dates and economic claims are separate from operating cash flows.
+    event_pv=[]
+    if valuation.get('portfolio_events'):
+        section(row,'DATED PORTFOLIO CASH AND RETAINED OWNERSHIP');row+=1
+        for event in valuation['portfolio_events']:
+            note(row,str(event['id'])+' | Closing '+event['date']);row+=1;event_refs={'wacc':wacc_ref}
+            event_keys=[('net_cash','Net acquisition / disposal cash'),('event_cash_tax','Cash tax on transaction'),('retained_interest_value','Retained interest created at closing'),
+                ('incremental_nci_claim','Incremental minority claim'),('existing_interest_transfer','Previously held associate stake transferred'),('nonlease_debt_transfer','Nonlease debt assumed / transferred'),
+                ('discount_years','Years to closing'),('discount_factor','Discount factor'),('present_value','Present value of event claims')]
+            for key,title in event_keys:
+                label(row,title,'years' if key=='discount_years' else '%' if key=='discount_factor' else unit);event_refs[key]='D'+str(row)
+                if key=='discount_factor':
+                    equation(row,4,'discount_factor',event_refs,event[key]);sheet[event_refs[key]].number_format=RATE
+                elif key=='present_value':equation(row,4,'event_present_value',event_refs,event[key])
+                else:put(row,4,event.get(key,0.),comment='Dated backend event input. Ownership-adjusted amounts; applied once.');row+=1;continue
+                row+=1
+            event_pv.append(event_refs['present_value'])
+    section(row,'ENTERPRISE VALUE TO COMMON EQUITY');row+=1
+    er={};label(row,'Present value of operating cash flows',unit)
+    er['operating_cashflow_present_value']=put(row,4,'=SUM('+','.join(detail_pv+transition_pv)+')',sum(c['present_value'] for c in detail+transition));row+=1
+    label(row,'Present value of terminal value',unit);er['terminal_present_value']=put(row,4,'='+tr['present_value'],terminal['present_value']);row+=1
+    for key,target in valuation['equity_bridge'].items():
+        label(row,key.replace('_',' ').capitalize(),unit);er[key]='D'+str(row)
+        if key=='enterprise_value':equation(row,4,'enterprise_value',er,target)
+        elif key=='future_portfolio_events':put(row,4,'=SUM('+','.join(event_pv)+')' if event_pv else 0.,target)
+        elif key in ('restricted_cash','pension_claim','deferred_consideration','other_claims'):put(row,4,'=-'+refs[key],target)
+        elif key=='other_assets':put(row,4,'='+refs[key],target)
+        else:put(row,4,target,comment=valuation.get('opening_bridge',{}).get({'nonlease_debt':'debt'}.get(key,key),'Dated valuation bridge snapshot; no forecast terminal cash is added.'))
+        row+=1
+    label(row,'Common equity value',unit);er['equity_value']=equation(row,4,'equity_value',er,valuation['equity_value']);locations['equity_value']=er['equity_value'];row+=1
+    label(row,'Valuation-date basic outstanding shares',share_unit);er['basic_shares']=put(row,4,valuation['opening_bridge']['shares']['value'],comment=valuation['opening_bridge']['shares']);row+=1
+    er['dilution_shares']=refs['dilution_shares']
+    label(row,'Valuation-date shares including explicit dilution',share_unit);er['valuation_date_shares']=equation(row,4,'valuation_date_shares',er,valuation['valuation_date_shares']);row+=1
+    for key in ('money_scale','share_scale'):
+        label(row,key.replace('_',' ').capitalize(),'units');er[key]=put(row,4,valuation[key]);row+=1
+    label(row,'Fair value per share — valuation date',valuation['currency']);locations['fair_value_per_share']=equation(row,4,'fair_value_per_share',er,valuation['fair_value_per_share']);row+=1
+    sheet[locations['fair_value_per_share']].border=TOTAL;sheet[locations['fair_value_per_share']].font=Font(name='Aptos',size=12,bold=True,color=INK)
+    sheet[locations['fair_value_per_share']].number_format=NUMBER.replace('0.0','0.00')
+    label(row,'Terminal present value / enterprise value','%');put(row,4,'='+tr['present_value']+'/'+er['enterprise_value'],terminal['share_of_enterprise_value'],unit='ratio');row+=2
+    section(row,'DATED MARKET COMPARISON');row+=1
+    quote=inputs.get('market',{}).get('price',{});label(row,'Quoted price',inputs.get('market',{}).get('currency'))
+    market_price=put(row,4,quote.get('value'),unit='per_share',comment=quote,input_cell=True);assumption_cells['market.price']=market_price
+    _cell(sheet,row,5,quote.get('as_of'));sheet.row_dimensions[row].height=max(30,status(row,6,quote.get('status')));row+=1
+    label(row,'Quote unit conversion to reporting currency','multiple');scale=put(row,4,inputs.get('market',{}).get('price_unit_scale',1.));row+=1
+    if valuation.get('market_comparison',{}).get('status')=='available':
+        label(row,'Current market price in reporting currency',valuation['currency']);market_normalized=put(row,4,'='+market_price+'*'+scale,valuation['market_comparison']['price_in_reporting_currency'],unit='per_share');row+=1
+        label(row,'Implied upside / downside','%');put(row,4,'='+locations['fair_value_per_share']+'/'+market_normalized+'-1',valuation['market_comparison']['upside'],unit='ratio');row+=1
+    else:note(row,'No reliable dated quote is available. Missing is not a zero share price; upside and current multiples remain unavailable.');row+=1
+    for item in valuation.get('implied_multiples',[]):
+        for key,title in (('implied_ev_ebit','DCF EV / operating profit after leases'),('implied_ev_ebitda','DCF EV / EBITDA after leases'),('market_ev_ebit','Market EV / operating profit after leases'),('market_ev_ebitda','Market EV / EBITDA after leases')):
+            label(row,item['period_id']+' — '+title,'x');put(row,4,item.get(key),comment='Backend comparison snapshot; rerun valuation after operating or market changes.');row+=1
+    row+=1;section(row,'VALUATION SENSITIVITIES — BACKEND SCENARIOS');row+=1
+    for column,title in ((2,'WACC'),(3,'Growth'),(4,'Fair value / share'),(5,'Terminal reinvestment'),(6,'Status')):
+        _cell(sheet,row,column,title,bold=True).alignment=Alignment(wrap_text=True,vertical='center')
+    sheet.row_dimensions[row].height=30
+    for point in valuation.get('sensitivities',{}).get('wacc_growth',[]):
+        row+=1;put(row,2,point.get('wacc'),unit='ratio');put(row,3,point.get('growth'),unit='ratio');put(row,4,point.get('fair_value_per_share'),unit='per_share');put(row,5,point.get('terminal_reinvestment'));_cell(sheet,row,6,point.get('status'))
+    row+=2;note(row,'Every sensitivity calls the same Python valuation function. Growth changes recompute terminal reinvestment. These are saved scenarios, not Excel data tables.');row+=2
+    for point in valuation.get('sensitivities',{}).get('event_consideration',[]):
+        label(row,str(point['event_id'])+' — consideration × '+str(point['net_cash_multiplier']),valuation['currency']+'/share');put(row,4,point['fair_value_per_share'],unit='per_share');row+=1
+    row+=1;section(row,'PROVENANCE, CASH-FLOW RECONCILIATION AND LIMITATIONS');row+=1
+    for item in valuation.get('statement_cf_reconciliation',[]):
+        note(row,item['period_id']+' statement CFO to FCFF: '+item['status']+(' | residual '+format(item['residual'],'.8g') if item.get('residual') is not None else ''))
+        sheet.cell(row,2).comment=Comment(_text(item),'Refractive');row+=1
+    for item in valuation.get('diagnostics',[]):note(row,str(item.get('message',item)));row+=1
+    note(row,'Sources and assumption methods are preserved in valuation.json / valuation_inputs.json. Workbook edits do not update these saved inputs or renew evidence validation.');row+=1
+    # A3 landscape pages reserve room for the repeated title and methods. Pack
+    # complete semantic blocks where possible; long blocks break between rows.
+    # This keeps headings with their data without company-specific coordinates.
+    page_capacity=600.;used=0.
+    starts=sorted(section_starts)
+    for index,start in enumerate(starts):
+        end=starts[index+1] if index+1<len(starts) else row+1
+        heights=[sheet.row_dimensions[r].height or 15 for r in range(start,end)]
+        block=sum(heights)
+        minimum=sum(heights[:min(4,len(heights))])
+        if used and used+(block if block<=page_capacity else minimum)>page_capacity:
+            sheet.row_breaks.append(Break(id=start-1));used=0.
+        for current,height in zip(range(start,end),heights):
+            if used and used+height>page_capacity:
+                sheet.row_breaks.append(Break(id=current-1));used=0.
+            used+=height
+    sheet.print_area=f'B2:{last_letter}{row}'
+    return dict(expected_valuation_cells=expected,valuation_cells=locations,valuation_assumption_cells=assumption_cells,
+                valuation_print_area=f'B2:{last_letter}{row}',valuation_status=valuation.get('status'),valuation_formula_count=formula_count,
+                valuation_section_rows=starts,valuation_page_breaks=[item.id for item in sheet.row_breaks.brk])
 
 
 def _legacy_history(workbook, spec):
@@ -617,7 +889,7 @@ def _reporting_bridges(workbook, bridges):
     sheet.print_area = f"B2:F{r - 1}"
 
 
-def _export_periodic(path, spec, values, checks):
+def _export_periodic(path, spec, values, checks, *, valuation=None):
     """Render one explicit cell graph at fiscal quarter, half-year and year frequency."""
     from .periods import cell_dependencies, cell_formula_excel, iter_identity_cells
     path = Path(path)
@@ -651,7 +923,7 @@ def _export_periodic(path, spec, values, checks):
     _cell(model, 2, 2, spec["company"], bold=True)
     model["B2"].font = Font(name="Aptos", size=18, bold=True, color=NAVY)
     model.row_dimensions[2].height = 30
-    opening_note = "Temporary forecasts · edit Assumptions; yellow Model boxes are linked displays · expand year groups for interim detail"
+    opening_note = "Temporary scenario · backend inputs are authoritative; Excel edits stay local · expand year groups for interim detail"
     if spec.get('financial_completeness') == 'incomplete_scope_accounting':
         opening_note = "Provisional model — material portfolio closing accounting is incomplete · edit Assumptions; yellow Model boxes are linked displays"
     _cell(model, 3, 2, opening_note, color=GREY)
@@ -731,7 +1003,7 @@ def _export_periodic(path, spec, values, checks):
         next_assumption+=1
     assumption_cells = {row["id"]: {pid: {"sheet": "Assumptions", "cell": f"{get_column_letter(c)}{assumption_positions[row['id']]}"} for pid, c in columns.items()} for row in control_rows}
     assumption_sheet = _table(workbook, "Assumptions", ["Driver ID", "Authoritative input / calculation", "Units"] + list(columns), [], {1: 35, 2: 55, 3: 14})
-    _cell(assumption_sheet, 3, 2, "Blue/yellow: editable input. Black: assumption calculation. Pink: historical calibration. Model boxes link here; blank inputs remain missing.", color=GREY)
+    _cell(assumption_sheet, 3, 2, "Backend input projection. Blue/yellow: workbook-local input. Black: calculation. Pink: calibration. Excel edits do not update the saved backend model.", color=GREY)
     for index,label in assumption_headers.items():_bar(assumption_sheet,index,label,last)
     fx_sheet = _table(workbook, "FX", ["Rate ID", "Imported period average", "Quote units"] + list(columns), [], {1: 35, 2: 55, 3: 20})
     _cell(fx_sheet, 3, 2, "Shared database snapshot: actual daily crosses plus spot held over future dates. Currency weights link to authoritative Assumptions; provisional exposures are estimates.", color=GREY)
@@ -752,7 +1024,7 @@ def _export_periodic(path, spec, values, checks):
                 cell.fill=PatternFill('solid',fgColor=YELLOW)
                 cell.number_format=';'.join(part+'" E"' for part in cell.number_format.split(';')[:3])
             if descriptor.get('status')!='not_applicable':cell.comment = Comment(_text(descriptor), "Refractive")
-    history = _table(workbook, "Historics", ["Metric ID", "Reported observation", "Units"] + list(history_columns), [], {1: 35, 2: 55, 3: 14})
+    history = _table(workbook, "Historics", ["Metric ID", "Historical inputs / supporting parameters", "Units"] + list(history_columns), [], {1: 35, 2: 55, 3: 14})
     _cell(history, 3, 2, "Source observations; internal cumulative periods retain live derivations in the hidden source columns. Original references and vintages remain in audit files.", color=GREY)
     for sheet in (assumption_sheet, history, fx_sheet):
         sheet.freeze_panes='D6'
@@ -782,6 +1054,8 @@ def _export_periodic(path, spec, values, checks):
             value = descriptor.get("value")
             if value is not None and not _number(value):
                 raise ValueError(f"Non-numeric source/input value: {row['id']} {pid}")
+            if descriptor.get('data_role')=='estimated_historical_baseline' or descriptor.get('calibration_eligible') is False:
+                continue
             if row["kind"] != "assumption" or descriptor.get("status") not in ("forecast",) and not descriptor.get("editable"):
                 _cell(history, hr, c, value, color=BLUE, number_format=_format(row["unit"]))
     def resolve(key, pid):
@@ -843,7 +1117,8 @@ def _export_periodic(path, spec, values, checks):
             elif formula:
                 content, target = cell_formula_excel(descriptor, pid, resolve), value
             elif descriptor.get("value") is not None:
-                content = descriptor["value"] if ar and (descriptor.get("editable") or status == "forecast") else lookup(row["id"], pid)
+                estimated=descriptor.get('data_role')=='estimated_historical_baseline' or descriptor.get('calibration_eligible') is False
+                content = descriptor["value"] if estimated or ar and (descriptor.get("editable") or status == "forecast") else lookup(row["id"], pid)
                 target = descriptor["value"]
             else:
                 content, target = (None, None)
@@ -869,7 +1144,7 @@ def _export_periodic(path, spec, values, checks):
                                 fill=YELLOW if ar and status in ("forecast", "estimate") else PALE if row.get("style") == "subtotal" else None,
                                 number_format=_model_format(row))
             if not row.get('fx_only'):
-                target_cell.comment = Comment(_text({"status": status, "reason": descriptor.get("reason"), "period": period_by_id[pid], "source_refs": descriptor.get("source_refs")}), "Refractive")
+                target_cell.comment = Comment(_text({"status": status, "classification":descriptor.get('data_role'),"calibration_eligible":descriptor.get('calibration_eligible'),"reason": descriptor.get("reason"), "period": period_by_id[pid], "source_refs": descriptor.get("source_refs")}), "Refractive")
             if ar:
                 # Excel can replace an empty formula's displayed cache with its
                 # hyperlink destination. Row labels provide navigation instead.
@@ -942,6 +1217,13 @@ def _export_periodic(path, spec, values, checks):
                 cell=_cell(fx_sheet,coverage_row+offset,c,_text(value));cell.alignment=Alignment(wrap_text=True,vertical='top')
             fx_sheet.row_dimensions[coverage_row+offset].height=72
             fx_sheet.cell(coverage_row+offset,2).comment=Comment(_text(item),'Refractive')
+    hidden_assumption_rows={}
+    for row in control_rows:
+        if row.get('support_matrix') and not any(cell.get('editable') for cell in row.get('cells',{}).values()):
+            index=assumption_positions[row['id']]
+            assumption_sheet.row_dimensions[index].hidden=True
+            assumption_sheet.row_dimensions[index].outlineLevel=1
+            hidden_assumption_rows[row['id']]=index
     for index in assumption_positions.values():
         label=assumption_sheet.cell(index,2)
         if len(str(label.value or ''))>62:
@@ -1035,7 +1317,8 @@ def _export_periodic(path, spec, values, checks):
     model.cell(summary_row,2).comment=Comment(_text(dict(gaps=spec.get('gaps',[]),finding_counts=finding_counts,
         full_findings='Every finding and its evidence is preserved in model.audit.json under checks.',
         fx='Rates and exposure matrices on FX; provisional weights and adjustment factors on Assumptions. Historical reported FX is preserved.')),'Refractive')
-    audit = dict(style_version=STYLE_VERSION, dependencies=dependency_rows, drivers=driver_rows, sources=source_rows, checks=checks, reporting_bridges=spec.get("reporting_bridges", []), missing_value_audit=spec.get("missing_value_audit", {}), fx_metadata=spec.get("fx_metadata", {}),fx_currency_coverage=spec.get('fx_currency_coverage',[]),fx_exposure_quality=spec.get('fx_exposure_quality',[]),financial_contracts=spec.get('financial_contracts',{}))
+    valuation_inspection = _valuation_sheet(workbook, spec, values, valuation, resolve) if valuation is not None else {}
+    audit = dict(style_version=STYLE_VERSION, dependencies=dependency_rows, drivers=driver_rows, sources=source_rows, checks=checks, reporting_bridges=spec.get("reporting_bridges", []), missing_value_audit=spec.get("missing_value_audit", {}), fx_metadata=spec.get("fx_metadata", {}),fx_currency_coverage=spec.get('fx_currency_coverage',[]),fx_exposure_quality=spec.get('fx_exposure_quality',[]),financial_contracts=spec.get('financial_contracts',{}), valuation=valuation)
     for sheet in workbook:
         for cells in sheet:
             for cell in cells:
@@ -1045,7 +1328,7 @@ def _export_periodic(path, spec, values, checks):
                     cell.comment=Comment('This commentary exceeds the Excel comment size supported by this exporter. The complete text is preserved in model.audit.json under extended_cell_comments['+reference+']. No source evidence has been discarded.','Refractive')
     path.parent.mkdir(parents=True, exist_ok=True)
     path.with_suffix(".audit.json").write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
-    workbook._sheets.sort(key=lambda sh: {"Model": 0, "Assumptions": 1, "Historics": 2, "FX": 3, "Historical Segments": 4}.get(sh.title, 5))
+    workbook._sheets.sort(key=lambda sh: {"Model": 0, "Valuation": 1, "Assumptions": 2, "Historics": 3, "FX": 4, "Historical Segments": 5}.get(sh.title, 6))
     for sheet in workbook:
         sheet.sheet_view.tabSelected = False
         sheet.sheet_view.topLeftCell='A1'
@@ -1059,11 +1342,11 @@ def _export_periodic(path, spec, values, checks):
     workbook.save(path)
     workbook.close()
     return dict(style_version=STYLE_VERSION, status="structure_and_formula_syntax_checked", recalculation="not_run", formula_count=formula_count,
-                expected_model_cells=expected_model, expected_check_cells=expected_checks, expected_assumption_cells=expected_assumptions, expected_fx_cells=expected_fx,expected_history_cells=expected_history,
+                expected_model_cells=expected_model, expected_check_cells=expected_checks, expected_assumption_cells=expected_assumptions, expected_fx_cells=expected_fx,expected_history_cells=expected_history,hidden_assumption_rows=hidden_assumption_rows,
                 model_rows=positions, fx_rows=fx_positions, period_columns={pid: get_column_letter(c) for pid, c in columns.items()},
                 internal_period_columns={pid:get_column_letter(c) for pid,c in internal_columns.items()},history_rows=history_positions,
                 year_columns={str(p["fiscal_year"]): get_column_letter(columns[str(p["id"])]) for p in periods if p["kind"] == "FY"},
-                periods=periods, forecast_years=spec.get('forecast_years',[]),forecast_horizon=spec.get('forecast_horizon',{}),internal_periods=internal_periods,section_rows=section_positions, fx_coverage_row=coverage_row,fx_currency_coverage=spec.get('fx_currency_coverage',[]),assumption_count=len(assumptions), assumption_cells=assumption_cells, header_rows="2:6")
+                periods=periods, forecast_years=spec.get('forecast_years',[]),forecast_horizon=spec.get('forecast_horizon',{}),internal_periods=internal_periods,section_rows=section_positions, fx_coverage_row=coverage_row,fx_currency_coverage=spec.get('fx_currency_coverage',[]),assumption_count=len(assumptions), assumption_cells=assumption_cells, header_rows="2:6", **valuation_inspection)
 
 
 def validate_workbook_layout(path, inspection):
@@ -1376,6 +1659,9 @@ def export_excel_review(path, inspection, output_directory, *, sections=None, ex
     for key in selected:
         start, end = bounds[key]
         items.append(dict(name=key, area=f"B{start}:{last_column}{end}", path=str(output_directory / (key + ".pdf"))))
+    if inspection.get('valuation_print_area'):
+        items.append(dict(name='valuation',sheet='Valuation',area=inspection['valuation_print_area'],
+            path=str(output_directory/'valuation.pdf'),print_title_rows='$2:$5'))
     if periodic:
         periods = inspection["periods"]
         forecast_years = sorted({p["fiscal_year"] for p in periods if p.get("status") == "forecast"})
@@ -1397,7 +1683,7 @@ def export_excel_review(path, inspection, output_directory, *, sections=None, ex
             return dict(visible_columns=[all_columns[p["id"]] for p in selected_periods],
                         year_headers=[dict(year=y, first=columns[0], last=columns[-1]) for y, columns in groups.items()])
         for item in items:
-            item.update(view_metadata(annual))
+            if item.get('sheet','Model')=='Model':item.update(view_metadata(annual))
         opening=next(item for item in items if item['name']=='opening')
         items.append(dict(name='opening_periods',area=opening['area'],path=str(output_directory/'opening_periods.pdf'),**view_metadata(detail)))
         for key in selected:
@@ -1422,6 +1708,7 @@ def export_excel_review(path, inspection, output_directory, *, sections=None, ex
             items.append(dict(name='fx_provider_coverage',sheet='FX',
                 area=f'B{start}:K{start + len(inspection.get("fx_currency_coverage", [])) + 4}',
                 path=str(output_directory/'fx_provider_coverage.pdf'),
+                print_title_rows=f'${start}:${start + 1}',
                 visible_columns=list('DEFGHIJK'),max_pages=3))
         # Exposure weights have one authoritative FY cell. Render their complete
         # currency lists separately, since a first-page rate preview omits them.
@@ -1461,7 +1748,7 @@ try {
   $sheet.PageSetup.Zoom=$false
   $sheet.PageSetup.FitToPagesWide=1
   $sheet.PageSetup.FitToPagesTall=$false
-  $sheet.PageSetup.PrintTitleRows=if($payload.periodic -and $name -eq 'Model'){'$2:$6'}else{'$2:$5'}
+  $sheet.PageSetup.PrintTitleRows=if($item.print_title_rows){$item.print_title_rows}elseif($payload.periodic -and $name -eq 'Model'){'$2:$6'}else{'$2:$5'}
   $sheet.PageSetup.LeftMargin=18
   $sheet.PageSetup.RightMargin=18
   $sheet.PageSetup.TopMargin=18

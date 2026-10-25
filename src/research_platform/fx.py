@@ -314,33 +314,52 @@ def _shift_months(day,months):
     return date(year,month,min(day.day,calendar.monthrange(year,month)[1]))
 
 
+def transaction_hedge_terms(component,start,end,*,prior=False):
+    """Resolve current and comparison purchase windows independently."""
+    start,end=_date(start),_date(end)
+    matches=[t for t in component.get('hedge_terms',[]) if _date(t['start'])<=end and _date(t['end'])>=start]
+    if matches:
+        if len(matches)!=1 or _date(matches[0]['start'])>start or _date(matches[0]['end'])<end:
+            raise ValueError('Hedge terms must cover the complete purchase window without overlap; split the scenario period explicitly')
+        terms=matches[0];coverage=terms.get('hedge_coverage',0.);hedge=terms.get('hedge_rate')
+    else:
+        prefix='prior_' if prior else '';coverage=component.get(prefix+'hedge_coverage',0.);hedge=component.get(prefix+'hedge_rate')
+    if type(coverage) not in (int,float) or not math.isfinite(coverage) or not 0<=coverage<=1:
+        raise ValueError('Hedge coverage must be between zero and one')
+    if coverage and _number(hedge) is None:raise ValueError('Positive hedge coverage requires a positive functional/invoice hedge rate')
+    return dict(hedge_coverage=coverage,hedge_rate=hedge)
+
+
 def transaction_fx_for_period(snapshot,component,start,end,prior_start=None,prior_end=None):
     """Functional-currency costing route, before consolidation translation.
 
     Lag shifts the purchase-rate window back from consumption. An explicitly
     entered fixed hedge rate blends with market rates; no hedge is inferred.
-    The same coverage/rate applies to the comparison window unless a separately
-    evidenced baseline effective rate is supplied.
+    Current and comparable coverage/rates are independent. Undocumented prior
+    hedging is an explicitly unhedged scenario, never inherited from today.
     """
     functional=component['functional_currency'];invoice=component['invoice_currency']
-    lag=component.get('lag_months',0);coverage=component.get('hedge_coverage',0.)
+    lag=component.get('lag_months',0)
     if type(lag) is not int or lag<0:raise ValueError('Procurement lag must be nonnegative whole months')
-    if not isinstance(coverage,(int,float)) or not math.isfinite(coverage) or not 0<=coverage<=1:raise ValueError('Hedge coverage must be between zero and one')
-    hedge=component.get('hedge_rate')
-    if coverage and _number(hedge) is None:raise ValueError('Positive hedge coverage requires a positive functional/invoice hedge rate')
     if functional==invoice:return dict(value=0.,status='identity',current_rate=1.,prior_rate=1.,functional_currency=functional,invoice_currency=invoice,lag_months=lag)
     start,end=_shift_months(start,-lag),_shift_months(end,-lag)
     previous_start=_shift_months(prior_start,-lag) if prior_start else _shift_months(start,-12)
     previous_end=_shift_months(prior_end,-lag) if prior_end else _shift_months(end,-12)
+    current_terms=transaction_hedge_terms(component,start,end)
+    prior_terms=transaction_hedge_terms(component,previous_start,previous_end,prior=True)
+    coverage=current_terms['hedge_coverage'];hedge=current_terms['hedge_rate']
+    prior_coverage=prior_terms['hedge_coverage'];prior_hedge=prior_terms['hedge_rate']
     current=forecast_rate(snapshot,functional,invoice,start,end);prior=forecast_rate(snapshot,functional,invoice,previous_start,previous_end)
     value=None
     if current['value'] is not None and prior['value'] is not None:
         effective=(1-coverage)*current['value']+coverage*(hedge or 0)
-        baseline=component.get('baseline_rate',(1-coverage)*prior['value']+coverage*(hedge or 0))
+        baseline=component.get('baseline_rate')
+        if baseline is None:baseline=(1-prior_coverage)*prior['value']+prior_coverage*(prior_hedge or 0)
         if _number(baseline) is None:raise ValueError('Transaction FX baseline rate must be positive')
         value=effective/baseline-1
     return dict(value=value,status='estimate' if value is not None else 'missing',current_rate=current['value'],prior_rate=prior['value'],
         functional_currency=functional,invoice_currency=invoice,lag_months=lag,hedge_coverage=coverage,hedge_rate=hedge,
+        prior_hedge_coverage=prior_coverage,prior_hedge_rate=prior_hedge,
         current=current,prior=prior,costing_route='Functional-currency cost x transaction factor, then reporting translation once')
 
 
@@ -414,6 +433,13 @@ def _attach_cost_pool_fx(spec,data,snapshot,pools,add,formula,empty,rows):
                     reason='Independent editable translation stress; zero effect is not evidence of zero exposure. '+str(trans['sensitivity_range']))
                 spec['fx_validation'].append(dict(area='fx_exposure',name=prefix+'_translation',status='WARNING',detail='No supported pool functional-currency map; independent provisional zero translation scenario'))
             components=transaction.get('components',[])
+            if pool.get('input_cost_includes_transaction_fx',False):
+                if any(c.get('weight',0) and c.get('functional_currency')!=c.get('invoice_currency') for c in components) or transaction.get('scenario_effect',0):
+                    raise ValueError('Input-cost forecast already includes transaction FX; separate transaction exposure must be disabled: '+prefix)
+                txn['note']='Transaction FX is included in the unit-cost input; no second transaction adjustment is applied.'
+                txn['input_cost_includes_transaction_fx']=True
+                for p in active:txn['cells'][p['id']]=dict(value=0.,status='forecast',editable=False,reason=txn['note'])
+                continue
             if any(not isinstance(c.get('weight'),(int,float)) or not math.isfinite(c['weight']) or c['weight']<0 for c in components) or sum(c['weight'] for c in components)>1+1e-9:
                 raise ValueError('Transaction exposure fractions must be finite, nonnegative and at most one')
             if weights and not any(w.get('exposure_status')=='unresolved' for w in weights):
@@ -441,26 +467,30 @@ def _attach_cost_pool_fx(spec,data,snapshot,pools,add,formula,empty,rows):
                 prior=add(part+'_market_prior',part+' comparable purchase-period market rate',unit='exchange_rate',fx_only=True)
                 cover=add(part+'_hedge_coverage',part+' explicitly assumed hedge coverage',kind='assumption',fx_only=True)
                 hedge=add(part+'_hedge_rate',part+' functional units per invoice unit hedge rate',unit='exchange_rate',kind='assumption',fx_only=True)
+                prior_cover=add(part+'_prior_hedge_coverage',part+' comparable-period hedge coverage',kind='assumption',fx_only=True)
+                prior_hedge=add(part+'_prior_hedge_rate',part+' comparable-period functional per invoice hedge rate',unit='exchange_rate',kind='assumption',fx_only=True)
                 hedged_current=add(part+'_hedged_current',part+' current blended rate',unit='exchange_rate',fx_only=True)
                 hedged_prior=add(part+'_hedged_prior',part+' comparable blended rate',unit='exchange_rate',fx_only=True)
                 effective_current=add(part+'_effective_current',part+' current effective rate',unit='exchange_rate',fx_only=True)
                 effective_prior=add(part+'_effective_prior',part+' prior effective rate',unit='exchange_rate',fx_only=True)
-                if 'baseline_rate' in component:effective_prior['kind']='assumption'
-                for row in (effect,current,prior,cover,hedge,weight,effective_prior):row.update(lag_months=component.get('lag_months',0),functional_currency=component['functional_currency'],invoice_currency=component['invoice_currency'])
+                fixed_baseline=component.get('baseline_rate') is not None
+                if fixed_baseline:effective_prior['kind']='assumption'
+                for row in (effect,current,prior,cover,hedge,prior_cover,prior_hedge,weight,effective_prior):row.update(lag_months=component.get('lag_months',0),functional_currency=component['functional_currency'],invoice_currency=component['invoice_currency'])
                 for p in active:
                     pid=p['id'];previous=pmap.get(by_kind.get((p['fiscal_year']-1,p['kind'])))
                     result=transaction_fx_for_period(snapshot,component,p['start'],p['end'],previous['start'] if previous else None,previous['end'] if previous else None)
                     for row,key in ((current,'current_rate'),(prior,'prior_rate')):
                         row['cells'][pid]=dict(value=result[key],status='estimate',editable=False,required=False,source_refs=[snapshot['source']],reason='Market invoice-to-functional average; purchase window shifted by explicit lag')
-                    cover['cells'][pid]=dict(value=component.get('hedge_coverage',0.),status='estimate',editable=True,
-                        reason='Explicit hedge scenario; zero is unhedged, not a reported company hedge ratio',source_refs=component.get('source_refs',[]))
-                    hedge['cells'][pid]=dict(value=component.get('hedge_rate'),status='estimate',editable=True,required=False,
-                        reason='Missing is permitted only while hedge coverage is zero; never a fabricated execution rate')
-                    for market,blended in ((current,hedged_current),(prior,hedged_prior)):
-                        blended['cells'][pid]=formula(f'(1 - {cover["id"]}) * {market["id"]} + {cover["id"]} * {hedge["id"]}')
+                    for terms_prefix,coverage_row,rate_row in (('',cover,hedge),('prior_',prior_cover,prior_hedge)):
+                        coverage_row['cells'][pid]=dict(value=result[terms_prefix+'hedge_coverage'],status='estimate',editable=not (terms_prefix and fixed_baseline),
+                            reason='Independent '+('comparable-period' if terms_prefix else 'current-period')+' hedge scenario; zero is provisional unhedged, not a company hedge disclosure',source_refs=component.get('source_refs',[]))
+                        rate_row['cells'][pid]=dict(value=result[terms_prefix+'hedge_rate'],status='estimate',editable=not (terms_prefix and fixed_baseline),required=False,
+                            reason='Missing is permitted only while this period hedge coverage is zero; never a fabricated execution rate')
+                    for market,blended,coverage_row,rate_row in ((current,hedged_current,cover,hedge),(prior,hedged_prior,prior_cover,prior_hedge)):
+                        blended['cells'][pid]=formula(f'(1 - {coverage_row["id"]}) * {market["id"]} + {coverage_row["id"]} * {rate_row["id"]}')
                         blended['cells'][pid]['required']=False
                     effective_current['cells'][pid]=formula(f'if_zero({cover["id"]}, {current["id"]}, {hedged_current["id"]})')
-                    effective_prior['cells'][pid]=dict(value=component['baseline_rate'],status='estimate',editable=True,reason='Explicit effective historical procurement rate') if 'baseline_rate' in component else formula(f'if_zero({cover["id"]}, {prior["id"]}, {hedged_prior["id"]})')
+                    effective_prior['cells'][pid]=dict(value=component['baseline_rate'],status='estimate',editable=True,reason='Explicit effective historical procurement rate; replaces the dormant comparable hedge-term controls') if fixed_baseline else formula(f'if_zero({prior_cover["id"]}, {prior["id"]}, {hedged_prior["id"]})')
                     effect['cells'][pid]=formula(f'{effective_current["id"]} / {effective_prior["id"]} - 1')
             transaction_total=add(prefix+'_transaction_weight_total',prefix+' total transaction exposure fraction',fx_only=True)
             for p in active:
@@ -505,6 +535,8 @@ def attach_company_fx(spec,data,snapshot):
             for item in pool_fx.get('translation',{}).get('weights',[]):currencies.add(item.get('rate_currency',item['currency']))
             for item in pool_fx.get('transaction',{}).get('components',[]):
                 currencies.update((item['functional_currency'],item['invoice_currency']))
+    accounting=data.get('financial_contracts',config.get('financial_contracts',{})).get('fx_accounting',{})
+    currencies.update(item['currency'] for item in accounting.get('exposures',[]))
     currencies.update(config.get('fx_currencies',[]))
     spec['fx_currency_coverage']=currency_coverage(snapshot,reporting,currencies,
         min(p['start'] for p in periods),max(p['end'] for p in periods))
@@ -577,17 +609,22 @@ def attach_company_fx(spec,data,snapshot):
                 # A missing reported FX component leaves these growth-bridge
                 # diagnostics unavailable. It must not invalidate independently
                 # reported sales or invent a historical translation contribution.
-                affected=set(reported_sales)
-                for _ in range(3):
-                    for row_id in (key+'_fx',key+'_growth',key+'_fx_effect'):
+                diagnostics={key+suffix for suffix in ('_fx','_growth','_fx_effect')}
+                diagnostics|={rid+suffix for rid in tuple(diagnostics) for suffix in ('_weighted_amount','_comparable_revenue') if rid+suffix in rows}
+                affected={(target['id'],pid) for pid in reported_sales}
+                changed=True
+                while changed:
+                    changed=False
+                    for row_id in sorted(diagnostics):
+                        if row_id not in rows:continue
                         for pid,cell in rows[row_id]['cells'].items():
-                            if not cell.get('expression'):continue
+                            if not cell.get('expression') or (row_id,pid) in affected:continue
                             from .periods import cell_dependencies
                             deps=cell_dependencies(cell,pid)
-                            if any(d['row_id'] in (key+'_fx',key+'_growth',key+'_fx_effect') and d['period_id'] in affected for d in deps):
+                            if any((d['row_id'],d['period_id']) in affected for d in deps):
                                 cell['required']=False
                                 cell['reason']='Reported historical FX component is undisclosed; this bridge diagnostic is unavailable, while reported sales remain unchanged.'
-                                affected.add(pid)
+                                affected.add((row_id,pid));changed=True
                 forecast_cells=[pid for pid in forecast_cells if pid not in reported_sales]
             if not forecast_cells:continue
             anchor=forecast_cells[0]
@@ -614,7 +651,7 @@ def attach_company_fx(spec,data,snapshot):
                 total['cells'][pid]=formula(' + '.join(f'w{i}' for i in range(len(weight_rows))),{k:v for k,v in bindings.items() if k.startswith('w')})
                 raw['cells'][pid]=formula(' + '.join(terms) if terms else '0',bindings)
                 raw['cells'][pid]['required']=False
-                if p['fiscal_year']<=base:
+                if p['fiscal_year']<=base or target['cells'][pid].get('status') in ('actual','reported','derived_actual'):
                     raw['cells'][pid]['status']='estimate'
                     raw['cells'][pid]['reason']='Current estimated exposure on historical market rates; diagnostic only, not a historically reported exposure or validated backtest'
                 historical=target['cells'][pid].get('status') in ('actual','reported','derived_actual')
@@ -697,6 +734,150 @@ def attach_company_fx(spec,data,snapshot):
     spec['policies']['fx']='Deterministic shared spot-held rates; company input baskets and editable adjustment multipliers. No second translation of reported history.'
 
 
+def apply_fx_accounting_contracts(spec,data,snapshot):
+    """Derive statement FX from dated exposures, with no balancing inputs.
+
+    This deliberately bounded interface covers opening foreign-operation
+    balances, explicitly supplied native-currency movements, and reporting-
+    functional-currency cash/debt monetary positions. It does not infer legal
+    entity functional currencies or a treasury hedge book from bond currency.
+    """
+    cfg=data.get('financial_contracts',data.get('model_configuration',{}).get('financial_contracts',{}))
+    policy=cfg.get('fx_accounting')
+    if policy is None:return spec
+    if not snapshot:
+        if policy.get('exposures'):raise ValueError('Exposure-derived FX accounting requires a saved FX snapshot; configured company exposure is distinct from missing market data')
+        spec['fx_accounting_coverage']=dict(status='incomplete',market_snapshot='missing',company_exposures='unquantified')
+        spec.setdefault('fx_validation',[]).append(dict(area='fx_accounting',name='empty_exposure_without_market_snapshot',status='WARNING',
+            detail='Company accounting exposures are unquantified and no market snapshot was supplied. Existing neutral scenarios do not establish FX-accounting coverage.'))
+        return spec
+    legacy=cfg.get('balance_sheet_fx',{})
+    if any(legacy.get(k,0) for k in ('annual_cash_translation_oci','annual_financing_remeasurement')) or any(legacy.get('annual_movements',{}).values()):
+        raise ValueError('Exposure-derived FX accounting conflicts with legacy independent FX amounts; migrate the explicit override to an exposure scenario')
+    exposures=copy.deepcopy(policy.get('exposures',[]));periods=spec['periods']
+    rows={r['id']:r for r in spec['rows']};py={(p['fiscal_year'],p['kind']):p['id'] for p in periods}
+    reporting=data['currency'];money=reporting+'m'
+    assets={'cash','inventories','receivables','owned_ppe','right_of_use_assets','intangibles','goodwill'}
+    liabilities={'trade_payables','nonlease_debt','lease_liabilities'}
+    frequency=spec.get('frequency_policy',{}).get('statements','half_year')
+    regular=('H1','H2') if frequency=='half_year' else ('Q1','Q2','Q3','Q4')
+    def actual(c):return c.get('status') in ('actual','reported','derived_actual')
+    def populated(c):return c.get('value') is not None or bool(c.get('expression'))
+    def leaves(year):
+        kinds=regular if any((year,k) in py for k in regular) else ('FY',)
+        return [p for p in periods if p['fiscal_year']==year and p['kind'] in kinds]
+    active=[p for year in spec['forecast_years'] for p in leaves(year)
+        if populated(rows['utop']['cells'][p['id']]) and not actual(rows['utop']['cells'][p['id']])]
+    if not active:return spec
+    def add(rid,label,unit=money,kind='calculated'):
+        if rid not in rows:
+            row=dict(id=rid,label=label,section='fx',unit=unit,kind=kind,metric_type='ratio' if unit in ('ratio','exchange_rate') else 'flow',
+                historical={},source_refs={},cells={p['id']:dict(value=None,status='not_applicable',editable=False) for p in periods},
+                fx_only=True,assumption_support=True,support_matrix=True,optional=True,evidence_role='shared_factor_diagnostic')
+            rows[rid]=row;spec['rows'].append(row)
+        else:rows[rid]['kind']=kind
+        return rows[rid]
+    def setf(rid,pid,expr,bindings=None,reason='Derived from exposure and shared average/closing rates'):
+        rows[rid]['cells'][pid]=dict(expression=expr,bindings=bindings or {},status='forecast',editable=False,reason=reason)
+    def sumf(rid,pid,terms):
+        if terms:setf(rid,pid,' + '.join(terms))
+        else:rows[rid]['cells'][pid]=dict(value=0.,status='forecast',editable=False,reason='No configured exposure in this accounting category; coverage limitation is explicit')
+    def aggregate(rid):
+        for year in spec['forecast_years']:
+            for p in periods:
+                if p['fiscal_year']!=year or actual(rows[rid]['cells'][p['id']]):continue
+                members=[q for q in leaves(year) if q['id']!=p['id'] and q['start']>=p['start'] and q['end']<=p['end']]
+                if len(members)>1 and members[0]['start']==p['start'] and members[-1]['end']==p['end']:
+                    bindings={f'x{i}':dict(row_id=rid,period_id=q['id']) for i,q in enumerate(members)}
+                    setf(rid,p['id'],' + '.join(bindings),bindings,'Sum of separate financial-period FX amounts; no duration averaging')
+                    if any(not populated(rows[rid]['cells'][q['id']]) for q in members):rows[rid]['cells'][p['id']]['required']=False
+    for rid in ['cash_fx','cash_translation_oci','financing_fx_remeasurement','oci_translation']:
+        add(rid,rows[rid]['label'])
+    add('cash_fx_remeasurement','Cash monetary remeasurement gain / (loss)')
+    role_targets={role:role+'_translation_movement' for role in (assets|liabilities)-{'cash'}}
+    for role,rid in role_targets.items():add(rid,rows[rid]['label'])
+    targets={p['id']:{r:[] for r in [*role_targets.values(),'cash_translation_oci','cash_fx_remeasurement','financing_fx_remeasurement']} for p in active}
+    contracts=[];seen=set();share_totals={}
+    for exposure in exposures:
+        eid=exposure['id'];role=exposure['role'];kind=exposure['type'];currency=exposure['currency']
+        if eid in seen or not re.fullmatch(r'[a-z][a-z0-9_]*',eid):raise ValueError('FX accounting exposure IDs must be unique stable business identifiers')
+        seen.add(eid)
+        if role not in assets|liabilities:raise ValueError('Unsupported FX balance role: '+role)
+        if kind not in ('foreign_operation','monetary'):raise ValueError('FX exposure requires foreign_operation or monetary accounting treatment')
+        if kind=='monetary' and (role not in ('cash','nonlease_debt') or exposure.get('functional_currency',reporting)!=reporting):
+            raise ValueError('Monetary FX currently supports cash/debt in the reporting functional currency; other functional ledgers require explicit extension')
+        share=exposure.get('opening_share')
+        if type(share) not in (int,float) or not math.isfinite(share) or not 0<=share<=1:raise ValueError('FX opening exposure share must be between zero and one')
+        share_totals[role]=share_totals.get(role,0)+share
+        if share_totals[role]>1+1e-9:raise ValueError('Foreign-operation and monetary shares cannot overlap beyond the total balance: '+role)
+        prefix='fx_accounting_'+eid
+        share_row=add(prefix+'_weight',exposure.get('label',eid)+' opening balance exposure share','ratio','assumption')
+        share_row.update(exposure_role=role,exposure_type=kind,effective_date=exposure.get('effective_from'),source_refs=exposure.get('source_refs',[]))
+        rate_unit='ratio' if currency==reporting else money+'/'+currency+'m'
+        for suffix,label,unit in [('_opening_rate','opening closing rate',rate_unit),('_closing_rate','current closing rate',rate_unit),
+            ('_average_rate','current average rate',rate_unit),('_opening_native','opening native-currency amount',currency+'m'),
+            ('_movement_native','net native-currency movement',currency+'m'),('_effect','currency movement',money)]:
+            row=add(prefix+suffix,exposure.get('label',eid)+' '+label,unit,'assumption' if suffix=='_movement_native' else 'calculated')
+            if suffix.endswith('_rate'):row.update(metric_type='ratio',number_format='0.000000')
+        for p in active:
+            pid=p['id'];start=p['start'];end=p['end']
+            applies=(not exposure.get('effective_from') or exposure['effective_from']<=end) and (not exposure.get('effective_to') or exposure['effective_to']>=start)
+            if applies and ((exposure.get('effective_from') or start)>start or (exposure.get('effective_to') or end)<end):
+                raise ValueError('Balance exposure changes inside a period need a separate dated event amount; split the profile at a financial-period boundary: '+eid)
+            prior=[q for q in periods if q['end']<start and q['kind'] in ('FY','H1','Q1','Q2','Q3','Q4') and populated(rows[role]['cells'][q['id']])]
+            if not prior:raise ValueError('No supported opening balance for FX exposure '+eid+':'+pid)
+            opening=max(prior,key=lambda q:(q['end'],q['kind']=='FY',q['kind']=='H1'))
+            share_row['cells'][pid]=dict(value=share if applies else 0.,status='estimate',editable=applies,source_refs=exposure.get('source_refs',[]),reason=exposure.get('method','Explicit provisional opening balance exposure'))
+            for suffix,a,b,method in [('_opening_rate',opening['start'],opening['end'],'closing'),('_closing_rate',start,end,'closing'),('_average_rate',start,end,'average')]:
+                result=forecast_rate(snapshot,reporting,currency,a,b,method)
+                rows[prefix+suffix]['cells'][pid]=dict(value=result['value'],status=result['status'],editable=False,source_refs=result['provenance'],reason='Shared '+method+' rate; missing observations remain missing')
+            setf(prefix+'_opening_native',pid,'opening * share / rate',dict(opening=dict(row_id=role,period_id=opening['id']),
+                share=dict(row_id=prefix+'_weight',period_id=pid),rate=dict(row_id=prefix+'_opening_rate',period_id=pid)))
+            movement=exposure.get('net_movement_native_by_period',{}).get(pid,0.) if applies else 0.
+            rows[prefix+'_movement_native']['cells'][pid]=dict(value=movement,status='estimate',editable=applies,source_refs=exposure.get('source_refs',[]),
+                reason='Explicit native-currency balance movement already represented in underlying cash/asset/debt schedules; zero limits this scenario to opening exposures. Not a reported treasury flow.')
+            setf(prefix+'_effect',pid,f'{prefix}_opening_native * ({prefix}_closing_rate - {prefix}_opening_rate) + {prefix}_movement_native * ({prefix}_closing_rate - {prefix}_average_rate)')
+            target=('cash_translation_oci' if role=='cash' else role_targets[role]) if kind=='foreign_operation' else ('cash_fx_remeasurement' if role=='cash' else 'financing_fx_remeasurement')
+            targets[pid][target].append(prefix+'_effect')
+        for suffix in ('_weight','_movement_native'):
+            rid=prefix+suffix
+            contract=dict(id=rid,definition=rows[rid]['label'],units=rows[rid]['unit'],financial_basis=data.get('forecast_basis'),
+                frequency=frequency,forecast_horizon=spec['forecast_years'],entity_id=exposure.get('entity_id','group'),cost_pool=None,
+                currency_basis='foreign_operation' if kind=='foreign_operation' else 'foreign_monetary_in_reporting_functional_currency',
+                timing=dict(effective_date=exposure.get('effective_from'),anchor='previous disclosed/modelled closing stock'),parameter_role='exposure_assumption',
+                expected_downstream_outputs=[target],source_refs=exposure.get('source_refs',[]),provisional=exposure.get('status')!='reported')
+            rows[rid]['driver_contract']=contract;contracts.append(contract)
+    for p in active:
+        pid=p['id']
+        for target,terms in targets[pid].items():sumf(target,pid,terms)
+        setf('cash_fx',pid,'cash_translation_oci + cash_fx_remeasurement',reason='Foreign-operation cash translation plus monetary cash remeasurement; both have explicit accounting counterparts')
+        c=rows['financial_income']['cells'][pid];c['expression']='('+c['expression']+') + cash_fx_remeasurement'
+        c=rows['cfo_fx_noncash']['cells'][pid];c['expression']='('+c['expression']+') - cash_fx_remeasurement'
+    for rid in ['cash_translation_oci','cash_fx_remeasurement','financing_fx_remeasurement',*role_targets.values()]:aggregate(rid)
+    # Retire the former scalar authority. Historical reported cash FX stays intact.
+    if 'cash_fx_assumption' in rows:
+        rows['cash_fx_assumption'].update(kind='calculated',support_matrix=True,note='Retired scalar; exposure/rate equations determine forecast cash FX.')
+        for p in periods:
+            if p['fiscal_year'] in spec['forecast_years'] and not actual(rows['cash_fx_assumption']['cells'][p['id']]):
+                rows['cash_fx_assumption']['cells'][p['id']]=dict(value=None,status='not_applicable',editable=False)
+    old=spec['financial_contracts'].get('drivers',[])
+    derived=set(role_targets.values())|{'cash_fx_assumption','cash_translation_oci','financing_fx_remeasurement','oci_translation'}
+    spec['financial_contracts']['drivers']=[c for c in old if c['id'] not in derived]+contracts
+    limitations=['Only configured opening balances and explicit native movements are covered; undisclosed intra-period balances, functional currencies and hedge books remain unresolved. Newly earned foreign profits and uncovered assets are not inferred from a cash-FX plug.']
+    spec['fx_accounting_contract']=dict(version=1,exposures=exposures,covered_opening_shares=share_totals,
+        unresolved_opening_shares={role:1-share_totals.get(role,0.) for role in sorted(assets|liabilities)},limitations=limitations,
+        cash_attribution='cash_fx = foreign-operation cash translation (OCI) + cash monetary remeasurement (financial income)',
+        monetary_debt='Debt remeasurement expense increases debt and is added back in CFO; translation debt affects OCI only',
+        rate_policy='Opening closing rate; current closing rate; current average for explicitly supplied native movements')
+    obsolete='Foreign balance-sheet exposures remain incomplete unless explicit closing-rate movements are supplied; cash-flow FX and OCI are independent.'
+    spec['financial_contracts']['limitations']=[s for s in spec['financial_contracts'].get('limitations',[]) if s!=obsolete]+limitations
+    spec['gaps']=[s for s in spec.get('gaps',[]) if s!=obsolete]
+    spec['policies']['fx_accounting']='Exposure-derived cash translation and monetary remeasurement have distinct OCI/earnings counterparts; net-asset translation is separate from cash FX. Uncovered opening balances and native flows are explicit limitations.'
+    spec['gaps']+=limitations
+    spec.setdefault('fx_validation',[]).append(dict(area='fx_accounting',name='exposure_coverage',status='WARNING',detail=limitations[0]))
+    return spec
+
+
 def validate_fx_contracts(spec,values):
     """Bounds and activation checks for editable currency/hedging controls."""
     checks=[];rows={r['id']:r for r in spec['rows']}
@@ -717,6 +898,18 @@ def validate_fx_contracts(spec,values):
             if rid.endswith('_hedge_coverage') and value>0:
                 hedge=values.get(rid.removesuffix('_coverage')+'_rate',{}).get(pid)
                 checks.append(dict(area='fx_contract',name=rid+':'+pid+':activation',status='PASS' if _number(hedge) is not None else 'FAIL',detail='Active hedge coverage requires a positive functional-currency-per-invoice-currency rate'))
+    if spec.get('fx_accounting_contract'):
+        for p in spec['periods']:
+            pid=p['id'];cash=values.get('cash_fx',{}).get(pid)
+            translation=values.get('cash_translation_oci',{}).get(pid);remeasurement=values.get('cash_fx_remeasurement',{}).get(pid)
+            if all(v is not None for v in (cash,translation,remeasurement)):
+                difference=cash-translation-remeasurement
+                checks.append(dict(area='fx_contract',name='cash_accounting_counterpart:'+pid,status='PASS' if abs(difference)<1e-8 else 'FAIL',
+                    detail='Cash FX equals its exposure-derived translation OCI and monetary earnings components',difference=difference))
+            for role in spec['fx_accounting_contract']['covered_opening_shares']:
+                weights=[values.get('fx_accounting_'+e['id']+'_weight',{}).get(pid) for e in spec['fx_accounting_contract']['exposures'] if e['role']==role]
+                if weights and all(v is not None for v in weights):checks.append(dict(area='fx_contract',name='nonoverlapping_balance_exposures:'+role+':'+pid,
+                    status='PASS' if sum(weights)<=1+1e-9 else 'FAIL',detail='Foreign-operation and monetary positions cannot exceed the same underlying balance'))
     return checks
 
 

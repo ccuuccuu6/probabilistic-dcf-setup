@@ -51,6 +51,285 @@ def asset_scope_context(data):
     return result
 
 
+def historical_eligibility_inputs(data):
+    """Keep excluded observations out of legacy annual/segment anchor paths.
+
+    Old saved inputs can contain the same number in both an excluded observation
+    and an unclassified annual dictionary. An eligible matching observation is
+    required to disambiguate that anchor; absence is not permission to calibrate.
+    The caller's evidence is retained unchanged, including excluded variants.
+    """
+    excluded_statuses={'unverified','conflict','excluded','vendor_unverified','primary_conflict'}
+    def excluded(o):
+        return (o.get('eligible') is False or o.get('restatement') in ('unknown','vendor_normalized')
+                or o.get('status') in excluded_statuses)
+    if not any(excluded(o) for o in data.get('observations',[])):return data
+    result=copy.deepcopy(data);annual={}
+    for observation in result.get('observations',[]):
+        if excluded(observation):observation['eligible']=False
+        if observation.get('kind')=='FY' or observation['period_id'].endswith('-FY'):
+            annual.setdefault((observation['row_id'],str(observation.get('fiscal_year',observation['period_id'].split('-')[0]))),[]).append(observation)
+    def validate(role,year,value,basis=None,observation_id=None):
+        choices=annual.get((role,str(year)),[])
+        if value is None or not any(not o.get('eligible',True) for o in choices):return
+        matching=[o for o in choices if o.get('eligible',True) and o.get('value') is not None
+                  and math.isclose(o['value'],value,rel_tol=0,abs_tol=1e-8)
+                  and (basis is None or basis in (o.get('basis'),o.get('compatibility_key')))
+                  and (observation_id is None or o['id']==observation_id)]
+        if not matching:
+            raise ValueError('Historical anchor '+role+':'+str(year)+' has excluded observation evidence without an eligible matching binding; preserve excluded facts for audit and supply eligible primary support')
+    for source in (result.get('historical',{}),result.get('schedule_controls',{})):
+        for role,history in source.items():
+            for year,value in history.get('values',{}).items():
+                basis=history.get('basis');basis=basis.get(str(year)) if isinstance(basis,dict) else basis
+                validate(role,year,value,basis,history.get('observation_ids',{}).get(str(year)))
+    for entity in result.get('segments',[])+[dict(result.get('corporate',{}),id='corporate')]:
+        for year in result.get('history_years',[]):
+            for metric in ('sales','utop','da','pricing','rig','organic'):
+                key=('og' if metric=='organic' else metric)+str(year)
+                if key in entity:validate(entity['id']+'_'+metric,year,entity[key])
+    return result
+
+
+def operating_expense_functions(data):
+    """Declared additional operating functions extend the default taxonomy."""
+    import re
+    result=[dict(id=role,label=label) for role,label in (
+        ('cogs','Cost of goods sold'),('distribution','Distribution costs'),
+        ('marketing_admin','Marketing and administration'),('research','Research and development'))]
+    seen={item['id'] for item in result}
+    for item in data.get('model_configuration',{}).get('operating_expense_functions',[]):
+        role=item.get('id','')
+        if not re.fullmatch(r'[a-z][a-z0-9_]*',role) or role in seen:
+            raise ValueError('Additional operating function needs a unique financial role: '+role)
+        if not item.get('source_refs') or not item.get('definition') or not item.get('label'):
+            raise ValueError('Additional operating function requires its label, definition and primary citations: '+role)
+        # Do not let an expense declaration overwrite an unrelated statement row.
+        if role in integrated_role_contract()['group_roles']:
+            raise ValueError('Additional operating function collides with an existing statement role: '+role)
+        seen.add(role);result.append(copy.deepcopy(item))
+    return result
+
+
+def cash_scope_policy(data):
+    """CF cash equals balance-sheet cash plus the signed disclosed components."""
+    import re
+    policy=data.get('model_configuration',{}).get('cash_scope')
+    if policy is None:return None
+    if not policy.get('method') or not policy.get('source_refs'):
+        raise ValueError('Cash scope requires a cited definition and method')
+    ids=set();roles=set()
+    for item in policy.get('components',[]):
+        role=item.get('role','');identifier=item.get('id','')
+        if not re.fullmatch(r'[a-z][a-z0-9_]*',role) or not re.fullmatch(r'[a-z][a-z0-9_]*',identifier) or role in roles or identifier in ids:
+            raise ValueError('Cash-scope component identities must be unique financial roles')
+        if role in ('cash','closing_cash','opening_cash','cash_change','short_debt','long_debt','nonlease_debt','total_debt'):
+            raise ValueError('Cash-scope component cannot be an aggregate cash or debt role')
+        if role!='held_for_sale_cash' and role in integrated_role_contract()['group_roles']:
+            raise ValueError('Cash-scope component must use a distinct subaccount rather than overwrite an existing statement role')
+        if type(item.get('coefficient')) not in (int,float) or item['coefficient'] not in (-1,1):
+            raise ValueError('Cash-scope coefficient must be +1 or -1')
+        if type(item.get('included_in_debt')) is not bool or (item['included_in_debt'] and item['coefficient']!=-1):
+            raise ValueError('A cash-scope debt component must be explicitly included in debt and deducted from CF cash')
+        if not item.get('source_refs') or not item.get('definition'):
+            raise ValueError('Cash-scope components require original citations and definitions')
+        ids.add(identifier);roles.add(role)
+    return copy.deepcopy(policy)
+
+
+def cashflow_presentation_policy(data):
+    """Cited extra cash movements, with separate equity and asset counterparts."""
+    import re
+    policy=data.get('model_configuration',{}).get('cashflow_presentation')
+    if policy is None:return None
+    if not policy.get('method') or not policy.get('source_refs'):
+        raise ValueError('Cash-flow presentation requires its method and source references')
+    seen=set();noncommon=False;distribution=False
+    for item in policy.get('components',[]):
+        role=item.get('role','');kind=item.get('classification');forecast=item.get('forecast_policy')
+        if not re.fullmatch(r'[a-z][a-z0-9_]*',role) or role in seen:
+            raise ValueError('Cash-flow component requires a unique financial role: '+role)
+        seen.add(role)
+        if not all(item.get(k) for k in ('label','definition','source_refs')):
+            raise ValueError('Cash-flow component requires cited label and definition: '+role)
+        if item.get('cashflow_section') not in ('cfi','cff'):
+            raise ValueError('Cash-flow component must identify cfi or cff: '+role)
+        if kind=='ordinary_equity_issuance':
+            if role!='issuance_cash' or item['cashflow_section']!='cff' or forecast!='existing_issuance_controls' or item.get('equity_role')!='share_capital' or item.get('asset_role') is not None:
+                raise ValueError('Ordinary issuance must use issuance_cash and existing share issuance controls')
+        elif kind in ('noncommon_equity_issuance','noncommon_equity_distribution'):
+            noncommon=True;distribution|=kind=='noncommon_equity_distribution'
+            if item['cashflow_section']!='cff' or item.get('equity_role') not in ('reserves','retained_earnings') or item.get('asset_role') is not None:
+                raise ValueError('Noncommon equity cash requires a separately cited equity counterpart, never debt: '+role)
+            if forecast not in ('no_new_transaction','hold_latest_annual'):
+                raise ValueError('Noncommon equity requires an explicit temporary transaction policy: '+role)
+        elif kind=='investment_movement':
+            if item.get('asset_role')!='short_investments' or item.get('equity_role') is not None or forecast not in ('no_new_transaction','hold_latest_annual'):
+                raise ValueError('Investment cash requires the opposite short-investment asset movement: '+role)
+        else:raise ValueError('Unsupported cash-flow component classification: '+str(kind))
+        if role not in ('issuance_cash','treasury_investments_cf') and role in integrated_role_contract()['group_roles']:
+            raise ValueError('Additional cash-flow component cannot overwrite an existing statement role: '+role)
+    claim=policy.get('noncommon_equity_claim_role')
+    if noncommon and (not isinstance(claim,str) or not re.fullmatch(r'[a-z][a-z0-9_]*',claim) or claim in seen or claim in integrated_role_contract()['group_roles']):
+        raise ValueError('Noncommon equity requires a distinct sourced memorandum equity claim role')
+    if not noncommon and claim is not None:raise ValueError('Noncommon equity claim requires corresponding classified cash components')
+    if distribution:
+        eps=data.get('model_configuration',{}).get('financial_contracts',{}).get('adjusted_earnings',{}).get('basic_earnings_adjustment')
+        if (not eps or not eps.get('source_refs') or not eps.get('method')
+                or eps.get('annual_amount') is None and not eps.get('amounts_by_period')):
+            raise ValueError('Noncommon distributions require a separate cited after-tax EPS attribution policy; paid cash cannot substitute for the EPS accrual')
+    return copy.deepcopy(policy)
+
+
+def functional_structure_inputs(data):
+    """Supply internal empty taxonomy buckets without inventing reported facts."""
+    structure=data.get('model_configuration',{}).get('functional_expense_structure',{})
+    allocations=data.get('model_configuration',{}).get('historical_allocations',[])
+    policies=data.get('model_configuration',{}).get('structural_account_policies',[])
+    cash_scope=cash_scope_policy(data)
+    if not structure and not allocations and not policies and cash_scope is None and not data.get('model_configuration',{}).get('cashflow_presentation'):return data
+    result=copy.deepcopy(data);allowed={item['id'] for item in operating_expense_functions(data)}
+    for role,policy in structure.items():
+        included=policy.get('included_in',[])
+        if role not in allowed or policy.get('treatment')!='included_in_other_functions' or not included or set(included)-allowed or role in included:
+            raise ValueError('Unsupported or overlapping functional expense structure: '+role)
+        if not policy.get('source_refs'):raise ValueError('Functional expense classification requires source evidence: '+role)
+        existing=[v for source in (data.get('historical',{}),data.get('schedule_controls',{})) for v in source.get(role,{}).get('values',{}).values()]
+        existing += [o.get('value') for o in data.get('observations',[]) if o['row_id']==role and o.get('eligible',True)]
+        if any(v is not None and v!=0 for v in existing):raise ValueError('A combined expense classification conflicts with a standalone amount: '+role)
+        result['historical'][role]=dict(values={str(y):0 for y in data['history_years']},sources={},basis=data['forecast_basis'],
+            data_role='structural_parameter',calibration_eligible=False,
+            note='No separately reported amount. Costs are included in '+', '.join(included)+'; the internal empty bucket is a classification identity, not a reported zero.')
+        result.get('schedule_controls',{}).pop(role,None)
+    seen=set()
+    policy_by_role={p.get('role'):p for p in policies}
+    for policy in policies:
+        role=policy.get('role');included=policy.get('included_in',[]);treatment=policy.get('treatment')
+        domains={'other_revenue':{'sales'},'net_other_trading':{'net_other_operating'},
+                 'net_other_operating':{'net_other_trading'},'exceptional_associate_distribution':set()}
+        valid=(role in domains and role not in seen and policy.get('source_refs') and policy.get('definition'))
+        if treatment=='included_in_role':valid=valid and bool(included) and set(included)<=domains.get(role,set())
+        elif treatment=='inactive_stage':valid=valid and role in ('net_other_trading','net_other_operating','exceptional_associate_distribution') and not included
+        else:valid=False
+        if not valid:raise ValueError('Unsupported or uncited structural account policy: '+str(role))
+        if any(role in policy_by_role.get(target,{}).get('included_in',[]) for target in included):
+            raise ValueError('Structural account inclusion cannot be circular')
+        seen.add(role)
+        if any(target not in result['historical'] for target in included):raise ValueError('Structural account containing role is missing: '+str(included))
+        existing=[v for source in (data.get('historical',{}),data.get('schedule_controls',{})) for v in source.get(role,{}).get('values',{}).values()]
+        existing += [o.get('value') for o in data.get('observations',[]) if o['row_id']==role and o.get('eligible',True)]
+        if any(v is not None and v!=0 for v in existing):raise ValueError('Structural account policy conflicts with a nonzero observation: '+role)
+        result['historical'][role]=dict(values={str(y):0 for y in data['history_years']},sources={},basis=data['forecast_basis'],
+            data_role='structural_parameter',calibration_eligible=False,classification_source_refs=copy.deepcopy(policy['source_refs']),
+            note='Internal classification identity, not a reported zero. '+policy['definition'])
+        result.get('schedule_controls',{}).pop(role,None)
+    if cash_scope is not None and 'held_for_sale_cash' not in result['historical'] and not any(i['role']=='held_for_sale_cash' for i in cash_scope['components']):
+        result['historical']['held_for_sale_cash']=dict(values={str(y):0 for y in data['history_years']},sources={},basis=data['forecast_basis'],
+            data_role='structural_parameter',calibration_eligible=False,classification_source_refs=cash_scope['source_refs'],
+            note='Inactive held-for-sale cash bridge; the cited company cash-scope components replace the default bridge.')
+    allocated=set()
+    for item in allocations:
+        role=item['row_id'];year=item['year'];amount=item['amount'];key=(role,year)
+        if key in allocated:raise ValueError('Duplicate historical allocation: '+str(key))
+        allocated.add(key)
+        if year not in data['history_years'] or item.get('status')!='estimated' or not item.get('source_refs') or not item.get('method') or not isinstance(amount,(int,float)) or isinstance(amount,bool) or not math.isfinite(amount):
+            raise ValueError('Historical allocations require a historical year, finite amount, estimated status, source evidence and method')
+        if any(o['row_id']==role and o['period_id']==str(year)+'-FY' and o.get('value') is not None and o.get('eligible',True) for o in data.get('observations',[])):
+            raise ValueError('Historical allocation cannot overwrite a source observation: '+role)
+        entity=next((s for s in result['segments'] if role==s['id']+'_da'),None)
+        if role=='corporate_da':entity=result['corporate']
+        if entity is not None:
+            entity['da'+str(year)]=amount
+            entity.setdefault('source_refs',{})['da'+str(year)]=copy.deepcopy(item['source_refs'][0])
+        elif role in result['historical']:
+            source=result['historical'][role];source.setdefault('values',{})[str(year)]=amount
+            source.setdefault('sources',{})[str(year)]=[]
+        else:raise ValueError('Unsupported historical allocation role: '+role)
+    return result
+
+
+def integrated_role_contract(scaffold_source=None):
+    """Read canonical historical roles from the scaffold without executing it.
+
+    Literal loop bindings are resolved, but company entities and financial values
+    are never evaluated. This catalogue describes identifiers, not evidence that
+    a company reports every role or that two accounting definitions are equal.
+    """
+    import ast
+    import inspect
+    import textwrap
+    source=scaffold_source if scaffold_source is not None else inspect.getsource(build_integrated_spec)
+    tree=ast.parse(textwrap.dedent(source));roles=set();anchors=set();segment_suffixes=set();role_sections={}
+    class Roles(ast.NodeVisitor):
+        def __init__(self):self.bindings={}
+        def strings(self,node):
+            if isinstance(node,ast.Constant) and isinstance(node.value,str):return {node.value}
+            if isinstance(node,ast.Name):
+                value=self.bindings.get(node.id)
+                return {value} if isinstance(value,str) else set()
+            if isinstance(node,ast.IfExp):return self.strings(node.body)|self.strings(node.orelse)
+            if isinstance(node,ast.BinOp) and isinstance(node.op,ast.Add):
+                return {left+right for left in self.strings(node.left) for right in self.strings(node.right)}
+            return set()
+        def visit_FunctionDef(self,node):
+            if node.name=='build_integrated_spec':
+                for statement in node.body:self.visit(statement)
+        def visit_For(self,node):
+            old=self.bindings.copy()
+            def bind(target,value):
+                if isinstance(target,ast.Name):self.bindings[target.id]=value
+                elif isinstance(target,(ast.Tuple,ast.List)):
+                    values=value if isinstance(value,(tuple,list)) else [None]*len(target.elts)
+                    for item,part in zip(target.elts,values):bind(item,part)
+            try:values=ast.literal_eval(node.iter)
+            except (ValueError,TypeError):values=[None]
+            if not isinstance(values,(list,tuple,set)):values=[None]
+            for value in values:
+                self.bindings=old.copy();bind(node.target,value)
+                for statement in node.body:self.visit(statement)
+            self.bindings=old
+            for statement in node.orelse:self.visit(statement)
+        def visit_Call(self,node):
+            name=node.func.id if isinstance(node.func,ast.Name) else None
+            positions={'row':(0,),'val':(0,),'ratio':(1,2),'composed':(0,1)}.get(name,())
+            for index in positions:
+                if len(node.args)>index:
+                    found=self.strings(node.args[index]);roles.update(found)
+                    if name in ('val','ratio'):anchors.update(found)
+            if name=='row':
+                row_roles=self.strings(node.args[0]) if node.args else set()
+                for keyword in node.keywords:
+                    if keyword.arg=='role':
+                        found=self.strings(keyword.value);roles.update(found);row_roles.update(found)
+                if len(node.args)>2:
+                    for role in row_roles:role_sections.setdefault(role,set()).update(self.strings(node.args[2]))
+                # Segment identifiers come from supplied entities. Retain their
+                # suffix contract separately from static group identifiers.
+                if node.args and isinstance(node.args[0],ast.BinOp) and isinstance(node.args[0].left,ast.Name) and node.args[0].left.id not in self.bindings:
+                    segment_suffixes.update(value for value in self.strings(node.args[0].right) if value.startswith('_'))
+            if isinstance(node.func,ast.Attribute) and isinstance(node.func.value,ast.Name) and node.func.value.id=='historical' and node.func.attr=='get' and node.args:
+                roles.update(self.strings(node.args[0]))
+            self.generic_visit(node)
+        def visit_Subscript(self,node):
+            if isinstance(node.value,ast.Name) and node.value.id=='historical':roles.update(self.strings(node.slice))
+            self.generic_visit(node)
+    Roles().visit(tree)
+    # The configurable function loop is not an AST literal loop. Preserve the
+    # canonical baseline expense roles in the research contract explicitly.
+    if scaffold_source is None:
+        standard={item['id'] for item in operating_expense_functions({})}
+        roles.update(standard);anchors.update(standard)
+        for role in standard:role_sections.setdefault(role,set()).add('income')
+        source+='\n'+inspect.getsource(operating_expense_functions)
+    # Corporate identifiers are explicit scaffold rows, not group aliases.
+    corporate={role for role in roles if role.startswith('corporate_')}
+    return dict(version='scaffold_roles_v1',source_sha256=hashlib.sha256(source.encode()).hexdigest(),
+        group_roles=sorted(roles-corporate),corporate_roles=sorted(corporate),
+        anchor_roles=sorted(anchors),segment_role_suffixes=sorted(segment_suffixes),
+        role_sections={role:sorted(sections) for role,sections in sorted(role_sections.items()) if sections},
+        interpretation='Canonical identifiers only; preserve company definitions, missing evidence and separately identified historical entities.')
+
+
 def build_integrated_spec(data, forecast_years=5):
     """Build the annual role scaffold used by the causal period compiler.
 
@@ -61,6 +340,11 @@ def build_integrated_spec(data, forecast_years=5):
     period compiler replaces its legacy economics with financial contracts before
     calculation, review and export, including for annual-only companies.
     """
+    data=functional_structure_inputs(historical_eligibility_inputs(data))
+    functions=operating_expense_functions(data)
+    cash_scope=cash_scope_policy(data)
+    cashflow_policy=cashflow_presentation_policy(data)
+    extra_cash_components=(cashflow_policy or {}).get('components',[])
     historical = copy.deepcopy(data['historical'])
     for key, supplement in data.get('schedule_controls', {}).items():
         if key not in historical:
@@ -98,6 +382,7 @@ def build_integrated_spec(data, forecast_years=5):
           'tax':'Effective P&L tax, current/deferred P&L split and cash-payment ratio are separate. Cash settlement is initialized from paid tax / current P&L tax where that split is disclosed. Current charge less cash payments changes current tax liabilities; deferred P&L charge changes deferred liabilities. Deferred/current tax assets and tax OCI/FX held flat in the temporary baseline.',
           'equity':'Retained earnings, treasury shares, reserves and NCI roll through profit, distributions, buybacks and equity-settled compensation.',
           'fx':'Segment sales/cost translation assumptions are zero initially; balance-sheet FX and cash FX zero. This is not a quantified currency-exposure model.'})
+    if cashflow_policy:spec['cashflow_presentation_contract']=copy.deepcopy(cashflow_policy)
     if data.get('associate_scope'):spec['policies']['associates']=data['associate_scope']
     def val(role, year=base):
         value = historical.get(role, {}).get('values', {}).get(str(year))
@@ -114,6 +399,8 @@ def build_integrated_spec(data, forecast_years=5):
             note=note,style='subtotal' if subtotal else 'normal',nonnegative=nonnegative)
         if expr is not None:r['expression']=expr
         if historical_expression:r['historical_expression']=historical_expression
+        if source.get('data_role')=='structural_parameter':
+            r.update(data_role='structural_parameter',calibration_eligible=False,kind='calculated',note=source['note'])
         spec['rows'].append(r);return r
     def assumption(key,label,sec,value,unit='ratio',note='', refs=None):
         r=row(key,label,sec,unit=unit,hist={b:value},note='TEMPORARY: '+note)
@@ -129,7 +416,11 @@ def build_integrated_spec(data, forecast_years=5):
             raise ValueError(f'Cannot initialise {label}: nonzero numerator with zero reported denominator')
         return num/den
     def ratio(key,num,den):return quotient(val(num),val(den),key)
-    def composed(left,right):
+    def composed(left,right,net=None):
+        if net and net in historical and (left not in historical or right not in historical):
+            return copy.deepcopy(historical[net].get('values',{}))
+        if left not in historical or right not in historical:
+            raise ValueError('Supply the reported net account '+str(net)+' or both gross components '+left+' and '+right)
         return {str(y):(historical[left]['values'].get(str(y))+historical[right]['values'].get(str(y)))
             if historical[left]['values'].get(str(y)) is not None and historical[right]['values'].get(str(y)) is not None else None for y in past}
     def lag(key):return f'lag("{key}", 1)'
@@ -145,12 +436,15 @@ def build_integrated_spec(data, forecast_years=5):
     for seg in data['segments']:
         key=seg['id'];sec='segment_'+key;segments.append(key)
         section(sec,seg['label']+' — operating build')
-        values={name:seg[f'{name}{base}'] for name in ('sales','utop','da','pricing','rig')}
+        revenue_model=data.get('model_configuration',{}).get('revenue_models',{}).get(key,{})
+        aggregate_organic=revenue_model.get('method')=='aggregate_organic'
+        values={name:seg[f'{name}{base}'] for name in ('sales','utop','da')}
+        values.update({name:seg.get(f'{name}{base}',0) if aggregate_organic else seg[f'{name}{base}'] for name in ('pricing','rig')})
         refs=seg.get('source_refs',{})
         price=assumption(key+'_pricing','Pricing contribution',sec,values['pricing'],note=
-            'Hold last disclosed pricing contribution. Additive with RIG; not a validated price forecast.',refs=[refs.get(f'pricing{base}',{})])
+            'Hold last completed annual pricing contribution. Additive with RIG; not a latest-quarter policy or validated forecast.',refs=[refs.get(f'pricing{base}',{})])
         activity=assumption(key+'_rig','Real internal growth (volume and mix)',sec,values['rig'],note=
-            'Hold last disclosed RIG, including product mix. Not a physical-volume forecast.',refs=[refs.get(f'rig{base}',{})])
+            'Hold last completed annual RIG, including product mix. This is an activity proxy, not observed physical volume.',refs=[refs.get(f'rig{base}',{})])
         fx=assumption(key+'_fx','FX translation contribution',sec,0,note='Neutral temporary translation; not a measured exposure.')
         inflation=assumption(key+'_cost_inflation','Operating-cost inflation before D&A',sec,values['pricing'],note=
             'Temporary proxy initialized to last pricing contribution, NOT reported unit-cost inflation. Costs also scale with RIG. Includes operating costs other than D&A.')
@@ -173,6 +467,21 @@ def build_integrated_spec(data, forecast_years=5):
         row(key+'_utop','Underlying trading operating profit',sec,key+'_ebitda - '+key+'_da',hist={b:values['utop']},subtotal=True)['source_refs']={b:[refs[f'utop{base}']]}
         row(key+'_margin','Underlying trading margin',sec,key+'_utop / '+key+'_sales',unit='ratio',hist={b:values['utop']/values['sales']})
         identity(key+'_sales_bridge',seg['label']+' sales bridge',key+'_sales - ('+lag(key+'_sales')+' + '+key+'_pricing_effect + '+key+'_rig_effect + '+key+'_fx_effect)')
+        if aggregate_organic:
+            organic=seg.get(f'og{base}')
+            if organic is None:raise ValueError('Aggregate organic mode requires a cited organic growth anchor: '+key)
+            selected={r['id']:r for r in spec['rows']}
+            for suffix in ('pricing','rig'):
+                selected[key+'_'+suffix].update(kind='calculated',expression='0',historical={},inputs={},support_matrix=True,
+                    note='Decomposition not disclosed; inactive calculation placeholder, not a reported zero or writable forecast.')
+            selected[key+'_organic'].update(kind='assumption',inputs={str(y):organic for y in future},
+                initialization='Hold last annual disclosed aggregate organic growth; provisional forecast.',
+                note=revenue_model.get('definition','Aggregate organic growth; no inferred price-volume decomposition.'))
+            selected[key+'_organic'].pop('expression',None)
+            selected[key+'_growth']['expression']=key+'_organic + '+key+'_fx'
+            selected[key+'_sales']['expression']=lag(key+'_sales')+' * (1 + '+key+'_organic + '+key+'_fx)'
+            selected[key+'_pricing_effect'].update(label='Organic growth contribution to sales',expression=lag(key+'_sales')+' * '+key+'_organic')
+            selected[key+'_rig_effect'].update(expression='0',support_matrix=True)
 
     section('corporate','Corporate and group consolidation')
     corp=data['corporate'];corp_utop=corp[f'utop{base}'];corp_da=corp[f'da{base}']
@@ -192,19 +501,20 @@ def build_integrated_spec(data, forecast_years=5):
     row('other_revenue','Other revenue','income','sales * other_revenue_ratio')
     row('total_revenue','Total revenue including other revenue','income','sales + other_revenue',subtotal=True)
     core_cost=val('total_revenue')-val('utop')
-    for role,label in [('cogs','Cost of goods sold'),('distribution','Distribution costs'),('marketing_admin','Marketing and administration'),('research','Research and development')]:
+    for function in functions:
+        role,label=function['id'],function['label']
         assumption(role+'_allocation',label+' allocation','income',-val(role)/core_cost,note=
             'Forecast allocation of group underlying costs using last reported functional expense shares; not a separately observed segment cost mix.')
         row(role,label,'income','-(total_revenue - utop) * '+role+'_allocation')
     row('gross_profit','Gross profit (sales less COGS)','income','sales + cogs',subtotal=True)
-    row('is_utop','Underlying trading profit — statement view','income','total_revenue + cogs + distribution + marketing_admin + research',hist=historical['utop']['values'],subtotal=True)
+    row('is_utop','Underlying trading profit — statement view','income','total_revenue + '+total([item['id'] for item in functions]),hist=historical['utop']['values'],subtotal=True)
     assumption('net_other_trading_assumption','Net other trading income / (expense)','income',0,'money',
         'No future restructuring or impairment costs in temporary baseline. Explicitly provisional, not a claim that recurring costs disappear.')
-    row('net_other_trading','Net other trading income / (expense)','income','net_other_trading_assumption',hist=composed('other_trading_income','other_trading_expense'))
+    row('net_other_trading','Net other trading income / (expense)','income','net_other_trading_assumption',hist=composed('other_trading_income','other_trading_expense','net_other_trading'))
     row('trading_profit','Trading operating profit','income','utop + net_other_trading',subtotal=True)
     assumption('net_other_operating_assumption','Other operating income / (expense)','income',0,'money',
         'No future disposals or other nontrading items. Activation requires an evidenced asset/cash counterpart.')
-    row('net_other_operating','Net other operating income / (expense)','income','net_other_operating_assumption',hist=composed('other_operating_income','other_operating_expense'))
+    row('net_other_operating','Net other operating income / (expense)','income','net_other_operating_assumption',hist=composed('other_operating_income','other_operating_expense','net_other_operating'))
     row('operating_profit','Operating profit','income','trading_profit + net_other_operating',subtotal=True)
     row('financial_income','Financial income','income','cash_interest + other_financial_income')
     row('financial_expense','Financial expense','income','-debt_interest - lease_interest - other_financial_cost')
@@ -222,7 +532,11 @@ def build_integrated_spec(data, forecast_years=5):
     row('shares_basic','Weighted-average basic shares (millions)','income',lag(opening_shares)+' - buyback_shares',unit='shares_m',nonnegative=True,
         note='Buybacks assumed at start of year for EPS. No new issuance in baseline.')
     row('eps_basic','Basic earnings per share','income','parent_profit / shares_basic',unit='money/shares_m')
-    identity('cost_allocation','Functional cost shares sum to one','cogs_allocation + distribution_allocation + marketing_admin_allocation + research_allocation - 1')
+    # Declare these roles before period source binding; a reported EPS remains
+    # a fact even when its independent diluted denominator is undisclosed.
+    row('shares_diluted','Diluted weighted-average shares','income','shares_basic',unit='shares_m',nonnegative=True)
+    row('eps_diluted','Diluted earnings per share','income','parent_profit / shares_diluted',unit='money/shares_m')
+    identity('cost_allocation','Functional cost shares sum to one',total([item['id']+'_allocation' for item in functions])+' - 1')
     identity('is_utop','Statement UTOP to segment UTOP','is_utop - utop')
     identity('profit_attribution','Total profit equals parent plus NCI','total_profit - parent_profit - nci_profit',[str(y) for y in past+future],1.5,True)
     identity('income_statement','Income statement profit bridge','total_profit - (operating_profit + financial_income + financial_expense + tax_expense + associate_profit)',[str(y) for y in past+future],3,True)
@@ -253,17 +567,35 @@ def build_integrated_spec(data, forecast_years=5):
             wc_extra.append(key)
     row('wc_cash','Operating working-capital cash effect','cashflow','wc_inventory_cf + wc_receivables_cf + wc_payables_cf'+(' + '+total(wc_extra) if wc_extra else ''),subtotal=True,
         note='Historical disclosed WC includes prepayments/accruals and FX/scope effects. Forecast other operating balances held flat; do not infer historic CF from closing BS differences.')
-    cfo_equation='total_profit + da + sbc - associate_profit + associate_dividends + cf_tax_timing + wc_cash'+(' + '+total(operating_adjustments) if operating_adjustments else '')
+    for rid,label in [('cfo_portfolio_noncash','Modelled noncash portfolio gain / loss reversal'),
+                      ('cfo_fx_noncash','Modelled noncash monetary FX reversal')]:
+        row(rid,label,'cashflow','0 * sales',hist={},note='Incremental modelled noncash reversal; disclosed historical adjustments remain in their original cash-flow rows.')
+    cfo_historical='cf_net_profit + da + sbc + cf_associates + associate_dividends + cf_tax_timing + wc_cash'+(' + '+total(operating_adjustments) if operating_adjustments else '')
+    cfo_equation=cfo_historical+' + cfo_portfolio_noncash + cfo_fx_noncash'
     row('cfo','Net cash from operating activities','cashflow',cfo_equation,subtotal=True)
     row('capex_ppe','Cash capital expenditure — owned PPE','cashflow','-sales * capex_ppe_ratio')
     row('capex_intangibles','Cash investment in intangible assets','cashflow','-sales * capex_intangible_ratio')
+    for item in extra_cash_components:
+        role=item['role']
+        expr='0 * sales'
+        if item['forecast_policy']!='existing_issuance_controls':
+            control=role+'_annual_policy'
+            hold=item['forecast_policy']=='hold_latest_annual'
+            assumption(control,item['label']+' — annual cash policy','financing',val(role) if hold else 0,'money',
+                ('Hold latest sourced annual cash amount' if hold else 'Explicit no-new-transaction scenario, not a reported zero')+
+                ', allocated by fiscal duration. Paid cash is distinct from any EPS accrual.',
+                refs=historical.get(role,{}).get('sources',{}).get(b,[]) if hold else item['source_refs'])
+            expr=control
+        row(role,item['label'],'cashflow',expr,note=item['definition']+' '+item['forecast_policy'])
     investing_adjustments=[]
     for key,label in [('business_acquisitions_cf','Acquisition of businesses'),('business_disposals_cf','Disposal of businesses'),
             ('associate_investing_cf','Investments / divestments in associates'),('treasury_investments_cf','Treasury investments'),
             ('other_investing_combined_cf','Other investing including long-term investments')]:
         if key in historical:
-            row(key,label,'cashflow','0 * sales',note='Historical cash transaction retained; no new transaction in the temporary forecast. Activation needs a supported asset/equity counterpart.')
-            investing_adjustments.append(key)
+            configured=next((i for i in extra_cash_components if i['role']==key),None)
+            if not configured:row(key,label,'cashflow','0 * sales',note='Historical cash transaction retained; no new transaction in the temporary forecast. Activation needs a supported asset/equity counterpart.')
+            if not configured or configured['cashflow_section']=='cfi':investing_adjustments.append(key)
+    investing_adjustments += [i['role'] for i in extra_cash_components if i['cashflow_section']=='cfi' and i['role'] not in investing_adjustments]
     cfi_equation='capex_ppe + capex_intangibles'+(' + '+total(investing_adjustments) if investing_adjustments else '')
     row('cfi','Net cash used in investing activities','cashflow',cfi_equation,subtotal=True,
         note='No new acquisitions, disposals or treasury-investment movements in the baseline; existing balances retained.')
@@ -278,13 +610,14 @@ def build_integrated_spec(data, forecast_years=5):
         if key in historical:
             row(key,label,'cashflow','0 * sales',note='Original financing movement retained. Future new debt is in the explicit borrowing/repayment controls; no new NCI acquisition.')
             financing_adjustments.append(key)
+    financing_adjustments += [i['role'] for i in extra_cash_components if i['cashflow_section']=='cff']
     cff_historical='dividends_parent + dividends_nci + buybacks + debt_borrow + debt_repay'+(' + '+total(financing_adjustments) if financing_adjustments else '')
     row('cff','Net cash used in financing activities','cashflow',cff_historical+' + lease_principal',subtotal=True)
     if len(operating_adjustments)==5:
-        identity('cfo_components','Historical operating cash subtotal from visible adjustments','cfo - ('+cfo_equation+')',[str(y) for y in past],1.5,True)
-    if len(investing_adjustments)==5:
+        identity('cfo_components','Historical operating cash subtotal from disclosed adjustments','cfo - ('+cfo_historical+')',[str(y) for y in past],1.5,True)
+    if len(investing_adjustments)==5 or any(i['cashflow_section']=='cfi' for i in extra_cash_components):
         identity('cfi_components','Historical investing cash subtotal from visible movements','cfi - ('+cfi_equation+')',[str(y) for y in past],1.5,True)
-    if len(financing_adjustments)==2:
+    if len(financing_adjustments)==2 or any(i['cashflow_section']=='cff' for i in extra_cash_components):
         identity('cff_components','Historical financing cash subtotal from visible movements','cff - ('+cff_historical+')',[str(y) for y in past],1.5,True)
     if len(wc_extra)==2:
         covered=[str(y) for y in past if all(historical.get(k,{}).get('values',{}).get(str(y)) is not None
@@ -293,16 +626,29 @@ def build_integrated_spec(data, forecast_years=5):
     row('cash_fx','Currency effects on cash','cashflow','cash_fx_assumption')
     row('cash_change','Net change in cash including FX','cashflow','cfo + cfi + cff + cash_fx',subtotal=True,
         note='Historical reported cash_change may exclude FX; opening/closing controls below use the company cash statement.')
-    row('opening_cash','Opening cash including held-for-sale scope','cashflow',lag('closing_cash'))
-    row('closing_cash','Closing cash — cash-flow scope','cashflow','opening_cash + cash_change',subtotal=True,nonnegative=True)
+    row('opening_cash','Opening cash — cash-flow scope' if cash_scope is not None else 'Opening cash including held-for-sale scope','cashflow',lag('closing_cash'))
+    row('closing_cash','Closing cash — cash-flow scope','cashflow','opening_cash + cash_change',subtotal=True,nonnegative=not cash_scope or not any(i['included_in_debt'] for i in cash_scope['components']))
     row('held_for_sale_cash','Cash within assets held for sale','cashflow','held_for_sale_cash_input',note='Explicit CF-to-BS scope bridge.')
-    row('cf_to_bs_cash','Closing balance-sheet cash','cashflow','closing_cash - held_for_sale_cash',role='cash',subtotal=True)
+    cash_bridge='closing_cash - held_for_sale_cash'
+    if cash_scope is not None:
+        cash_bridge='closing_cash'
+        for component in cash_scope['components']:
+            role=component['role']
+            if role!='held_for_sale_cash':
+                control=row(role,component['definition'],'cashflow',note='Hold the last sourced closing balance; separately declared cash scope, not operating cash flow.',nonnegative=True)
+                control.update(kind='assumption',metric_type='stock',inputs={str(y):val(role) for y in future},
+                    initialization='Hold latest sourced closing cash-scope component; changes occur at period end unless a dated model specifies otherwise.')
+            cash_bridge+=(' - ' if component['coefficient']==1 else ' + ')+role
+        spec['cash_scope_contract']=copy.deepcopy(cash_scope)
+    row('cf_to_bs_cash','Closing balance-sheet cash','cashflow',cash_bridge,role='cash',subtotal=True)
     identity('cash_roll','Cash flow opening-to-closing reconciliation','closing_cash - opening_cash - cfo - cfi - cff - cash_fx',[str(y) for y in past+future],2.5,True)
-    identity('cash_scope','Cash flow to balance-sheet cash scope','closing_cash - held_for_sale_cash - cash',[b]+[str(y) for y in future],1.5,True)
+    identity('cash_scope','Cash flow to balance-sheet cash scope',cash_bridge+' - cash',[b]+[str(y) for y in future],1.5,True)
 
     section('balance','Balance sheet')
     row('cash','Cash and cash equivalents','balance','cf_to_bs_cash',nonnegative=True)
     row('short_investments','Short-term investments','balance',lag('short_investments'),nonnegative=True)
+    investment_roles=[i['role'] for i in extra_cash_components if i['classification']=='investment_movement']
+    if investment_roles:spec['rows'][-1]['expression']+=' - ('+total(investment_roles)+')'
     row('inventories','Inventories','balance','-cogs * inventory_ratio',nonnegative=True)
     row('receivables','Trade and other receivables','balance','sales * receivables_ratio',nonnegative=True)
     row('other_current_assets','Other current assets','balance',lag('other_current_assets'),nonnegative=True)
@@ -339,6 +685,17 @@ def build_integrated_spec(data, forecast_years=5):
     row('reserves','Translation and other reserves','balance',lag('reserves')+' + sbc + cash_fx',
         note='No forecast OCI other than the explicitly modelled cash FX; equity-settled share compensation increases reserves. Not a full currency translation model.')
     row('retained_earnings','Retained earnings','balance',lag('retained_earnings')+' + parent_profit + dividends_parent')
+    for equity_role in ('reserves','retained_earnings'):
+        cash_roles=[i['role'] for i in extra_cash_components if i.get('equity_role')==equity_role]
+        if cash_roles:next(r for r in spec['rows'] if r['id']==equity_role)['expression']+=' + '+total(cash_roles)
+    if cashflow_policy and cashflow_policy.get('noncommon_equity_claim_role'):
+        claim=cashflow_policy['noncommon_equity_claim_role'];val(claim)
+        movements=[i['role'] for i in extra_cash_components if i['classification']=='noncommon_equity_issuance']
+        claim_row=row(claim,'Noncommon equity — carrying claim already included in parent equity','balance',
+            lag(claim)+(' + '+total(movements) if movements else ''),nonnegative=True,
+            note='Memorandum senior claim on common equity; included in the declared reserves/retained balance, never added again to total equity or debt. Carrying value is a provisional valuation proxy.')
+        claim_row.update(metric_type='stock',support_matrix=True)
+        spec['cashflow_presentation_contract']=copy.deepcopy(cashflow_policy)
     row('parent_equity','Equity attributable to shareholders','balance','share_capital + treasury_stock + reserves + retained_earnings',subtotal=True)
     row('nci_equity','Non-controlling interests','balance',lag('nci_equity')+' + nci_profit + dividends_nci')
     row('total_equity','Total equity','balance','parent_equity + nci_equity',subtotal=True)
@@ -407,11 +764,12 @@ def build_integrated_spec(data, forecast_years=5):
     assumption('buyback_price','Inactive buyback price placeholder','financing',val('parent_equity')/val('shares_basic'),'money/shares_m',
         'Initialised to book equity per share solely as an inactive arithmetic placeholder, NOT a market quote or execution estimate. Replace before enabling a buyback scenario.')
     row('buyback_shares','Shares repurchased (millions)','financing','buyback_cash / buyback_price',unit='shares_m',hist={})
-    assumption('held_for_sale_cash_input','Cash held for sale — CF/BS scope bridge','financing',val('held_for_sale_cash'),'money','Hold disclosed held-for-sale cash scope; no invented disposal transaction.')
+    assumption('held_for_sale_cash_input','Cash held for sale — baseline before event transfers','financing',val('held_for_sale_cash'),'money','Hold disclosed held-for-sale cash scope; no invented disposal transaction.')
     row('net_debt','Net debt before derivatives','financing','total_debt - cash - short_investments',hist={},historical_expression='total_debt - cash - short_investments',subtotal=True,
         note='Transparent debt minus cash/short investments, not the company APM including derivatives.')
     identity('debt_roll','Debt and lease liability roll-forward','total_debt - ('+lag('total_debt')+' + debt_borrow + debt_repay + lease_asset_additions + lease_principal)')
-    identity('retained_roll','Retained earnings roll-forward','retained_earnings - ('+lag('retained_earnings')+' + parent_profit + dividends_parent)')
+    retained_extra=[i['role'] for i in extra_cash_components if i.get('equity_role')=='retained_earnings']
+    identity('retained_roll','Retained earnings roll-forward','retained_earnings - ('+lag('retained_earnings')+' + parent_profit + dividends_parent'+(' + '+total(retained_extra) if retained_extra else '')+')')
     # Derived historical rows execute visibly rather than pretending to be
     # separately reported observations. Original components remain source pulls.
     by_id={r['id']:r for r in spec['rows']}
@@ -466,6 +824,9 @@ def build_integrated_spec(data, forecast_years=5):
         if bases:r['basis']=bases
     for key,parts in [('net_other_trading',('other_trading_income','other_trading_expense')),
                       ('net_other_operating',('other_operating_income','other_operating_expense'))]:
+        if key in historical and any(part not in historical for part in parts):
+            by_id[key]['note']+=' Historical directly reported net presentation retained without inventing gross components.'
+            continue
         r=by_id[key];r['source_refs']={str(y):sum([copy.deepcopy(historical[p]['sources'].get(str(y),[])) for p in parts],[]) for y in past}
         r['basis']=copy.deepcopy(historical[parts[0]].get('basis',{}))
         r['note']+=' Historical calculated sum of '+ ' and '.join(parts)+'.'
@@ -512,7 +873,7 @@ def build_integrated_spec(data, forecast_years=5):
         'nci_dividend_payout':'-dividends_nci / nci_profit',
         'buyback_price':'parent_equity / shares_basic',
         'deferred_tax_share':'deferred_tax_expense / tax_expense'}
-    for key in ('cogs','distribution','marketing_admin','research'):
+    for key in (item['id'] for item in functions):
         initialization_sources[key+'_allocation']=(key,'total_revenue','utop')
         initialization_expressions[key+'_allocation']=f'-{key} / (total_revenue - utop)'
     for key,parts in initialization_sources.items():
@@ -561,6 +922,11 @@ def build_integrated_spec(data, forecast_years=5):
     for r in spec['rows']:
         r['unit']=r['unit'].replace('money',money)
         if r['unit']==money+'/shares_m':r['display_unit']=data['currency']+'/share'
+    for item in data.get('model_configuration',{}).get('historical_allocations',[]):
+        r=by_id[item['row_id']];year=str(item['year'])
+        r.setdefault('estimated_historical',{})[year]=copy.deepcopy(item)
+        r['source_refs'][year]=[]
+        r['calibration_eligible']=False
     return spec
 
 
@@ -582,16 +948,108 @@ def financial_cost_pools(data):
                     status='provisional',source_refs=[],
                     limitations=['RIG includes mix. The temporary activity elasticity is an explicit scenario, not measured physical volume.']
                         if role in ('cogs','distribution') else ['Independent nominal spending budget; no sales-ratio forecast.'])
-               for role,label in [('cogs','Production and procurement'),('distribution','Distribution'),
-                                  ('marketing_admin','Marketing and administration'),('research','Research and development')]]
+               for role,label in ((item['id'],{'cogs':'Production and procurement','distribution':'Distribution',
+                    'marketing_admin':'Marketing and administration','research':'Research and development'}.get(item['id'],item['label']))
+                    for item in operating_expense_functions(data))]
     ids=[p['id'] for p in pools]
     if len(ids)!=len(set(ids)):raise ValueError('Duplicate financial cost pool')
-    allowed={'cogs','distribution','marketing_admin','research'}
+    allowed={item['id'] for item in operating_expense_functions(data)}
     if any(p.get('destination') not in allowed for p in pools):
         raise ValueError('Cost pool must name a supported, non-overlapping statement expense destination')
+    absent=data.get('model_configuration',{}).get('functional_expense_structure',{})
+    for role in allowed-{p['destination'] for p in pools}:
+        if absent.get(role,{}).get('treatment')=='included_in_other_functions':
+            pools.append(dict(id=role,label=role.replace('_',' ').capitalize()+' (included in other functions)',destination=role,baseline_role=role,
+                baseline_amount=0,activity_driver='independent',method='budget_delta',source_refs=copy.deepcopy(absent[role].get('source_refs',[])),structural_empty=True))
     if {p['destination'] for p in pools}!=allowed:
         raise ValueError('Cost pools must cover every reported functional expense destination')
+    if len({p['id'] for p in pools})!=len(pools):raise ValueError('Structural expense bucket conflicts with a configured pool ID')
+    for pool in pools:
+        method=pool.setdefault('method','activity_cost' if pool.get('activity_driver')=='rig' else 'budget_delta')
+        if method not in ('activity_cost','budget_delta','budget_growth','absolute_budget'):
+            raise ValueError('Unsupported cost method '+str(method))
+        pool.setdefault('effective_activity_sensitivity',pool.get('elasticity',0)*pool.get('variable_share',1))
+        pool.setdefault('input_cost_includes_transaction_fx',False)
+        if method!='activity_cost' and pool.get('unit_cost_change',0):
+            raise ValueError('Budget costs cannot also apply unit-cost inflation')
+        if method!='budget_growth' and pool.get('spending_change',0):
+            raise ValueError('Spending growth requires the budget_growth method')
+        if method!='budget_delta' and pool.get('budget_change',0):
+            raise ValueError('An incremental budget cannot overlap the selected cost method')
     return pools
+
+
+def scope_period_inclusion(event,start,end,year_days=365):
+    """Annual contribution included after the control date, with explicit seasonality."""
+    from datetime import date, timedelta
+    import calendar
+    first=max(date.fromisoformat(start),date.fromisoformat(event['effective_date']));last=date.fromisoformat(end)
+    if first>last:return 0.0
+    weights=event.get('calendar_month_weights')
+    if weights:
+        if len(weights)!=12 or any(v<0 for v in weights) or abs(sum(weights)-1)>1e-8:raise ValueError('Event monthly seasonality requires twelve nonnegative weights summing to one')
+        total=0.0;day=first
+        while day<=last:
+            total+=weights[day.month-1]/calendar.monthrange(day.year,day.month)[1];day+=timedelta(days=1)
+        return total
+    return (last-first).days/year_days+1/year_days
+
+
+def estimate_scope_events(events):
+    """Compile cited operating and closing estimates into common event mechanics.
+
+    Inputs are company research, not inferred balancing amounts. Disposal gain and
+    acquisition goodwill are the accounting consequences of independently supplied
+    consideration and asset estimates. Every estimation ingredient remains saved.
+    """
+    result=copy.deepcopy(events)
+    for event in result:
+        estimate=event.get('estimation')
+        if not estimate:continue
+        if not event.get('source_refs') or not estimate.get('method'):raise ValueError('Event estimates require cited evidence and a method')
+        direction=1 if event.get('type')=='acquisition' else -1
+        revenue=estimate.get('annual_revenue')
+        if revenue is None and estimate.get('revenue_anchor') is not None:revenue=estimate['revenue_anchor']*estimate['revenue_share']
+        profit=estimate.get('annual_operating_profit')
+        if profit is None and revenue is not None and estimate.get('operating_margin') is not None:profit=revenue*estimate['operating_margin']
+        da=estimate.get('annual_da')
+        if da is None and revenue is not None and estimate.get('da_intensity') is not None:da=revenue*estimate['da_intensity']
+        if revenue is not None:event['annual_revenue']=direction*revenue
+        if da is not None:event['annual_da']=direction*da
+        if None not in (revenue,profit,da) and estimate.get('cost_weights'):
+            weights=estimate['cost_weights']
+            if abs(sum(weights.values())-1)>1e-8:raise ValueError('Event cost allocation weights must sum to one')
+            event['annual_cash_costs']={k:direction*(revenue-profit-da)*w for k,w in weights.items()}
+        closing=estimate.get('closing')
+        if not closing:continue
+        assets=closing.get('assets',{});liabilities=closing.get('liabilities',{})
+        if set(assets)&set(liabilities):raise ValueError('Event asset and liability roles overlap')
+        cash=closing.get('cash_transferred',0);consideration=closing.get('consideration',0)
+        net_assets=sum(assets.values())+(0 if closing.get('cash_transferred_in_asset_roles') else cash)-sum(liabilities.values())
+        expected=closing.get('net_assets_check')
+        if expected is not None and abs(expected-net_assets)>closing.get('rounding_tolerance',1e-6):raise ValueError('Estimated closing accounts disagree with cited net asset total')
+        event['balance_movements']={k:direction*v for k,v in {**assets,**liabilities}.items()}
+        if direction<0:
+            retained=closing.get('retained_investment',0);recycling=closing.get('cta_recycling',0)
+            event['cash_flows']={'business_disposals_cf':consideration-cash}
+            event['gain_loss']=consideration+retained-net_assets-recycling
+            event['oci_reclassification']=recycling
+            if retained:event['balance_movements']['associates']=event['balance_movements'].get('associates',0)+retained
+        else:
+            prior_value=closing.get('previous_interest_fair_value',0);prior_book=closing.get('previous_interest_carrying_value',0)
+            event['cash_flows']={'business_acquisitions_cf':cash-consideration}
+            event['gain_loss']=prior_value-prior_book
+            event['balance_movements']['associates']=event['balance_movements'].get('associates',0)-prior_book
+            event['balance_movements']['goodwill']=event['balance_movements'].get('goodwill',0)+consideration+prior_value-net_assets
+        event['accounting_enabled']=True
+        event['estimated_closing_net_assets']=net_assets
+        event['accounting_status']='estimated_closing_accounts_not_reported'
+        event['tax_rate']=closing.get('gain_tax_rate',0)
+        event['nci_share']=closing.get('gain_nci_share',0)
+        event['held_for_sale_cash_removed']=closing.get('held_for_sale_cash',0)
+        event['estimation_outputs']=dict(annual_revenue=revenue,annual_operating_profit=profit,annual_da=da,
+            net_assets=net_assets,gain_loss=event['gain_loss'],method=estimate['method'],classification='estimated_baseline')
+    return result
 
 
 def apply_financial_contracts(spec, data):
@@ -605,6 +1063,7 @@ def apply_financial_contracts(spec, data):
     if not spec.get('periods'):return spec
     from datetime import date, timedelta
     from .construction import dependencies, expression_tree
+    data=functional_structure_inputs(historical_eligibility_inputs(data))
     cfg=copy.deepcopy(data.get('financial_contracts',data.get('model_configuration',{}).get('financial_contracts',{})))
     rows={r['id']:r for r in spec['rows']};periods=spec['periods'];pm={p['id']:p for p in periods}
     py={(p['fiscal_year'],p['kind']):p['id'] for p in periods}
@@ -669,12 +1128,32 @@ def apply_financial_contracts(spec, data):
         existing=next((i for i,item in enumerate(contracts) if item['id']==rid),None)
         if existing is None:contracts.append(c)
         else:contracts[existing]=c
+    def cost_expression(rid,pool,base,scope_factor='1'):
+        cash_base='('+base+' - '+rid+'_sbc_seed * '+scope_factor+')'
+        method=pool['method']
+        if method=='activity_cost':return cash_base+f' * (1 + {rid}_activity_change * {rid}_effective_activity_sensitivity) * (1 + {rid}_unit_cost_change)'
+        if method=='budget_growth':return cash_base+f' * (1 + {rid}_spending_change)'
+        if method=='absolute_budget':return rid+'_budget_amount * '+scope_factor
+        return cash_base+' + '+rid+'_budget_change * '+scope_factor
+    # These rows contain incremental forecast reversals, not replacements for
+    # already reported historical noncash components. Historical zero therefore
+    # means no additional modelled adjustment and is not calibration evidence.
+    for rid in ('cfo_portfolio_noncash','cfo_fx_noncash'):
+        for p in periods:
+            if actual(rows['cfo']['cells'].get(p['id'],{})):
+                rows[rid]['cells'][p['id']]=dict(value=0,status='derived_actual',data_role='structural_absence',
+                    calibration_eligible=False,editable=False,required=False,reason='No incremental forecast adjustment to reported historical CFO.')
+        for p in financial:f(rid,p['id'],'0 * sales')
     pools=financial_cost_pools(data)
-    total_expenses=sum(-hv(role) for role in ('cogs','distribution','marketing_admin','research'))
+    source_tolerance=cfg.get('source_rounding_tolerance',1e-6)
+    if not isinstance(source_tolerance,(int,float)) or isinstance(source_tolerance,bool) or not math.isfinite(source_tolerance) or source_tolerance<0:
+        raise ValueError('Source rounding tolerance must be finite and nonnegative')
+    destinations=[item['id'] for item in operating_expense_functions(data)]
+    total_expenses=sum(-hv(role) for role in destinations)
     total_da=hv('da');cash_total=total_expenses-total_da
     if cash_total<=0:raise ValueError('Positive sourced cash operating expense base is required')
     # Pool amounts and D&A shares must reconcile to each reported expense exactly.
-    by_dest={d:[p for p in pools if p['destination']==d] for d in ('cogs','distribution','marketing_admin','research')}
+    by_dest={d:[p for p in pools if p['destination']==d] for d in destinations}
     for destination,items in by_dest.items():
         reported=-hv(destination)
         for pool in items:
@@ -695,10 +1174,41 @@ def apply_financial_contracts(spec, data):
     entities=[(s['id'],s['label'],s[f'sales{base}']-s[f'utop{base}']-s[f'da{base}']) for s in data['segments']]
     corporate_base=-data['corporate'][f'utop{base}']-data['corporate'][f'da{base}']+hv('other_revenue',0)
     entities.append(('corporate','Corporate',corporate_base))
-    if not math.isclose(sum(x[2] for x in entities),cash_total,abs_tol=3):
+    if not math.isclose(sum(x[2] for x in entities),cash_total,abs_tol=source_tolerance,rel_tol=0):
         raise ValueError('Functional expense base and segment cash costs do not reconcile')
     # Tiny source publication rounding is explicit in the baseline allocation.
     entity_denominator=sum(x[2] for x in entities)
+    corporate_weights=cfg.get('corporate_cost_weights')
+    if corporate_weights is None:
+        preferred=next((p for p in pools if p['id']=='administration'),next(p for p in pools if p['destination']=='marketing_admin'))
+        corporate_weights={preferred['id']:1.0}
+    if set(corporate_weights)-{p['id'] for p in pools} or not math.isclose(sum(corporate_weights.values()),1,abs_tol=1e-9):
+        raise ValueError('Corporate cost weights must name configured pools and sum to one')
+    baseline_matrix={}
+    for pool in pools:
+        corp=corporate_base*corporate_weights.get(pool['id'],0)
+        remainder=pool['cash_baseline']-corp
+        if remainder < -1e-6:raise ValueError('Corporate allocation exceeds the available '+pool['id']+' expense; provide supported corporate_cost_weights')
+        for entity,_,entity_base in entities:
+            amount=corp if entity=='corporate' else remainder*entity_base/(entity_denominator-corporate_base)
+            baseline_matrix[entity,pool['id']]=pool.get('baseline_amounts',{}).get(entity,amount)
+    for entity,_,entity_base in entities:
+        if not math.isclose(sum(baseline_matrix[entity,p['id']] for p in pools),entity_base,abs_tol=source_tolerance,rel_tol=0):raise ValueError('Entity cost allocation does not reconcile: '+entity)
+    for pool in pools:
+        if not math.isclose(sum(baseline_matrix[e,pool['id']] for e,_,_ in entities),pool['cash_baseline'],abs_tol=source_tolerance,rel_tol=0):raise ValueError('Functional cost allocation does not reconcile: '+pool['id'])
+    sbc_cfg=cfg.get('sbc',{});sbc_base=hv('sbc',0)
+    sbc_weights={(x['entity_id'],x['pool_id']):x['weight'] for x in sbc_cfg.get('allocations',[])}
+    if not sbc_weights:
+        candidates={k:v for k,v in baseline_matrix.items() if next(p['destination'] for p in pools if p['id']==k[1])=='marketing_admin'}
+        total=sum(candidates.values())
+        sbc_weights={k:v/total for k,v in candidates.items()} if total else {}
+    if sbc_base and (not math.isclose(sum(sbc_weights.values()),1,abs_tol=1e-9) or set(sbc_weights)-set(baseline_matrix)):
+        raise ValueError('SBC allocation must identify cost pools and reconcile to one')
+    for key,weight in sbc_weights.items():
+        if weight<0 or sbc_base*weight>baseline_matrix[key]+1e-8:raise ValueError('Embedded SBC allocation exceeds its operating expense baseline')
+    make('sbc_annual_budget','Annual equity-settled compensation expense budget','financing',kind='assumption',metric_type='stock',
+         note='Reporting-currency expense already embedded in operating costs; separately identified once for expense, noncash addback and equity.')
+    for year in forecast_years:a('sbc_annual_budget',pm[py[year,'FY']],sbc_cfg.get('annual_amount',sbc_base),'Previous full-year expense held nominally constant unless an explicit budget is supplied.')
     pool_rows={};new_flows=[]
     for pool in pools:
         for suffix,value,label in [('cash_share',pool['cash_baseline']/cash_total,'Historical cash-expense allocation'),
@@ -710,12 +1220,14 @@ def apply_financial_contracts(spec, data):
             for p in financial:f(rid,p['id'],'anchor',{'anchor':dict(row_id=rid,period_id=base_pid)},editable=False)
     for entity,label,entity_base in entities:
         section='corporate' if entity=='corporate' else 'segment_'+entity
+        revenue_model=spec.get('revenue_models',spec.get('model_configuration',{}).get('revenue_models',{})).get(entity,{})
+        revenue_mode=revenue_model.get('method',revenue_model.get('mode')) if isinstance(revenue_model,dict) else revenue_model
         targets=[]
         for pool in pools:
             rid=entity+'_pool_'+pool['id'];targets.append(rid);pool_rows[entity,pool['id']]=rid
-            baseline=pool.get('baseline_amounts',{}).get(entity,pool['cash_baseline']*entity_base/entity_denominator)
+            baseline=baseline_matrix[entity,pool['id']]
             note='Estimated baseline allocation of reported functional cash expense; not a reported segment-by-function expense. '+str(pool.get('behaviour','independent cost pool'))
-            make(rid,label+' — '+pool['label']+' cash expense',section,note=note)['nonnegative']=True
+            make(rid,label+' — '+pool['label']+' expense before D&A',section,note=note+' Includes separately identified equity-settled compensation, removed from the cash-cost driver base.')['nonnegative']=True
             make(rid+'_seed','Comparable cash expense base',section,kind='calculated',note=note,support=True)
             make(rid+'_activity_base','Operating expense base excluding disposed scope',section,note=note,support=True)
             make(rid+'_pre_fx','Expense before transaction/translation FX',section,note=note,support=True)
@@ -723,33 +1235,59 @@ def apply_financial_contracts(spec, data):
             make(rid+'_translation_amount','Translation FX expense effect',section,note='Consolidation effect after transaction FX, applied once.',support=True)
             new_flows.extend((rid,rid+'_pre_fx',rid+'_transaction_amount',rid+'_translation_amount'))
             rows[rid]['cells'][base_pid]=dict(value=baseline,status='estimated',editable=False,required=False,
-                reason=note,source_refs=copy.deepcopy(pool.get('source_refs') or history[pool.get('baseline_role',pool['destination'])].get('sources',{}).get(str(base),[])))
-            controls=[('activity_change','Activity proxy change',0,'ratio'),('elasticity','Activity elasticity',pool.get('elasticity',0),'ratio'),
-                      ('variable_share','Share sensitive to the activity proxy',pool.get('variable_share',1),'ratio'),
+                reason=note,data_role='estimated_historical_baseline',calibration_eligible=False,
+                source_refs=copy.deepcopy(pool.get('source_refs') or history[pool.get('baseline_role',pool['destination'])].get('sources',{}).get(str(base),[])))
+            rows[rid].update(historical_allocation=True,calibration_eligible=False,allocation_method='Corporate-specific allocation, then remaining functional expenses proportional to segment expense bases; estimated, not reported segment functions.')
+            weight=sbc_weights.get((entity,pool['id']),0)
+            make(rid+'_sbc_expense','Embedded equity-settled compensation expense',section,support=True)
+            make(rid+'_sbc_seed','Comparable embedded compensation to remove from cash base',section,support=True)
+            rows[rid+'_sbc_expense']['cells'][base_pid]=dict(value=sbc_base*weight,status='estimated',editable=False,required=False,data_role='estimated_historical_baseline',calibration_eligible=False)
+            controls=[('activity_change','Activity proxy change',0,'ratio'),
+                      ('effective_activity_sensitivity','Effective activity sensitivity',pool['effective_activity_sensitivity'],'ratio'),
+                      ('elasticity','Legacy activity elasticity diagnostic',pool['effective_activity_sensitivity'],'ratio'),('variable_share','Legacy combined-sensitivity identity',1,'ratio'),
                       ('unit_cost_change','Unit input-cost change',pool.get('unit_cost_change',0),'ratio'),
                       ('spending_change','Independent spending change',pool.get('spending_change',0),'ratio'),
-                      ('budget_change','Additional cash spending budget',pool.get('budget_change',0),money)]
+                      ('budget_change','Incremental cash spending budget',pool.get('budget_change',0),money),
+                      ('budget_amount','Absolute cash spending budget',pool.get('budget_amount',baseline-sbc_base*weight),money)]
+            active_controls={'activity_cost':{'effective_activity_sensitivity','unit_cost_change'},'budget_delta':{'budget_change'},
+                             'budget_growth':{'spending_change'},'absolute_budget':{'budget_amount'}}[pool['method']]
+            linked_activity=pool.get('activity_driver')=='rig' and entity!='corporate' and revenue_mode!='aggregate_organic'
+            if pool['method']=='activity_cost' and not linked_activity:active_controls=active_controls|{'activity_change'}
+            if baseline==0:active_controls=set()
             for suffix,title,value,unit in controls:
-                cr=make(rid+'_'+suffix,pool['label']+' — '+title,section,unit,'assumption','ratio' if unit=='ratio' else 'flow',
-                        note='Independent economic input. Pricing has no automatic effect.',support=suffix in ('activity_change','elasticity','variable_share'))
-                contract(cr['id'],entity,pool['id'],'economic_input',[rid,entity+'_utop','utop','operating_profit','cfo'])
+                active=suffix in active_controls
+                cr=make(rid+'_'+suffix,pool['label']+' — '+title,section,unit,'assumption' if active else 'calculated','ratio' if unit=='ratio' else 'flow',
+                        note='Selected '+pool['method']+' method; no overlapping growth/budget controls. Input-cost inflation '+('includes' if pool['input_cost_includes_transaction_fx'] else 'excludes')+' transaction FX.',support=not active or suffix=='effective_activity_sensitivity')
+                if active:contract(cr['id'],entity,pool['id'],'structural_parameter' if suffix=='effective_activity_sensitivity' else 'forecast_assumption',[rid,entity+'_utop','utop','operating_profit','cfo'])
             for side in ('translation_fx','transaction_fx'):
                 if rid+'_'+side not in rows:
                     make(rid+'_'+side,pool['label']+' — '+side.replace('_',' '),section,'ratio','assumption','ratio',
                         note='Explicit zero scenario: cost-pool currency exposure is unresolved, not inferred from revenue.',support=True)
                     for p in financial:a(rid+'_'+side,p,0,'Unmodelled exposure; zero scenario, not evidence of no exposure.')
+            if pool['input_cost_includes_transaction_fx']:
+                transaction=rows[rid+'_transaction_fx'];transaction['kind']='calculated'
+                transaction['note']='Transaction FX is already included in the unit-cost forecast; a separate transaction effect is disabled.'
+                for p in financial:transaction['cells'][p['id']]=dict(value=0,status='forecast',editable=False,required=False,reason=transaction['note'])
             # Source-linked interim baseline allocations stay estimates and never
             # manufacture unsupported quarterly statements or alter source rows.
             for p in periods:
                 if p['id']==base_pid or p['kind'] not in (*regular,'FY') or p['fiscal_year']<base:continue
                 cash_row=entity+'_cash_cost'
                 if present(cash_row,p['id']) and actual(rows[cash_row]['cells'][p['id']]):
-                    ratio='pool_'+pool['id']+'_cash_share'
+                    ratio=rid+'_baseline_weight';make(ratio,'Estimated entity functional-cost allocation','working_capital','ratio',metric_type='ratio',support=True)
+                    rows[ratio]['cells'][base_pid]=dict(value=baseline/entity_base if entity_base else 0,status='estimated',editable=False,required=False,calibration_eligible=False)
                     if entity=='corporate':
                         f(rid,p['id'],'(base + other) * weight',{'base':dict(row_id=cash_row,period_id=p['id']),
                            'other':dict(row_id='other_revenue',period_id=p['id']),'weight':dict(row_id=ratio,period_id=base_pid)},note,status='estimated',required=False)
                     else:f(rid,p['id'],'base * weight',{'base':dict(row_id=cash_row,period_id=p['id']),
                         'weight':dict(row_id=ratio,period_id=base_pid)},note,status='estimated',required=False)
+                    rows[rid]['cells'][p['id']].update(data_role='estimated_historical_baseline',calibration_eligible=False)
+                    if present('sbc',p['id']):
+                        rows[rid+'_sbc_expense']['cells'][p['id']]=dict(value=None,status='estimated',editable=False,required=False)
+                        # An allocation is an estimate even when its source total is reported.
+                        sbc_weight=rid+'_sbc_weight';make(sbc_weight,'Estimated embedded compensation weight',section,'ratio',metric_type='ratio',support=True)
+                        rows[sbc_weight]['cells'][base_pid]=dict(value=weight,status='estimated',editable=False,required=False)
+                        f(rid+'_sbc_expense',p['id'],'sbc * allocation',{'allocation':dict(row_id=sbc_weight,period_id=base_pid)},status='estimated',required=False)
             for p in financial:
                 pid=p['id'];prior=py.get((p['fiscal_year']-1,p['kind']))
                 if prior and (present(rid,prior) or planned_pool_period(prior)):
@@ -758,16 +1296,25 @@ def apply_financial_contracts(spec, data):
                     priorfy=py.get((p['fiscal_year']-1,'FY'),base_pid)
                     if not present(rid,priorfy) and not planned_pool_period(priorfy):priorfy=base_pid
                     f(rid+'_seed',pid,'base * period_year_fraction',{'base':dict(row_id=rid,period_id=priorfy)},'Explicit fiscal-duration allocation of annual functional expense')
-                for suffix,title,value,unit in controls:a(rid+'_'+suffix,p,value*frac(p) if unit==money else value)
-                if pool.get('activity_driver')=='rig' and entity!='corporate':
-                    f(rid+'_activity_change',pid,entity+'_rig',reason='RIG includes mix; explicit adjustable activity proxy, not physical volume.',editable=True)
-                f(rid+'_pre_fx',pid,f'{rid}_seed * (1 + {rid}_activity_change * {rid}_elasticity * {rid}_variable_share) * (1 + {rid}_unit_cost_change) * (1 + {rid}_spending_change) + {rid}_budget_change')
+                seed=rows[rid+'_seed']['cells'][pid];source=seed['bindings'].get('prior',seed['bindings'].get('base'))
+                f(rid+'_sbc_seed',pid,'anchor'+(' * period_year_fraction' if 'base' in seed['bindings'] else ''),{'anchor':dict(row_id=rid+'_sbc_expense',period_id=source['period_id'])})
+                sbc_weight=rid+'_sbc_weight';make(sbc_weight,'Estimated embedded compensation weight',section,'ratio',metric_type='ratio',support=True)
+                rows[sbc_weight]['cells'][base_pid]=dict(value=weight,status='estimated',editable=False,required=False)
+                f(rid+'_sbc_expense',pid,'budget * period_year_fraction * allocation * '+entity+'_scope_active_fraction',{
+                    'budget':dict(row_id='sbc_annual_budget',period_id=py[p['fiscal_year'],'FY']),
+                    'allocation':dict(row_id=sbc_weight,period_id=base_pid)})
+                for suffix,title,value,unit in controls:
+                    if suffix in active_controls:a(rid+'_'+suffix,p,value*frac(p) if unit==money else value)
+                    else:rows[rid+'_'+suffix]['cells'][pid]=dict(value=value*frac(p) if unit==money else value,status='forecast',editable=False,required=False)
+                if pool['method']=='activity_cost' and linked_activity:
+                    f(rid+'_activity_change',pid,entity+'_rig',reason='Derived RIG activity/mix proxy; use an independent activity source only through explicit method configuration.')
+                f(rid+'_pre_fx',pid,cost_expression(rid,pool,rid+'_seed'))
                 f(rid+'_activity_base',pid,rid+'_seed')
-                f(rid+'_transaction_amount',pid,f'{rid}_pre_fx * {rid}_transaction_fx')
+                f(rid+'_transaction_amount',pid,f'{rid}_pre_fx * '+('0' if pool['input_cost_includes_transaction_fx'] else rid+'_transaction_fx'))
                 f(rid+'_translation_amount',pid,f'({rid}_pre_fx + {rid}_transaction_amount) * {rid}_translation_fx')
-                f(rid,pid,f'{rid}_pre_fx + {rid}_transaction_amount + {rid}_translation_amount')
+                f(rid,pid,f'{rid}_pre_fx + {rid}_transaction_amount + {rid}_translation_amount + {rid}_sbc_expense')
             for year in forecast_years:
-                for out in (rid,rid+'_pre_fx',rid+'_transaction_amount',rid+'_translation_amount'):aggregate(out,year)
+                for out in (rid,rid+'_pre_fx',rid+'_transaction_amount',rid+'_translation_amount',rid+'_sbc_expense'):aggregate(out,year)
         target=entity+'_cash_cost'
         if entity=='corporate':
             target='corporate_gross_cash_cost';make(target,'Corporate cash expense before other revenue','corporate')
@@ -785,6 +1332,10 @@ def apply_financial_contracts(spec, data):
             legacy.update(kind='calculated',support_matrix=True,note='Diagnostic only: economic costs use independent pool controls. No pricing-linked fallback.',inputs={})
             for pid,cell in legacy['cells'].items():
                 if not actual(cell):legacy['cells'][pid]=missing()
+    for p in financial:summed('sbc',p['id'],[(pool_rows[e,pool['id']]+'_sbc_expense',p['id']) for e,_,_ in entities for pool in pools])
+    for year in forecast_years:aggregate('sbc',year)
+    rows['sbc_ratio']['kind']='calculated';rows['sbc_ratio']['note']='Diagnostic embedded compensation / sales; the independent expense budget drives compensation.'
+    for p in financial:f('sbc_ratio',p['id'],'sbc / sales')
     for destination,items in by_dest.items():
         for p in financial:
             pid=p['id'];amounts=[pool_rows[e,pool['id']] for e,_,_ in entities for pool in items]
@@ -801,9 +1352,7 @@ def apply_financial_contracts(spec, data):
     # Once included in both periods, it is organic baseline rather than repeated M&A.
     event_audit=[]
     def event_overlap(event,p):
-        effective=date.fromisoformat(event['effective_date']);start=date.fromisoformat(p['start']);end=date.fromisoformat(p['end'])
-        days=max(0,(end-max(start,effective)).days+1)
-        return days/pm[py[p['fiscal_year'],'FY']]['duration_days']
+        return scope_period_inclusion(event,p['start'],p['end'],pm[py[p['fiscal_year'],'FY']]['duration_days'])
     def previous_overlap(event,p):
         prior=py.get((p['fiscal_year']-1,p['kind']))
         if prior:return event_overlap(event,pm[prior])
@@ -814,8 +1363,8 @@ def apply_financial_contracts(spec, data):
         start=previous_day(p['start']);end=previous_day(p['end']);effective=date.fromisoformat(event['effective_date'])
         priorfy=pm.get(py.get((p['fiscal_year']-1,'FY')),{})
         denominator=priorfy.get('duration_days',365)
-        return max(0,(end-max(start,effective)).days+1)/denominator
-    events=cfg.get('scope_events',[])
+        return scope_period_inclusion(event,start.isoformat(),end.isoformat(),denominator)
+    events=estimate_scope_events(cfg.get('scope_events',[]))
     # A complete business exit is a fraction of the running comparable base,
     # not a frozen old revenue number that leaves a fictitious residual business.
     for entity,label,_ in entities:
@@ -828,9 +1377,13 @@ def apply_financial_contracts(spec, data):
             for event in full:
                 proportion=event['entity_scope_fraction']
                 if not 0<=proportion<=1:raise ValueError('Entity scope fraction must lie between zero and one')
-                current*=1-proportion*event_overlap(event,p)/frac(p)
+                whole=scope_period_inclusion(dict(event,effective_date=p['start']),p['start'],p['end'],pm[py[p['fiscal_year'],'FY']]['duration_days'])
+                current*=1-proportion*event_overlap(event,p)/whole
                 prior=py.get((p['fiscal_year']-1,p['kind']))
-                prior_fraction=frac(pm[prior]) if prior else frac(p)
+                if prior:
+                    previous_period=pm[prior]
+                    prior_fraction=scope_period_inclusion(dict(event,effective_date=previous_period['start']),previous_period['start'],previous_period['end'],pm[py[previous_period['fiscal_year'],'FY']]['duration_days'])
+                else:prior_fraction=whole
                 previous*=1-proportion*previous_overlap(event,p)/prior_fraction
             for suffix,value in [('scope_active_fraction',current),('scope_comparable_fraction',previous)]:
                 rows[entity+'_'+suffix]['cells'][p['id']]=dict(value=value,status='estimate',editable=False,required=False,
@@ -861,7 +1414,7 @@ def apply_financial_contracts(spec, data):
                     # already exclude the disposal. Only within-period timing is
                     # additional. Otherwise this is an explicit provisional run
                     # rate until the unmodelled derecognition is supplied.
-                    amount=0 if event.get('accounting_enabled') and event['effective_date']<p['start'] else event.get('annual_da_by_role',{}).get(role,0)*event_overlap(event,p)
+                    amount=0 if event.get('accounting_enabled') and (event.get('accounting_date') or event['effective_date'])<p['start'] else event.get('annual_da_by_role',{}).get(role,0)*event_overlap(event,p)
                     event_control='scope_'+event['id']+'_'+role
                     make(event_control,event['id']+' — '+rows[role]['label'],'assets',kind='assumption',support=True)
                     a(event_control,p,amount,'Explicit event D&A by asset class, already weighted for event dates; missing deconsolidation remains separately qualified.')
@@ -942,7 +1495,7 @@ def apply_financial_contracts(spec, data):
             organic=entity+'_organic_comparable_sales';make(organic,'Organic comparable sales excluding disposed scope','segment_'+entity,support=True)
             f(organic,p['id'],f'{entity}_sales_seed * {entity}_scope_activity_factor'+(' + '+' + '.join(negative) if negative else ''),
                 reason='Disposed comparable sales do not receive organic pricing or activity growth; acquisitions enter scope before joining the comparable organic base.')
-            constant=f'{organic} * (1 + {entity}_pricing + {entity}_rig)'+(' + '+' + '.join(positive) if positive else '')
+            constant=f'{organic} * (1 + {entity}_organic)'+(' + '+' + '.join(positive) if positive else '')
             constant_row=entity+'_constant_currency_sales';make(constant_row,'Sales including scope before translation','segment_'+entity,support=True)
             f(constant_row,p['id'],constant)
             translation=entity+'_revenue_fx_adjusted'
@@ -954,7 +1507,8 @@ def apply_financial_contracts(spec, data):
                 f(entity+'_fx',p['id'],f'if_zero({entity}_sales_seed, 0, {entity}_fx_effect / {entity}_sales_seed)')
             else:
                 f(entity+'_sales',p['id'],constant_row+f' + {entity}_sales_seed * {entity}_fx')
-            for suffix,driver in [('pricing_effect','pricing'),('rig_effect','rig')]:f(entity+'_'+suffix,p['id'],organic+' * '+entity+'_'+driver)
+            aggregate_organic=spec.get('model_configuration',{}).get('revenue_models',{}).get(entity,{}).get('method')=='aggregate_organic'
+            for suffix,driver in [('pricing_effect','organic' if aggregate_organic else 'pricing'),('rig_effect','rig')]:f(entity+'_'+suffix,p['id'],organic+' * '+entity+'_'+driver)
             if entity+'_growth' in rows:f(entity+'_growth',p['id'],f'if_zero({entity}_sales_seed, 0, {entity}_sales / {entity}_sales_seed - 1)')
             for identity in spec.get('identities',[]):
                 if identity.get('id','').startswith(entity+'_sales_bridge_') and p['id'] in identity.get('periods',[]):
@@ -970,7 +1524,7 @@ def apply_financial_contracts(spec, data):
                 a(sid,p,amount)
                 before=f'{rid}_seed * {entity}_scope_activity_factor'+(' + '+sid if amount<0 else '')
                 f(rid+'_activity_base',p['id'],before)
-                expr=f'{rid}_activity_base * (1 + {rid}_activity_change * {rid}_elasticity * {rid}_variable_share) * (1 + {rid}_unit_cost_change) * (1 + {rid}_spending_change) + {rid}_budget_change * {entity}_scope_activity_factor'
+                expr=cost_expression(rid,pool,rid+'_activity_base',entity+'_scope_activity_factor')
                 if amount>=0:expr+=' + '+sid
                 f(rid+'_pre_fx',p['id'],expr,reason='Disposed costs leave the activity/unit-cost baseline; acquisition cost enters scope once. Full exits remove the current expense base rather than an old fixed amount.')
             f(entity+'_margin',p['id'],f'if_zero({entity}_sales, 0, {entity}_utop / {entity}_sales)',reason='Inactive fully closed entity displays zero margin; no active profit forecast remains.')
@@ -1009,8 +1563,9 @@ def apply_financial_contracts(spec, data):
     for event in events:
         if not event.get('enabled',True) or not event.get('accounting_enabled',False):continue
         if not event.get('source_refs'):raise ValueError('Active scope accounting requires source evidence or an explicit cited scenario')
+        accounting_date=event.get('accounting_date') or event['effective_date']
         for p in financial:
-            if not p['start']<=event['effective_date']<=p['end']:continue
+            if not p['start']<=accounting_date<=p['end']:continue
             pid=p['id'];closing=py[p['fiscal_year'],'FY'] if p['kind']=='H2' else pid
             for role,amount in event.get('cash_flows',{}).items():
                 if role not in rows or rows[role].get('section')!='cashflow':raise ValueError('Unsupported scope cash-flow destination '+role)
@@ -1029,10 +1584,10 @@ def apply_financial_contracts(spec, data):
                     # These closing stocks are already post-scope targets from
                     # the remaining revenue/cost base. Add the transfer only to
                     # their cash bridge, not to the closing target a second time.
-                    c=rows[cf]['cells'][pid];c['expression']='('+c['expression']+') '+('-' if role=='trade_payables' else '+')+' scope_change'
-                    c.setdefault('bindings',{})['scope_change']=dict(row_id=driver,period_id=pid)
+                    c=rows[cf]['cells'][pid];c['expression']='('+c['expression']+') '+('-' if role=='trade_payables' else '+')+' '+driver
+                    c.setdefault('bindings',{})[driver]=dict(row_id=driver,period_id=pid)
                 else:
-                    c['expression']='('+c['expression']+') + scope_change';c.setdefault('bindings',{})['scope_change']=dict(row_id=driver,period_id=pid)
+                    c['expression']='('+c['expression']+') + '+driver;c.setdefault('bindings',{})[driver]=dict(row_id=driver,period_id=pid)
                 prefix={'owned_ppe':'ppe_roll_','intangibles':'intangible_roll_','nonlease_debt':'debt_roll_','lease_liabilities':'debt_roll_'}.get(role)
                 if prefix:
                     for identity in spec.get('identities',[]):
@@ -1041,12 +1596,78 @@ def apply_financial_contracts(spec, data):
             make(rid,event['id']+' — disposal/acquisition P&L','income',kind='assumption',support=True);a(rid,p,gain)
             # Attach to the calculated adjustment, not its recurring policy input.
             c=rows['net_other_operating']['cells'][pid];c['expression']='('+c['expression']+') + '+rid
-            c=rows['cfo']['cells'][pid];c['expression']='('+c['expression']+') - '+rid
+            c=rows['cfo_portfolio_noncash']['cells'][pid];c['expression']='('+c['expression']+') - '+rid
+            if 'tax_rate' in event:
+                # Reverse the ordinary operating tax/NCI policy on this event,
+                # then apply separately specified event treatment exactly once.
+                tax=event['tax_rate'];nci=event.get('nci_share',0)
+                taxid='scope_'+event['id']+'_tax_rate';nciid='scope_'+event['id']+'_nci_share'
+                make(taxid,'Event-specific tax-rate estimate','income','ratio','assumption','ratio',support=True);a(taxid,p,tax)
+                make(nciid,'Event-specific NCI attribution estimate','income','ratio','assumption','ratio',support=True);a(nciid,p,nci)
+                c=rows['tax_expense']['cells'][pid]
+                c['expression']='('+c['expression']+') + '+rid+f' * (effective_tax_rate - {taxid})'
+                c=rows['nci_profit']['cells'][pid]
+                c['expression']='('+c['expression']+') + '+rid+f' * (1 - {taxid}) * ({nciid} - nci_profit_share)'
             transfer=event.get('oci_reclassification',0)
             if transfer:
                 rid='scope_'+event['id']+'_oci_reclassification';make(rid,event['id']+' — separately sourced OCI reclassification','working_capital',kind='assumption',support=True)
                 a(rid,p,transfer);c=rows['reserves']['cells'][closing]
-                c['expression']='('+c['expression']+') + scope_oci';c.setdefault('bindings',{})['scope_oci']=dict(row_id=rid,period_id=pid)
+                c['expression']='('+c['expression']+') + '+rid;c.setdefault('bindings',{})[rid]=dict(row_id=rid,period_id=pid)
+        removed=event.get('held_for_sale_cash_removed',0)
+        if removed:
+            rid='scope_'+event['id']+'_held_for_sale_cash';make(rid,'Estimated cash removed from held-for-sale scope','cashflow',kind='assumption',metric_type='stock',support=True)
+            for y in forecast_years:a(rid,pm[py[y,'FY']],removed)
+            for p in periods:
+                if p['end']<accounting_date or not forecast('held_for_sale_cash',p['id']):continue
+                c=rows['held_for_sale_cash']['cells'][p['id']]
+                if c.get('expression'):
+                    c['expression']='('+c['expression']+') - '+rid
+                    c.setdefault('bindings',{})[rid]=dict(row_id=rid,period_id=py[p['fiscal_year'],'FY'])
+        retained=event.get('retained_operation')
+        if retained:
+            inv='scope_'+event['id']+'_retained_investment';earn=inv+'_earnings';dist=inv+'_distributions'
+            make(inv,'Retained investment carrying amount','assets',metric_type='stock',support=True)
+            make(earn,'Retained operation after-tax earnings','income',support=True);make(dist,'Retained operation cash distributions','cashflow',support=True)
+            historical_cutoff=data.get('model_configuration',{}).get('actual_through',pm[base_pid]['end'])
+            for p in periods:
+                for rid,creation_date in ((inv,accounting_date),(earn,event['effective_date']),(dist,event['effective_date'])):
+                    if p['end']>=creation_date:continue
+                    rows[rid]['cells'][p['id']]=dict(value=0,status='derived_actual' if p['end']<=historical_cutoff else 'forecast',
+                        data_role='structural_absence',calibration_eligible=False,editable=False,required=False,
+                        reason='Structural absence before the configured accounting creation or operating inclusion date; this zero is not a reported historical observation or calibration evidence.')
+            previous=None
+            if financial and accounting_date<financial[0]['start']:
+                opening=retained.get('opening_carrying_value')
+                if opening is None or not retained.get('opening_source_refs'):
+                    raise ValueError('Existing retained operation requires a cited opening carrying estimate; otherwise generic yield and incremental earnings would double count')
+                candidates=[p for p in periods if p['end']<financial[0]['start'] and p['kind'] in ('FY','H1','Q1','Q2','Q3','Q4')]
+                previous=max(candidates,key=lambda p:p['end'])['id']
+                rows[inv]['cells'][previous]=dict(value=opening,status='estimated',data_role='estimated_historical_baseline',calibration_eligible=False,
+                    editable=False,required=False,source_refs=retained['opening_source_refs'],reason='Explicit opening retained investment; exclude generic yield before adding separately modelled earnings.')
+            for p in financial:
+                pid=p['id'];closing=py[p['fiscal_year'],'FY'] if p['kind']=='H2' else pid
+                inclusion=event_overlap(event,p)
+                earnings=retained['annual_profit_after_tax']*retained['ownership']*inclusion
+                payout=earnings*retained['distribution_share']
+                a(earn,p,earnings);rows[earn]['kind']='assumption';a(dist,p,payout);rows[dist]['kind']='assumption'
+                opening=0 if previous is None else previous
+                # Remove the generic investment-yield return on this separate
+                # carrying amount before adding the independently estimated JV.
+                correction=earn
+                bindings={}
+                if previous:
+                    correction+=' - retained_opening * associate_earnings_yield * period_year_fraction'
+                    bindings['retained_opening']=dict(row_id=inv,period_id=previous)
+                c=rows['associate_profit']['cells'][pid];c['expression']='('+c['expression']+') + '+correction;c.setdefault('bindings',{}).update(bindings)
+                c=rows['associate_dividends']['cells'][pid]
+                c['expression']='('+c['expression']+') - '+earn+' * associate_distribution_ratio + '+dist
+                start_value=event.get('estimation',{}).get('closing',{}).get('retained_investment',0) if p['start']<=accounting_date<=p['end'] else 0
+                capital=inv+'_initial_value';make(capital,'Estimated retained investment at loss of control','assets',kind='assumption',support=True);a(capital,p,start_value)
+                expr=capital+' + '+earn+' - '+dist
+                binds={r:dict(row_id=r,period_id=pid) for r in (earn,dist,capital)}
+                if previous:expr+=' + opening';binds['opening']=dict(row_id=inv,period_id=previous)
+                f(inv,closing,expr,binds);previous=closing
+            for y in forecast_years:aggregate(earn,y);aggregate(dist,y)
     # Regional cost FX summaries sum money before deriving annual percentages.
     for entity,label,_ in entities:
         if entity=='corporate':continue
@@ -1072,10 +1693,29 @@ def apply_financial_contracts(spec, data):
     # movements below, not operating cash flows generated by a currency change.
     make('operating_cogs_base','COGS before modelled translation for operating working capital','working_capital',support=True)
     make('operating_sales_base','Sales before modelled translation for operating working capital','working_capital',support=True)
+    for rid,label in [('closing_scope_sales_correction','Period-equivalent revenue adjustment to closing operating scope'),
+                      ('closing_scope_cost_correction','Period-equivalent COGS expense adjustment to closing operating scope'),
+                      ('closing_operating_sales_base','Period-equivalent sales run rate for closing working capital'),
+                      ('closing_operating_cogs_base','Period-equivalent COGS run rate for closing working capital')]:
+        make(rid,label,'working_capital',support=True,note='Closing working capital uses remaining operating scope at the balance date, separately from time-weighted income-statement flows. Estimated run rate, not a reported flow.')
+    for event in events:
+        exclusion=event.get('operating_wc_excluded_from')
+        if not exclusion or not event.get('enabled',True):continue
+        date.fromisoformat(exclusion)
+        accounting=event.get('accounting_date') or event['effective_date']
+        if exclusion>accounting:raise ValueError('Operating working-capital exclusion cannot follow the accounting disposal date')
+        if financial and exclusion>=financial[0]['start']:
+            raise ValueError('Forecast held-for-sale reclassification requires a separate supported transfer bridge; operating_wc_excluded_from currently describes an already reported reclassification')
+        if set(event.get('balance_movements',{})) & {'inventories','receivables','trade_payables'}:
+            raise ValueError('Already reclassified held-for-sale working capital cannot be removed again from operating balances at disposal')
+    if any(e.get('operating_wc_excluded_from') for e in events):
+        policy=f'Working-capital turnover holds fiscal {base} ratios as provisional assumptions on remaining operating scope. Held-for-sale exclusions use cited dates and estimated business run rates; these are not observed post-reclassification turnover ratios.'
+        spec['policies']['working_capital']=policy
+        for rid in ('inventory_ratio','receivables_ratio','payables_ratio'):rows[rid]['note']=policy
     for p in financial:
         pid=p['id'];fxcost=[pool_rows[e,pool['id']]+'_translation_amount' for e,_,_ in entities for pool in pools if pool['destination']=='cogs']
         f('operating_cogs_base',pid,'cogs + '+' + '.join(fxcost),reason='Remove the modelled consolidation FX expense; transaction FX remains a functional-currency input cost.')
-        rev_bindings={};revterms=[]
+        rev_bindings={};revterms=[];entity_fx={}
         for entity,_,_ in entities:
             if entity=='corporate':continue
             # Revenue may be quarterly while the WC financial flow is half-year.
@@ -1086,10 +1726,69 @@ def apply_financial_contracts(spec, data):
                 if rows[entity+'_sales']['cells'].get(q['id'],{}).get('status') not in ('forecast','estimate'):continue
                 if cell.get('status') not in ('forecast','estimate') or not present(role,q['id']):continue
                 token='fx'+str(len(revterms));revterms.append(token);rev_bindings[token]=dict(row_id=role,period_id=q['id'])
+                entity_fx.setdefault(entity,[]).append((role,q['id']))
         f('operating_sales_base',pid,'sales'+(' - ('+' + '.join(revterms)+')' if revterms else ''),rev_bindings,
           'Remove known modelled translation only. Undisclosed historical FX is not reconstructed; mixed-period working-capital targets remain provisional.')
+        revenue_corrections=[];cost_corrections=[]
+        for entity,label,_ in entities:
+            selected=[e for e in events if e.get('enabled',True) and e.get('entity_id')==entity and
+                (p['start']<=(e.get('accounting_date') or e['effective_date'])<=p['end'] or
+                 e.get('operating_wc_excluded_from') and e['operating_wc_excluded_from']<=p['end'])]
+            full=[e for e in selected if e.get('entity_scope_fraction') is not None]
+            if full:
+                end=1.0
+                for event in events:
+                    closing_date=event.get('operating_wc_excluded_from') or event.get('accounting_date') or event['effective_date']
+                    if event.get('enabled',True) and event.get('entity_id')==entity and event.get('entity_scope_fraction') is not None and closing_date<=p['end']:end*=1-event['entity_scope_fraction']
+                active=entity+'_closing_scope_active_fraction';factor=entity+'_closing_scope_correction_factor'
+                make(active,label+' closing operating scope','working_capital','ratio',metric_type='ratio',support=True)
+                make(factor,label+' closing versus included operating scope','working_capital','ratio',metric_type='ratio',support=True)
+                rows[active]['cells'][pid]=dict(value=end,status='estimate',editable=False,required=True,reason='Remaining entity fraction at the closing date; dated company scope configuration.')
+                f(factor,pid,f'if_zero({entity}_scope_active_fraction, 0, {active} / {entity}_scope_active_fraction - 1)')
+                if entity!='corporate':
+                    rid=entity+'_closing_scope_sales_correction';make(rid,label+' closing revenue scope correction','working_capital',support=True)
+                    bindings={f'fx{i}':dict(row_id=r,period_id=q) for i,(r,q) in enumerate(entity_fx.get(entity,[]))}
+                    untranslated=entity+'_sales'+(' - ('+' + '.join(bindings)+')' if bindings else '')
+                    f(rid,pid,'('+untranslated+') * '+factor,bindings);revenue_corrections.append(rid)
+                rid=entity+'_closing_scope_cost_correction';make(rid,label+' closing expense scope correction','working_capital',support=True)
+                terms=[pool_rows[entity,pool['id']]+'_'+suffix for pool in by_dest['cogs'] for suffix in ('pre_fx','transaction_amount','sbc_expense')]
+                da_share=' + '.join('pool_'+pool['id']+'_da_share' for pool in by_dest['cogs'])
+                f(rid,pid,'('+' + '.join(terms)+' + '+entity+'_da * ('+da_share+')) * '+factor);cost_corrections.append(rid)
+            for event in selected:
+                if event.get('entity_scope_fraction') is not None:continue
+                # The income statement includes the business for only part of
+                # this period. Closing balances require the full post-event run
+                # rate; transferred balances remain separate in the cash bridge.
+                weight=0 if event['effective_date']<=p['start'] else frac(p)-event_overlap(event,p)
+                if entity!='corporate':
+                    rid='scope_'+event['id']+'_closing_revenue_correction';make(rid,'Estimated closing revenue scope adjustment','working_capital',support=True)
+                    control=rid+'_run_rate';make(control,'Period-equivalent extra event revenue exposure','working_capital',support=True)
+                    rows[control]['cells'][pid]=dict(value=event.get('annual_revenue',0)*weight,status='estimate',editable=False,required=True,
+                        reason='Configured event annual run rate times closing-versus-included date exposure; rebuild from the event scenario when its estimate changes.',source_refs=copy.deepcopy(event.get('source_refs',[])))
+                    expression=control+(' * (1 + '+entity+'_organic)' if event.get('annual_revenue',0)<0 else '')
+                    f(rid,pid,expression);revenue_corrections.append(rid)
+                for pool in by_dest['cogs']:
+                    rid='scope_'+event['id']+'_'+pool['id']+'_closing_cost_correction';make(rid,'Estimated closing COGS scope adjustment','working_capital',support=True)
+                    control=rid+'_run_rate';make(control,'Period-equivalent extra event cash-cost exposure','working_capital',support=True)
+                    amount=event.get('annual_cash_costs',{}).get(pool['id'],0)
+                    rows[control]['cells'][pid]=dict(value=amount*weight,status='estimate',editable=False,required=True,
+                        reason='Configured signed event cash-cost run rate times closing-versus-included date exposure.',source_refs=copy.deepcopy(event.get('source_refs',[])))
+                    expr=control;poolid=pool_rows[entity,pool['id']]
+                    if amount<0:
+                        if pool['method']=='activity_cost':expr+=f' * (1 + {poolid}_activity_change * {poolid}_effective_activity_sensitivity) * (1 + {poolid}_unit_cost_change)'
+                        elif pool['method']=='budget_growth':expr+=' * (1 + '+poolid+'_spending_change)'
+                    if not pool['input_cost_includes_transaction_fx']:expr+=' * (1 + '+poolid+'_transaction_fx)'
+                    da=0 if event.get('da_already_in_baseline') else event.get('annual_da',0)
+                    dacontrol=rid+'_da_run_rate';make(dacontrol,'Period-equivalent extra event D&A exposure','working_capital',support=True)
+                    rows[dacontrol]['cells'][pid]=dict(value=da*weight,status='estimate',editable=False,required=True,
+                        reason='Configured event D&A run rate times closing-versus-included date exposure; allocated to the expense destination explicitly.')
+                    f(rid,pid,expr+' + '+dacontrol+' * pool_'+pool['id']+'_da_share');cost_corrections.append(rid)
+        for rid,terms in [('closing_scope_sales_correction',revenue_corrections),('closing_scope_cost_correction',cost_corrections)]:
+            f(rid,pid,' + '.join(terms) if terms else '0 * sales')
+        f('closing_operating_sales_base',pid,'operating_sales_base + closing_scope_sales_correction')
+        f('closing_operating_cogs_base',pid,'operating_cogs_base - closing_scope_cost_correction')
         closing=py[p['fiscal_year'],'FY'] if p['kind']=='H2' else pid
-        for role,dep,target in [('inventories','cogs','operating_cogs_base'),('trade_payables','cogs','operating_cogs_base'),('receivables','sales','operating_sales_base')]:
+        for role,dep,target in [('inventories','cogs','closing_operating_cogs_base'),('trade_payables','cogs','closing_operating_cogs_base'),('receivables','sales','closing_operating_sales_base')]:
             cell=rows[role]['cells'][closing]
             if cell.get('expression') and not actual(cell):cell.setdefault('bindings',{})[dep]=dict(row_id=target,period_id=pid)
     for year in forecast_years:
@@ -1099,7 +1798,7 @@ def apply_financial_contracts(spec, data):
     for role,assumption,parts in [('net_other_trading','net_other_trading_assumption',('other_trading_income','other_trading_expense')),
                                   ('net_other_operating','net_other_operating_assumption',('other_operating_income','other_operating_expense'))]:
         policy=normalization.get(role,{})
-        amount=policy.get('annual_amount',sum(hv(x,0) for x in parts))
+        amount=policy.get('annual_amount',hv(role,sum(hv(x,0) for x in parts)) if any(x not in history for x in parts) else sum(hv(x,0) for x in parts))
         for p in financial:a(assumption,p,amount*frac(p),policy.get('reason','Explicit recurring run-rate scenario from latest net adjustment; exceptional classification remains unresolved.'))
         contract(assumption,'group',None,'economic_input',['operating_profit','parent_profit','cfo'],timing='annual policy allocated by fiscal duration')
     for rid,label in [('underlying_operating_profit_change','Underlying operating profit change'),
@@ -1167,6 +1866,20 @@ def apply_financial_contracts(spec, data):
         rows['shares_end_outstanding']['cells'][base_pid]=dict(copy.deepcopy(rows['shares_basic']['cells'][base_pid]),
             status='estimated',reason='Unresolved closing count: explicitly labelled weighted-average opening proxy, not an actual closing-share disclosure.')
         spec['gaps'].append('Closing shares lack a distinct source at the base date; the weighted-average opening proxy remains an unresolved financing input.')
+    for item in finance.get('historical_closing_shares',[]):
+        pid=item['period_id'];amount=item['value']
+        if pid not in pm or pm[pid]['end']>spec['model_configuration'].get('actual_through',pm[base_pid]['end']) or not item.get('source_refs') or not isinstance(amount,(int,float)) or isinstance(amount,bool) or not math.isfinite(amount) or amount<=0:
+            raise ValueError('Historical closing shares require an actual date, positive count and source evidence')
+        disclosed=[o for o in data.get('observations',[]) if o['row_id']=='shares_end_outstanding' and o['period_id']==pid and o.get('status') in ('actual','reported','derived_actual')]
+        if any(not math.isclose(o['value'],amount,abs_tol=1e-8,rel_tol=0) for o in disclosed):raise ValueError('Historical closing shares conflict with a preserved source observation')
+        cell=rows['shares_end_outstanding']['cells'].get(pid,{})
+        if actual(cell) and present('shares_end_outstanding',pid):
+            if cell.get('value') is None or not math.isclose(cell['value'],amount,abs_tol=1e-8,rel_tol=0):raise ValueError('Historical closing shares conflict with a preserved source observation')
+            continue
+        rows['shares_end_outstanding']['cells'][pid]=dict(value=amount,status='reported',editable=False,required=False,
+            source_refs=copy.deepcopy(item['source_refs']),data_role='reported_fact',reason='Separately disclosed closing shares outstanding, distinct from weighted-average EPS shares.')
+    if actual(rows['shares_end_outstanding']['cells'].get(base_pid,{})):
+        spec['gaps']=[g for g in spec['gaps'] if not g.startswith('Closing shares lack a distinct source at the base date')]
     for p in financial:
         pid=p['id'];a('buyback_price',p,finance.get('repurchase_price'),
             'Explicit execution price in reporting currency per share. Missing is permitted only while buyback cash is zero.',required=False)
@@ -1174,7 +1887,9 @@ def apply_financial_contracts(spec, data):
         a('issuance_shares',p,finance.get('issuance_shares',0)*frac(p));a('issuance_elapsed_fraction',p,finance.get('issuance_elapsed_fraction',0.5))
         a('issuance_price',p,finance.get('issuance_price'),required=False)
         f('issuance_cash',pid,'if_zero(issuance_shares, 0, issuance_shares * issuance_price)')
-        cf=rows['cff']['cells'][pid];cf['expression']='('+cf['expression']+') + issuance_cash'
+        cf=rows['cff']['cells'][pid]
+        if ('issuance_cash',0) not in dependencies(expression_tree(cf['expression'])):
+            cf['expression']='('+cf['expression']+') + issuance_cash'
         rows['buyback_price']['label']='Repurchase execution price';rows['buyback_price']['note']='No book-value fallback. Inactive missing price is allowed; positive buyback requires a positive execution price.'
         f('buyback_shares',pid,'if_zero(buyback_cash, 0, buyback_cash / buyback_price)')
         old=rows['shares_basic']['cells'][pid];opening=next((v for k,v in old.get('bindings',{}).items() if k.startswith('lag:')),None)
@@ -1184,6 +1899,18 @@ def apply_financial_contracts(spec, data):
             opening=dict(row_id='shares_end_outstanding',period_id=prior['id'])
         else:
             candidate=dict(opening,row_id='shares_end_outstanding')
+            aliases=[q for q in periods if q['end']==pm[candidate['period_id']]['end'] and present('shares_end_outstanding',q['id'])]
+            if aliases:
+                chosen=max(aliases,key=lambda q:(actual(rows['shares_end_outstanding']['cells'][q['id']]),q['kind']=='FY'))
+                candidate['period_id']=chosen['id']
+            weighted_aliases=[q for q in periods if q['end']==pm[candidate['period_id']]['end'] and
+                actual(rows['shares_basic']['cells'].get(q['id'],{})) and present('shares_basic',q['id'])]
+            if not present('shares_end_outstanding',candidate['period_id']) and weighted_aliases:
+                proxy=max(weighted_aliases,key=lambda q:(q['kind']=='FY',q['kind']=='H1',q['duration_days']))
+                f('shares_end_outstanding',candidate['period_id'],'weighted_proxy',{'weighted_proxy':dict(row_id='shares_basic',period_id=proxy['id'])},
+                    reason='Unresolved closing share count at this date. Reported weighted-average shares are an explicit provisional proxy; earlier disclosed closing shares do not establish subsequent treasury or employee-plan movements.',status='estimated_historical',required=False)
+                rows['shares_end_outstanding']['cells'][candidate['period_id']].update(data_role='estimated_historical_baseline',calibration_eligible=False)
+                spec['gaps'].append('Closing shares at '+candidate['period_id']+' use a weighted-average proxy because intervening share movements and the closing count are undisclosed; an earlier reported closing count is preserved separately.')
             if present('shares_end_outstanding',candidate['period_id']):opening=candidate
         f('shares_basic',pid,'opening - buyback_shares * (1 - repurchase_elapsed_fraction) + issuance_shares * (1 - issuance_elapsed_fraction)',{'opening':opening})
         close_pid=py[p['fiscal_year'],'FY'] if p['kind']=='H2' else pid
@@ -1192,6 +1919,258 @@ def apply_financial_contracts(spec, data):
         f('shares_end_outstanding',close_pid,'opening - bought + issued',{'opening':opening,'bought':dict(row_id='buyback_shares',period_id=pid),'issued':dict(row_id='issuance_shares',period_id=pid)})
     for year in forecast_years:
         aggregate('shares_basic',year,'weighted_average');aggregate('buyback_shares',year)
+    # Financing is an explicit dated manual schedule, with within-period
+    # borrowing/repayment interest; no cash floor or automatic debt plug.
+    schedule=finance.get('schedule',{})
+    rows['borrowing_input']['note']='Manual discretionary borrowing; separate refinancing and maturity inputs. Interest reflects the supplied within-period transaction timing.'
+    rows['repayment_input']['note']='Manual discretionary repayment, separate from contractual maturities; cash, debt and time-weighted interest share one input.'
+    rows['debt_interest']['note']='Opening non-lease debt plus within-period time-weighted borrowing and repayment, multiplied by the annual funding rate and fiscal duration.'
+    valid_periods={p['id'] for p in financial}
+    if set(schedule)-valid_periods:raise ValueError('Financing schedule must use authoritative financial periods: '+', '.join(sorted(set(schedule)-valid_periods)))
+    for rid,label in [('maturity_input','Contractual non-lease debt maturities'),('refinancing_input','Refinancing borrowings'),
+                      ('issuance_nominal_cash','Legal nominal capital issued'),('issuance_premium_cash','Share premium issued')]:
+        make(rid,label,'financing',kind='assumption' if rid.endswith('_input') else 'calculated')
+    for rid,label in [('borrowing_elapsed_fraction','Borrowing date: fraction of period elapsed'),('repayment_elapsed_fraction','Repayment date: fraction of period elapsed')]:
+        make(rid,label,'financing','ratio','assumption','ratio')
+    nominal=finance.get('issuance_nominal_price')
+    if nominal is not None:make('issuance_nominal_price','Legal nominal value per issued share','financing',money+'/shares_m','assumption','ratio')
+    else:
+        rows['share_capital']['label']='Share capital / combined paid-in capital'
+        rows['share_capital']['note']='Reported history retains its legal definition. Forecast issuance is combined paid-in capital until nominal value and premium are separately specified.'
+    for p in financial:
+        pid=p['id'];item=schedule.get(pid,{})
+        for rid,key in [('borrowing_input','borrowing'),('repayment_input','repayment'),('maturity_input','maturities'),('refinancing_input','refinancing')]:
+            current=rows[rid]['cells'][pid].get('value',0) if rid in ('borrowing_input','repayment_input') else 0
+            a(rid,p,item.get(key,current),'Explicit period financing cash flow; missing schedule means the documented hold/zero policy, not verified absence of contractual maturities.')
+        for rid in ('borrowing_elapsed_fraction','repayment_elapsed_fraction'):a(rid,p,item.get(rid,finance.get(rid,.5)))
+        f('debt_borrow',pid,'borrowing_input + refinancing_input')
+        f('debt_repay',pid,'-repayment_input - maturity_input')
+        old=rows['debt_interest']['cells'][pid];opening=next(b for k,b in old['bindings'].items() if k.startswith('lag:'))
+        f('debt_interest',pid,'(opening + debt_borrow * (1 - borrowing_elapsed_fraction) + debt_repay * (1 - repayment_elapsed_fraction)) * borrowing_rate * period_year_fraction',{'opening':opening},
+          'Interest on opening debt plus time-weighted scheduled borrowing and repayment; manual financing, no automatic cash balancing.')
+        if nominal is not None:
+            a('issuance_nominal_price',p,nominal)
+            f('issuance_nominal_cash',pid,'issuance_shares * issuance_nominal_price')
+            f('issuance_premium_cash',pid,'issuance_cash - issuance_nominal_cash')
+        else:
+            f('issuance_nominal_cash',pid,'issuance_cash',reason='Combined paid-in capital because no nominal-value contract was supplied; not represented as legal nominal capital.')
+            rows['issuance_premium_cash']['cells'][pid]=dict(value=0,status='forecast',editable=False)
+        closing=py[p['fiscal_year'],'FY'] if p['kind']=='H2' else pid
+        rows['share_capital']['cells'][closing]['bindings']['issued_cash']=dict(row_id='issuance_nominal_cash',period_id=pid)
+        reserve=rows['reserves']['cells'][closing]
+        reserve['expression']='('+reserve['expression']+') + issuance_premium'
+        reserve.setdefault('bindings',{})['issuance_premium']=dict(row_id='issuance_premium_cash',period_id=pid)
+    for year in forecast_years:
+        for rid in ('debt_borrow','debt_repay','debt_interest','issuance_nominal_cash','issuance_premium_cash'):aggregate(rid,year)
+    spec['policies']['financing']='Manual maturities, refinancing, discretionary borrowing/repayment and capital distributions. Interest includes the remaining period after each scheduled cash flow. Absent maturities are unresolved hold-policy inputs, not evidence of no maturity.'
+    # Company-defined adjusted earnings bridge, including separate tax,
+    # non-controlling and after-tax associate effects rather than UTOP/EPS.
+    earnings=cfg.get('adjusted_earnings',{})
+    basic_adjustment=earnings.get('basic_earnings_adjustment')
+    eps_parent='parent_profit';adjusted_numerator='adjusted_parent_profit'
+    if basic_adjustment is not None:
+        if not basic_adjustment.get('source_refs') or not basic_adjustment.get('method'):
+            raise ValueError('An EPS numerator adjustment requires company evidence and an explicit method')
+        amounts=basic_adjustment.get('amounts_by_period',{})
+        if set(amounts)-valid_periods:raise ValueError('EPS numerator adjustment must use authoritative financial periods')
+        make('basic_earnings_adjustment','After-tax basic EPS numerator adjustment','income',kind='assumption',
+             note=basic_adjustment['method']+' EPS attribution only; no duplicate cash flow or P&L expense.')
+        make('basic_eps_numerator','Earnings attributable to ordinary shares','income')
+        eps_parent='basic_eps_numerator';adjusted_numerator='(adjusted_parent_profit + basic_earnings_adjustment)'
+        for p in financial:
+            a('basic_earnings_adjustment',p,amounts.get(p['id'],basic_adjustment.get('annual_amount',0)*frac(p)))
+            f('basic_eps_numerator',p['id'],'parent_profit + basic_earnings_adjustment')
+            f('eps_basic',p['id'],'basic_eps_numerator / shares_basic')
+        for year in forecast_years:
+            aggregate('basic_earnings_adjustment',year);aggregate('basic_eps_numerator',year)
+            f('eps_basic',py[year,'FY'],'basic_eps_numerator / shares_basic')
+        for pid,item in basic_adjustment.get('historical',{}).items():
+            if pid not in pm or not actual(rows['parent_profit']['cells'].get(pid,{})) or not item.get('source_refs'):
+                raise ValueError('Historical EPS attribution needs an actual earnings period and cited adjustment')
+            rows['basic_earnings_adjustment']['cells'][pid]=dict(value=item['amount'],status='reported',editable=False,required=False,
+                source_refs=copy.deepcopy(item['source_refs']),data_role='reported_fact')
+            f('basic_eps_numerator',pid,'parent_profit + basic_earnings_adjustment',status='derived_actual',required=False)
+            existing=rows['eps_basic']['cells'].get(pid,{})
+            if existing.get('status') not in ('actual','reported'):
+                f('eps_basic',pid,'basic_eps_numerator / shares_basic',status='derived_actual',required=False)
+    dilution=earnings.get('dilution',cfg.get('dilution',{}))
+    make('incremental_diluted_shares','Incremental dilutive weighted shares','financing','shares_m','assumption','weighted_average',
+         note=dilution.get('method','Explicit incremental-share scenario; no unreported dilution is asserted as fact.'))
+    make('diluted_earnings_adjustment','After-tax diluted earnings adjustment','income',kind='assumption')
+    make('shares_diluted','Diluted weighted-average shares','income','shares_m',metric_type='weighted_average')
+    make('eps_diluted','Statutory diluted EPS','income',money+'/shares_m',metric_type='ratio')
+    control_numerator=dilution.get('control_numerator_row',eps_parent)
+    if control_numerator not in rows:raise ValueError('Unknown continuing-operations dilution control numerator: '+control_numerator)
+    for rid,label,unit in [('dilution_control_basic_eps','Continuing-operations EPS before potential shares',money+'/shares_m'),
+        ('dilution_control_candidate_eps','Continuing-operations EPS with potential shares',money+'/shares_m'),
+        ('dilution_control_spread','Decrease in continuing-operations EPS from potential shares',money+'/shares_m'),
+        ('eligible_diluted_shares','Potential weighted shares passing anti-dilution test','shares_m'),
+        ('eligible_diluted_earnings_adjustment','Diluted earnings adjustment passing anti-dilution test',money)]:
+        make(rid,label,'income',unit,metric_type='weighted_average' if rid=='eligible_diluted_shares' else 'ratio' if 'eps' in rid or rid.endswith('spread') else 'flow',support=True)
+    def forecast_dilution(pid):
+        f('dilution_control_basic_eps',pid,control_numerator+' / shares_basic')
+        f('dilution_control_candidate_eps',pid,'('+control_numerator+' + diluted_earnings_adjustment) / (shares_basic + incremental_diluted_shares)')
+        f('dilution_control_spread',pid,'dilution_control_basic_eps - dilution_control_candidate_eps')
+        f('eligible_diluted_shares',pid,'if_positive(dilution_control_spread, incremental_diluted_shares, 0)')
+        f('eligible_diluted_earnings_adjustment',pid,'if_positive(dilution_control_spread, diluted_earnings_adjustment, 0)')
+        f('shares_diluted',pid,'shares_basic + eligible_diluted_shares')
+        f('eps_diluted',pid,f'({eps_parent} + eligible_diluted_earnings_adjustment) / shares_diluted')
+    for p in financial:
+        a('incremental_diluted_shares',p,dilution.get('incremental_shares',max(0,(hv('shares_diluted') or hv('shares_basic'))-hv('shares_basic'))))
+        a('diluted_earnings_adjustment',p,dilution.get('earnings_adjustment',0)*frac(p))
+        forecast_dilution(p['id'])
+    for year in forecast_years:
+        # IAS33 eligibility is tested independently for the annual earnings
+        # control number, not averaged from shares eligible in each half.
+        aggregate('incremental_diluted_shares',year,'weighted_average');aggregate('diluted_earnings_adjustment',year)
+        forecast_dilution(py[year,'FY'])
+    historical_dilution=copy.deepcopy(dilution.get('historical',{}))
+    for p in periods:
+        pid=p['id'];eps=rows['eps_diluted']['cells'].get(pid,{})
+        if pid in historical_dilution or eps.get('status') not in ('actual','reported') or present('shares_diluted',pid):continue
+        if dilution.get('historical_missing_denominator_policy','carry_latest_cited_increment')!='carry_latest_cited_increment':continue
+        previous=[(q,item) for q,item in historical_dilution.items() if q in pm and pm[q]['end']<p['start'] and item.get('source_refs') and item.get('status','reported') in ('actual','reported')]
+        if previous:
+            anchor,item=max(previous,key=lambda pair:pm[pair[0]]['end'])
+            historical_dilution[pid]=dict(incremental_shares=item['incremental_shares'],earnings_adjustment=item['earnings_adjustment']*p['duration_days']/pm[anchor]['duration_days'],
+                status='estimated',source_refs=copy.deepcopy(item['source_refs']),reason='Undisclosed diluted denominator: carry the latest cited potential-share increment from '+anchor+'. Independent estimate, never reverse-engineered from rounded EPS.')
+    for pid,item in historical_dilution.items():
+        if pid not in pm or not actual(rows['shares_basic']['cells'].get(pid,{})):raise ValueError('Historical dilution requires an actual basic-share period')
+        if not item.get('source_refs'):raise ValueError('Historical dilution requires cited evidence, including for an estimated allocation')
+        status=item.get('status','reported')
+        if status not in ('actual','reported','estimated','estimate','estimated_historical'):raise ValueError('Unsupported historical dilution status')
+        estimated=status not in ('actual','reported');status='estimated_historical' if estimated else 'reported'
+        for rid,key in [('incremental_diluted_shares','incremental_shares'),('diluted_earnings_adjustment','earnings_adjustment')]:
+            if key not in item:raise ValueError('Historical dilution must disclose both shares and earnings adjustment')
+            rows[rid]['cells'][pid]=dict(value=item[key],status=status,editable=False,required=False,source_refs=copy.deepcopy(item['source_refs']),
+                data_role='estimated_historical_baseline' if estimated else 'reported_fact',calibration_eligible=not estimated,reason=item.get('reason','Cited historical dilution bridge'))
+        for rid,source in [('eligible_diluted_shares','incremental_diluted_shares'),('eligible_diluted_earnings_adjustment','diluted_earnings_adjustment')]:
+            f(rid,pid,source,status='estimated_historical' if estimated else 'derived_actual',required=False)
+            rows[rid]['cells'][pid].update(data_role='estimated_historical_baseline' if estimated else 'derived_fact',calibration_eligible=not estimated)
+        from .construction import formula_value
+        def historical_number(rid,target,seen=None):
+            seen=set() if seen is None else set(seen)
+            if (rid,target) in seen:return None
+            seen.add((rid,target));cell=rows[rid]['cells'].get(target,{})
+            if cell.get('value') is not None:return cell['value']
+            if not cell.get('expression'):return None
+            def resolve(symbol,lag):
+                binding=cell.get('bindings',{}).get(f'lag:{symbol}:{lag}' if lag else symbol,dict(row_id=symbol,period_id=target))
+                return historical_number(binding['row_id'],binding['period_id'],seen)
+            return formula_value(expression_tree(cell['expression']),resolve)
+        for rid,expression,tolerance in [('shares_diluted','shares_basic + incremental_diluted_shares',item.get('share_rounding_tolerance',1e-6)),
+                                        ('eps_diluted',f'({eps_parent} + diluted_earnings_adjustment) / shares_diluted',item.get('eps_rounding_tolerance',.005))]:
+            reported=[o for o in data.get('observations',[]) if o['row_id']==rid and o['period_id']==pid and o.get('status') in ('actual','reported') and o.get('eligible',True)]
+            existing=rows[rid]['cells'].get(pid,{})
+            if reported:
+                chosen=reported[0]
+                if any(not math.isclose(o['value'],chosen['value'],abs_tol=tolerance,rel_tol=0) for o in reported):raise ValueError('Conflicting preserved historical dilution observations: '+rid)
+                existing=dict(value=chosen['value'],status='reported',editable=False,required=False,source_refs=copy.deepcopy(chosen.get('source_refs',[])),observation_id=chosen['id'],data_role='reported_fact')
+            elif pm[pid]['kind']=='FY':
+                source=history.get(rid,{})
+                amount=source.get('values',{}).get(str(pm[pid]['fiscal_year']));refs=source.get('sources',{}).get(str(pm[pid]['fiscal_year']),[])
+                if amount is not None and refs:existing=dict(value=amount,status='reported',editable=False,required=False,source_refs=copy.deepcopy(refs),data_role='reported_fact')
+            expected=formula_value(expression_tree(expression),lambda symbol,lag:historical_number(symbol,pid))
+            if actual(existing) and (existing.get('value') is not None or existing.get('expression')):
+                observed=existing.get('value') if existing.get('value') is not None else historical_number(rid,pid)
+                if expected is None or observed is None or not math.isclose(observed,expected,abs_tol=tolerance,rel_tol=0):raise ValueError('Historical dilution conflicts with a preserved reported '+rid)
+                rows[rid]['cells'][pid]=existing
+            else:
+                f(rid,pid,expression,status='estimated_historical' if estimated else 'derived_actual',required=False)
+                rows[rid]['cells'][pid].update(data_role='estimated_historical_baseline' if estimated else 'derived_fact',calibration_eligible=not estimated)
+    spec['dilution_contract']=dict(control_numerator_row=control_numerator,
+        historical_missing_denominator_policy=dilution.get('historical_missing_denominator_policy','carry_latest_cited_increment'),
+        method='Single supported potential-share class or explicitly equivalent share-plan pool; include only when continuing-operations EPS falls. Apply independently to interim and annual periods.',
+        limitations=['Different convertible/option classes require a separately sequenced instrument model; an aggregate mixed-instrument pool is not a claim of full IAS33 instrument modelling.',
+            'When no separate continuing-operations control numerator is supplied, the ordinary-share earnings numerator is the explicit proxy.'])
+    if earnings:
+        bridges={k:[] for k in ('pretax','tax','associate','nci')}
+        for adjustment in earnings.get('adjustments',[]):
+            key='adjustment_'+adjustment['id'];basis=adjustment.get('basis','after_tax_associate' if adjustment.get('associate_after_tax') else 'pretax')
+            if basis not in ('pretax','after_tax_associate','tax_only','nci_only'):raise ValueError('Unsupported adjusted-earnings adjustment basis')
+            sign=adjustment.get('sign',1)
+            if sign not in (-1,1):raise ValueError('Earnings adjustment sign must be -1 or 1')
+            make(key,adjustment.get('label',adjustment['id']),'income',kind='calculated' if adjustment.get('source_row') else 'assumption',support=True)
+            for p in financial:
+                if adjustment.get('source_row'):
+                    if adjustment['source_row'] not in rows:raise ValueError('Unknown earnings bridge source '+adjustment['source_row'])
+                    f(key,p['id'],('-' if sign<0 else '')+adjustment['source_row'])
+                else:a(key,p,sign*adjustment.get('annual_amount',0)*frac(p),'Explicit company-defined normalization estimate, not a reported adjustment.')
+            category={'pretax':'pretax','after_tax_associate':'associate','tax_only':'tax','nci_only':'nci'}[basis]
+            bridges[category].append(key)
+            if basis in ('pretax','after_tax_associate'):
+                for suffix in ('tax_rate','nci_share'):
+                    make(key+'_'+suffix,adjustment.get('label',adjustment['id'])+' '+suffix.replace('_',' '),'income','ratio','assumption','ratio',support=True)
+                    for p in financial:a(key+'_'+suffix,p,0 if basis=='after_tax_associate' and suffix=='tax_rate' else adjustment.get(suffix,0))
+                make(key+'_tax','Adjustment tax effect','income',support=True);make(key+'_nci','Adjustment attributable to NCI','income',support=True)
+                for p in financial:
+                    f(key+'_tax',p['id'],f'-{key} * {key}_tax_rate')
+                    f(key+'_nci',p['id'],f'({key} + {key}_tax) * {key}_nci_share')
+                bridges['tax'].append(key+'_tax');bridges['nci'].append(key+'_nci')
+        for category,source in [('pretax','pretax'),('tax','tax_expense'),('associate','associate_profit'),('nci','nci_profit')]:
+            rid='adjusted_'+category;make(rid,earnings.get('label','Adjusted')+' '+category,'income')
+            for p in financial:f(rid,p['id'],source+(' + '+' + '.join(bridges[category]) if bridges[category] else ''))
+            for year in forecast_years:aggregate(rid,year)
+        for rid,label,expr,unit in [('adjusted_total_profit','Adjusted total profit','adjusted_pretax + adjusted_tax + adjusted_associate',money),
+             ('adjusted_parent_profit','Adjusted profit attributable to owners','adjusted_total_profit - adjusted_nci',money),
+             ('adjusted_eps_basic','Adjusted basic EPS',adjusted_numerator+' / shares_basic',money+'/shares_m'),
+             ('adjusted_eps_diluted','Adjusted diluted EPS','('+adjusted_numerator+' + eligible_diluted_earnings_adjustment) / shares_diluted',money+'/shares_m')]:
+            make(rid,label,'income',unit,metric_type='ratio' if 'eps' in rid else 'flow')
+            for p in financial:f(rid,p['id'],expr)
+            for year in forecast_years:
+                if 'eps' in rid:f(rid,py[year,'FY'],expr)
+                else:aggregate(rid,year)
+        historical_bridges={}
+        for item in earnings.get('historical_adjustments',[]):
+            pid=item['period_id'];basis=item['basis'];rid='historical_adjustment_'+item['id']
+            if pid not in pm or not actual(rows['parent_profit']['cells'].get(pid,{})):raise ValueError('Historical earnings bridge requires an actual statutory earnings period')
+            category={'pretax':'pretax','after_tax_associate':'associate','tax_only':'tax','nci_only':'nci'}.get(basis)
+            if category is None:raise ValueError('Unsupported historical adjustment basis')
+            if not item.get('source_refs'):raise ValueError('Historical adjustment requires explicit source provenance')
+            make(rid,item.get('label',item['id']),'income',support=True)
+            rows[rid]['cells'][pid]=dict(value=item['amount'],status=item.get('status','reported'),editable=False,required=False,
+                source_refs=copy.deepcopy(item['source_refs']),data_role='reported_fact' if item.get('status','reported')=='reported' else 'estimated_historical_baseline')
+            historical_bridges.setdefault(pid,{k:[] for k in ('pretax','tax','associate','nci')})[category].append(rid)
+        for pid,bridge in historical_bridges.items():
+            estimate=any(rows[r]['cells'][pid]['status']!='reported' for items in bridge.values() for r in items)
+            status='estimated' if estimate else 'derived_actual'
+            for category,source in [('pretax','pretax'),('tax','tax_expense'),('associate','associate_profit'),('nci','nci_profit')]:
+                f('adjusted_'+category,pid,source+(' + '+' + '.join(bridge[category]) if bridge[category] else ''),status=status,required=False,
+                  reason='Company-defined historical adjustment bridge from cited period-specific amounts; absence of a category means this supplied bridge has no adjustment in that category.')
+            for rid,expr in [('adjusted_total_profit','adjusted_pretax + adjusted_tax + adjusted_associate'),
+                ('adjusted_parent_profit','adjusted_total_profit - adjusted_nci'),('adjusted_eps_basic',adjusted_numerator+' / shares_basic')]:
+                f(rid,pid,expr,status=status,required=False)
+            if present('shares_diluted',pid):f('adjusted_eps_diluted',pid,'('+adjusted_numerator+' + eligible_diluted_earnings_adjustment) / shares_diluted',status=status,required=False)
+        spec['adjusted_earnings_contract']=copy.deepcopy(earnings)
+    # Writable policy and calculated effective ratio are distinct business IDs.
+    ratio_contracts=[('effective_tax_rate','Tax-rate policy','-tax_expense / pretax'),
+                     ('nci_profit_share','NCI attribution policy','if_zero(total_profit, 0, nci_profit / total_profit)'),
+                     ('current_debt_share','Current-debt classification policy','if_zero(total_debt, 0, short_debt / total_debt)')]
+    for rid,label,expression in ratio_contracts:
+        policy=rid+'_policy';r=copy.deepcopy(rows[rid]);r.update(id=policy,label=label,kind='assumption')
+        for cell in r['cells'].values():
+            if actual(cell):continue
+            for binding in cell.get('bindings',{}).values():
+                if binding.get('row_id')==rid:binding['row_id']=policy
+        if rid=='current_debt_share':
+            r['note']='Closing-date debt classification policy. Annual classification uses the final financial-period policy, never an average of interim classifications.'
+            for year in forecast_years:
+                candidates=leaves(year);last=max(candidates,key=lambda p:p['end']);fy=py[year,'FY']
+                if last['id']!=fy and not actual(r['cells'].get(fy,{})):
+                    r['cells'][fy]=dict(expression='closing_policy',bindings={'closing_policy':dict(row_id=policy,period_id=last['id'])},
+                        status='forecast',editable=False,required=True,reason=r['note'])
+        rows[policy]=r;spec['rows'].append(r);rows[rid]['kind']='calculated';rows[rid]['note']='Calculated effective ratio from matching financial amounts; the separate policy input determines the forecast.'
+        spec.setdefault('input_migrations',{})[rid]=policy
+        for target in spec['rows']:
+            if target['id'] in (rid,policy):continue
+            for pid,cell in target['cells'].items():
+                if actual(cell) or not cell.get('expression'):continue
+                if (rid,0) in dependencies(expression_tree(cell['expression'])):
+                    cell.setdefault('bindings',{})[rid]=dict(row_id=policy,period_id=pid)
+        for p in periods:
+            if p['fiscal_year'] not in forecast_years or actual(rows[rid]['cells'].get(p['id'],{})):continue
+            if rid=='current_debt_share' and not present('short_debt',p['id']):continue
+            if p in financial or p['kind']=='FY':f(rid,p['id'],expression)
     # FX accounting inputs are distinct. Asset/liability translation drives OCI;
     # cash-flow FX never masquerades as a translation-reserve plug.
     fx_policy=cfg.get('balance_sheet_fx',{})
@@ -1203,7 +2182,7 @@ def apply_financial_contracts(spec, data):
     make('cash_translation_oci','OCI attributable to translated cash exposure','working_capital',kind='assumption',
         note='Independent attribution based on foreign cash exposure; not automatically equal to the cash-flow FX line.',support=True)
     make('oci_translation','OCI translation of explicit net-asset exposures','working_capital',note='Sum of declared asset less liability currency movements, independently of cash-flow FX.')
-    reserves_note=('Opening reserves plus equity-settled compensation and explicitly modelled net-asset OCI translation. '
+    reserves_note=('Opening reserves plus equity-settled compensation, issuance premium and explicitly modelled net-asset OCI translation or event reclassifications. '
                    'Cash-flow FX and financing remeasurement remain separate; undisclosed translation exposures are unmodelled.')
     rows['reserves']['note']=reserves_note
     make('financing_fx_remeasurement','Financing FX remeasurement charge / (gain)','financing',kind='assumption',
@@ -1231,10 +2210,20 @@ def apply_financial_contracts(spec, data):
         # A debt remeasurement is noncash P&L, not new borrowing.
         fc=rows['financial_expense']['cells'][pid];fc['expression']='('+fc['expression']+') - financing_fx_remeasurement'
         debt=rows['nonlease_debt']['cells'][closing];debt['expression']='('+debt['expression']+') + remeasurement';debt['bindings']['remeasurement']=dict(row_id='financing_fx_remeasurement',period_id=pid)
-        cfo=rows['cfo']['cells'][pid];cfo['expression']='('+cfo['expression']+') + financing_fx_remeasurement'
+        cfo=rows['cfo_fx_noncash']['cells'][pid];cfo['expression']='('+cfo['expression']+') + financing_fx_remeasurement'
     for year in forecast_years:
         aggregate('oci_translation',year)
+        aggregate('cfo_portfolio_noncash',year);aggregate('cfo_fx_noncash',year)
         for role in bs_roles:aggregate(role+'_translation_movement',year)
+    component_ids=['cf_net_profit','da','sbc','cf_associates','associate_dividends','cf_tax_timing','wc_cash']
+    component_ids += [rid for rid in ('impairment','disposal_result_cf','other_noncash_ex_sbc',
+        'other_operating_assets_liabilities_cf','cf_finance_timing') if rid in rows]
+    component_ids += ['cfo_portfolio_noncash','cfo_fx_noncash']
+    spec['cashflow_component_contract']=dict(cfo_components=component_ids,
+        method='CFO equals the sum of named visible signed components; working-capital detail is counted through its subtotal once.')
+    for p in financial:
+        spec['identities'].append(dict(id='cfo_visible_components_'+p['id'],label='Visible cash-flow components reconcile to CFO',
+            expression='cfo - ('+' + '.join(component_ids)+')',periods=[p['id']],tolerance=1e-6,independent=False))
     # Existing roll-forward checks gain the explicit noncash movements rather
     # than loosening their tolerances or forcing a balancing cash/reserve value.
     for identity in spec.get('identities',[]):
@@ -1243,15 +2232,20 @@ def apply_financial_contracts(spec, data):
         if name.startswith('ppe_roll_'):identity['expression']+=' - owned_ppe_translation_movement'
         elif name.startswith('intangible_roll_'):identity['expression']+=' - intangibles_translation_movement'
         elif name.startswith('debt_roll_'):identity['expression']+=' - nonlease_debt_translation_movement - lease_liabilities_translation_movement - financing_fx_remeasurement'
-    spec['financial_contracts']=dict(version=1,cost_pools=pools,drivers=contracts,
-        authoritative_profit_build='Function cash cost pools plus allocated D&A feed segment profit and the same group expense totals.',
+    spec['financial_contracts']=dict(version=2,cost_pools=pools,drivers=contracts,
+        authoritative_profit_build='Independent cash cost methods plus explicit embedded SBC and allocated D&A feed segment profit and the same group expense totals.',
         limitations=['Segment-by-function cash-cost baselines are source-reconciled allocations, not disclosed facts.',
                      'Foreign balance-sheet exposures remain incomplete unless explicit closing-rate movements are supplied; cash-flow FX and OCI are independent.'])
     # Full-year attribution is not available merely because its forecast portion
     # is modelled. In a mixed actual/forecast year, historical expense FX, OCI and
     # repurchase counts require their own disclosures. Preserve their absence,
     # while keeping every future-only financial/driver requirement strict.
-    attribution_rows={'buyback_shares','group_cost_fx_amount','group_scope_da','operating_cogs_base','operating_sales_base','oci_translation'}
+    attribution_rows={'buyback_shares','group_cost_fx_amount','group_scope_da','operating_cogs_base','operating_sales_base','oci_translation',
+                      'debt_interest','issuance_nominal_cash','issuance_premium_cash','diluted_earnings_adjustment','shares_diluted','eps_diluted',
+                      'basic_earnings_adjustment','basic_eps_numerator','eps_basic'}
+    attribution_rows.update(r for r in rows if r.startswith('adjusted_'))
+    attribution_rows.update(r for r in rows if r.startswith(('dilution_control_','eligible_diluted_')))
+    attribution_rows.add('incremental_diluted_shares')
     attribution_rows.update(role+'_translation_movement' for role in bs_roles)
     for entity,_,_ in entities:
         if entity!='corporate':attribution_rows.update(entity+suffix for suffix in ('_scope_da','_cost_fx','_cost_fx_amount','_cost_fx_base','_cost_fx_adjusted','_cost_fx_raw'))
@@ -1298,11 +2292,164 @@ def apply_financial_contracts(spec, data):
         entity=next((e for e,_,_ in entities if r['id'].startswith(e+'_')),'group')
         role='allocation' if r['id'].endswith(('_share','_weight','_seasonality','_allocation')) or '_weight_' in r['id'] else 'economic_input'
         contract(r['id'],entity,None,role,outputs,timing=r.get('note','Explicit financial-period input'))
-    spec['policies']['operating_costs']='Independent functional cash spending/activity/unit-cost pools; pricing does not determine COGS or marketing. D&A is allocated once.'
+    for r in spec['rows']:
+        if r['kind'] not in ('assumption','driver'):continue
+        for pid,cell in r['cells'].items():
+            if actual(cell) or not cell.get('editable'):continue
+            anchors=sorted({b['period_id'] for b in cell.get('bindings',{}).values() if b.get('period_id') in pm and pm[b['period_id']]['fiscal_year']<=base})
+            if not anchors:continue
+            cell['initialization_anchor_periods']=anchors
+            reason=cell.get('reason','')
+            for phrase in ('Latest','latest','Last disclosed','last disclosed','Last reported','last reported'):
+                reason=reason.replace(phrase,'Base full-year')
+            cell['reason']=reason+' Initialization uses '+', '.join(anchors)+'; later interim disclosures are not automatically substituted.'
+    spec['policies']['operating_costs']='One selected method per pool: effective activity sensitivity and unit costs, or an independent budget. Embedded SBC is removed from comparable cash bases and added once; pricing does not determine costs.'
     spec['policies']['dividends']='Explicit annual cash-dividend pool and independent payment schedule; no half-year earnings annualisation.'
     spec['policies']['equity']='Weighted share timing and separate cash-flow FX, debt remeasurement and net-asset OCI translation.'
+    for role,policy in data.get('model_configuration',{}).get('functional_expense_structure',{}).items():
+        row=rows[role];note=data['historical'][role]['note']
+        row.update(data_role='structural_parameter',calibration_eligible=False,note=note,label=row['label']+' (included in other functions)')
+        for p in periods:
+            cell=row['cells'].get(p['id'],{})
+            if cell.get('status')=='not_applicable':continue
+            if p['fiscal_year']<=base or actual(rows['utop']['cells'].get(p['id'],{})):
+                row['cells'][p['id']]=dict(value=0,status='estimated',editable=False,required=False,reason=note,
+                    data_role='structural_parameter',calibration_eligible=False,classification_source_refs=copy.deepcopy(policy['source_refs']))
+            else:cell.update(data_role='structural_parameter',calibration_eligible=False)
+    spec['functional_expense_structure']=copy.deepcopy(data.get('model_configuration',{}).get('functional_expense_structure',{}))
+    for policy in data.get('model_configuration',{}).get('structural_account_policies',[]):
+        role=policy['role']
+        targets=[role]+({'other_revenue':['other_revenue_ratio'],
+            'net_other_trading':['net_other_trading_assumption'],
+            'net_other_operating':['net_other_operating_assumption']}.get(role,[]))
+        for target in targets:
+            if target not in rows:continue
+            row=rows[target];row.update(kind='calculated',data_role='structural_parameter',calibration_eligible=False)
+            for pid,cell in row['cells'].items():
+                if cell.get('status')=='not_applicable':continue
+                row['cells'][pid]=dict(value=0,status='estimated' if pm[pid]['end']<=spec['model_configuration'].get('actual_through',pm[base_pid]['end']) else 'forecast',
+                    editable=False,required=False,data_role='structural_parameter',calibration_eligible=False,
+                    reason=data['historical'][role]['note'],classification_source_refs=copy.deepcopy(policy['source_refs']))
+    spec['structural_account_policies']=copy.deepcopy(data.get('model_configuration',{}).get('structural_account_policies',[]))
     spec['gaps']=[g for g in spec.get('gaps',[]) if 'Cost inflation is a temporary proxy' not in g]
+    spec['gaps']=[g.replace('Opening asset/debt convention delays capex depreciation and new borrowing interest to the next year.',
+                 'Opening-asset depreciation delays new-capex depreciation; financing interest instead uses explicit within-period borrowing/repayment timing.') for g in spec['gaps']]
     spec['gaps']+=spec['financial_contracts']['limitations']
+    return spec
+
+
+def apply_cash_scope_contract(spec, data):
+    """Preserve reported net cash while financing and valuation use gross debt.
+
+    A separately controlled overdraft changes gross cash and debt together. It
+    does not create another financing inflow in an already net cash statement.
+    The default scenario holds that closing stock; edits occur at period end.
+    """
+    policy=cash_scope_policy(data)
+    if policy is None:return spec
+    periods=spec['periods'];pm={p['id']:p for p in periods};rows={r['id']:r for r in spec['rows']}
+    py={(p['fiscal_year'],p['kind']):p['id'] for p in periods}
+    frequency=spec['frequency_policy']['statements'];kinds=('H1','H2') if frequency=='half_year' else ('Q1','Q2','Q3','Q4')
+    base_pid=py[max(data['history_years']),'FY'];money=spec['currency']+'m'
+    debt_roles=[item['role'] for item in policy['components'] if item['included_in_debt']]
+    def present(role,pid):
+        cell=rows[role]['cells'].get(pid,{})
+        return cell.get('value') is not None or bool(cell.get('expression'))
+    def stock_period(p):return py[p['fiscal_year'],'FY'] if frequency=='half_year' and p['kind']=='H2' else p['id']
+    def original(role,pid):return rows[role]['cells'].get(pid,{}).get('status') in ('actual','reported','derived_actual')
+    def add(role,label,metric):
+        row=dict(id=role,label=label,section='cashflow',unit=money,kind='calculated',metric_type=metric,
+            note=policy['method'],cells={p['id']:dict(value=None,status='not_applicable',editable=False,required=False) for p in periods})
+        rows[role]=row;spec['rows'].append(row);return row
+    def formula(role,pid,expression,bindings,status='forecast'):
+        rows[role]['cells'][pid]=dict(expression=expression,bindings=bindings,status=status,editable=False,
+            reason='Cited cash-scope bridge. Netted debt is included once in gross cash and gross debt.',source_refs=copy.deepcopy(policy['source_refs']))
+    add('cash_scope_netted_debt','Debt deducted within reported cash-flow cash','stock')
+    add('cash_scope_debt_change','Change in debt netted within cash-flow cash','flow')
+    add('valuation_cash','Gross cash in the valuation bridge','stock')
+    add('valuation_cash_change','Change in gross valuation cash','flow')
+    if not any(item['role']=='held_for_sale_cash' for item in policy['components']):
+        # Replacing the cash-flow bridge does not replace independently reported
+        # held-for-sale assets. Only the normalizer's absent internal bucket is
+        # a structural zero; a disclosed HFS balance remains a historical fact.
+        hfs=data.get('historical',{}).get('held_for_sale_cash',{})
+        internal_hfs=(hfs.get('data_role')=='structural_parameter' and not hfs.get('sources')
+            and not any(o.get('row_id')=='held_for_sale_cash' and o.get('eligible',True)
+                        and o.get('value') is not None for o in data.get('observations',[])))
+        control=rows['held_for_sale_cash_input']
+        control.update(kind='calculated',support_matrix=True)
+        for cell in control['cells'].values():
+            cell['editable']=False
+            if cell.get('status')!='not_applicable':
+                cell['reason']='Hold the separately disclosed HFS cash balance; it is excluded from the configured cash-flow cash bridge.'
+        for role in ('held_for_sale_cash','held_for_sale_cash_input') if internal_hfs else ():
+            rows[role].update(kind='calculated',data_role='structural_parameter',calibration_eligible=False,support_matrix=True)
+            for pid,cell in rows[role]['cells'].items():
+                if cell.get('status')=='not_applicable':continue
+                rows[role]['cells'][pid]=dict(value=0,status='forecast' if pm[pid]['fiscal_year'] in spec['forecast_years'] else 'estimated',
+                    data_role='structural_parameter',calibration_eligible=False,editable=False,required=False,
+                    reason='Inactive internal HFS cash bucket; the cited cash-scope policy replaces this bridge.',classification_source_refs=copy.deepcopy(policy['source_refs']))
+    for p in periods:
+        pid=p['id']
+        if not present('closing_cash',pid):continue
+        if all(present(role,pid) for role in debt_roles):
+            expression=' + '.join(debt_roles) or '0 * closing_cash'
+            formula('cash_scope_netted_debt',pid,expression,{r:dict(row_id=r,period_id=pid) for r in debt_roles} |
+                ({} if debt_roles else {'closing_cash':dict(row_id='closing_cash',period_id=pid)}),
+                'derived_actual' if original('closing_cash',pid) and all(original(r,pid) for r in debt_roles) else 'forecast')
+            formula('valuation_cash',pid,'closing_cash + netted_debt',{
+                'closing_cash':dict(row_id='closing_cash',period_id=pid),'netted_debt':dict(row_id='cash_scope_netted_debt',period_id=pid)},
+                rows['cash_scope_netted_debt']['cells'][pid]['status'])
+    leaves=[p for p in periods if p.get('annual_only') or p['kind'] in kinds]
+    for p in leaves:
+        pid=p['id'];closing=stock_period(p)
+        if not present('cash_change',pid) or not present('cash_scope_netted_debt',closing):continue
+        prior=[q for q in periods if q['end']<p['start'] and present('cash_scope_netted_debt',q['id'])]
+        if not prior:
+            if not debt_roles:
+                formula('cash_scope_debt_change',pid,'0 * cash_change',{'cash_change':dict(row_id='cash_change',period_id=pid)},'derived_actual' if original('cash_change',pid) else 'forecast')
+            else:continue
+        else:
+            previous=max(prior,key=lambda q:(q['end'],q['kind']=='FY'))['id']
+            formula('cash_scope_debt_change',pid,'closing - opening',{
+                'closing':dict(row_id='cash_scope_netted_debt',period_id=closing),
+                'opening':dict(row_id='cash_scope_netted_debt',period_id=previous)},
+                'derived_actual' if original('cash_change',pid) else 'forecast')
+        formula('valuation_cash_change',pid,'cash_change + debt_change',{
+            'cash_change':dict(row_id='cash_change',period_id=pid),'debt_change':dict(row_id='cash_scope_debt_change',period_id=pid)},
+            'derived_actual' if original('cash_change',pid) else 'forecast')
+        if not debt_roles or original('cash_change',pid):continue
+        debt=rows['nonlease_debt']['cells'][closing]
+        if debt.get('expression'):
+            debt['expression']='('+debt['expression']+') + scope_debt_change'
+            debt.setdefault('bindings',{})['scope_debt_change']=dict(row_id='cash_scope_debt_change',period_id=pid)
+        # The sourced short-debt balance already includes the disclosed overdraft.
+        # Allocate only the remaining debt using its historical maturity share.
+        formula('current_debt_share',pid,'if_zero(total - netted, 0, (short - netted) / (total - netted))',{
+            'total':dict(row_id='total_debt',period_id=base_pid),'short':dict(row_id='short_debt',period_id=base_pid),
+            'netted':dict(row_id='cash_scope_netted_debt',period_id=base_pid)})
+        rows['current_debt_share']['cells'][pid]['editable']=True
+        formula('short_debt',closing,'(total - netted) * share + netted',{
+            'total':dict(row_id='total_debt',period_id=closing),'netted':dict(row_id='cash_scope_netted_debt',period_id=closing),
+            'share':dict(row_id='current_debt_share',period_id=pid)})
+        for identity in spec['identities']:
+            if identity['id'].startswith('debt_roll_') and pid in identity.get('periods',[]):
+                identity['expression']+=' - cash_scope_debt_change'
+                identity.setdefault('bindings',{})['cash_scope_debt_change']=dict(row_id='cash_scope_debt_change',period_id=pid)
+    # Additive summaries include actual and forecast financial periods; stock
+    # rows above always use the closing snapshot rather than sum balances.
+    for p in periods:
+        parts=[q for q in leaves if q['id']!=p['id'] and q['start']>=p['start'] and q['end']<=p['end']]
+        for role in ('cash_scope_debt_change','valuation_cash_change'):
+            if present(role,p['id']) or len(parts)<2 or not all(present(role,q['id']) for q in parts):continue
+            if parts[0]['start']!=p['start'] or parts[-1]['end']!=p['end']:continue
+            formula(role,p['id'],' + '.join('x'+str(i) for i in range(len(parts))),
+                {'x'+str(i):dict(row_id=role,period_id=q['id']) for i,q in enumerate(parts)},
+                'derived_actual' if all(original(role,q['id']) for q in parts) else 'forecast')
+    spec['cash_scope_contract']=dict(policy,valuation_cash_role='valuation_cash',valuation_cash_change_role='valuation_cash_change',
+        debt_policy='Netted debt is already within sourced total debt. Its closing change affects gross cash and debt once, outside the net CF financing subtotal.',
+        availability_policy='Cash-flow scope does not establish cash accessibility. Review each cited component and treat restricted or unavailable cash as a separate valuation claim.',
+        forecast_timing='Component changes occur at period end; next-period opening debt bears interest. Borrowing controls describe other borrowing.')
     return spec
 
 
@@ -1311,30 +2458,51 @@ def validate_financial_contracts(spec, values):
     if not spec.get('financial_contracts'):return []
     checks=[];rows={r['id']:r for r in spec['rows']}
     def value(r,p):return values.get(r,{}).get(p)
+    for item in spec.get('cash_scope_contract',{}).get('components',[]):
+        if not item.get('included_in_debt'):continue
+        for p in spec['periods']:
+            pid=p['id'];amount=value(item['role'],pid);short=value('short_debt',pid);debt=value('nonlease_debt',pid)
+            if None not in (amount,short,debt):
+                checks.append(check('cash_scope',item['role']+':'+pid,'PASS' if 0<=amount<=min(short,debt)+1e-6 else 'FAIL',
+                    'Netted cash-scope borrowing must be a nonnegative component of current non-lease debt.'))
     for p in spec['periods']:
         pid=p['id'];cash=value('buyback_cash',pid);price=value('buyback_price',pid)
         if cash is not None and rows['buyback_cash']['cells'][pid].get('status')=='forecast':
             ok=cash>=0 and (cash==0 or price is not None and price>0)
             checks.append(check('financial_contract','repurchase_price:'+pid,'PASS' if ok else 'FAIL',
                 'Zero repurchase cash permits missing price; active repurchases require a strictly positive currency-per-share execution price.'))
-        for rid in ('repurchase_elapsed_fraction','issuance_elapsed_fraction'):
+        for rid in ('repurchase_elapsed_fraction','issuance_elapsed_fraction','borrowing_elapsed_fraction','repayment_elapsed_fraction'):
             v=value(rid,pid)
             if v is not None:checks.append(check('financial_contract',rid+':'+pid,'PASS' if 0<=v<=1 else 'FAIL','Share transaction timing must fall within the period.'))
         issued=value('issuance_shares',pid);issue_price=value('issuance_price',pid)
         if issued is not None:
             checks.append(check('financial_contract','issuance_price:'+pid,'PASS' if issued>=0 and (issued==0 or issue_price is not None and issue_price>0) else 'FAIL',
                 'Active share issuance requires a positive reporting-currency execution price and explicit timing.'))
+            nominal=value('issuance_nominal_price',pid)
+            if nominal is not None and issued>0:checks.append(check('financial_contract','issuance_nominal:'+pid,
+                'PASS' if nominal>=0 and issue_price is not None and nominal<=issue_price else 'FAIL','Legal nominal capital cannot exceed total issuance proceeds.'))
+        for rid in ('borrowing_input','repayment_input','maturity_input','refinancing_input','sbc_annual_budget','incremental_diluted_shares'):
+            amount=value(rid,pid)
+            if amount is not None:checks.append(check('financial_contract',rid+':'+pid,'PASS' if amount>=0 else 'FAIL','Amount must be nonnegative under the stated cash/sign convention.'))
+        basic=value('eps_basic',pid);diluted=value('eps_diluted',pid)
+        if basic is not None and diluted is not None and rows.get('eps_diluted',{}).get('cells',{}).get(pid,{}).get('status')=='forecast':
+            spread=value('dilution_control_spread',pid);eligible=value('eligible_diluted_shares',pid)
+            valid=spread is not None and eligible is not None and (eligible==0 or spread>0)
+            checks.append(check('financial_contract','dilution:'+pid,'PASS' if valid else 'FAIL','Potential shares must reduce continuing-operations EPS; total/adjusted earnings may have a different sign.'))
         for r in spec['rows']:
             if r['id'].endswith('_variable_share'):
                 v=value(r['id'],pid)
                 if v is not None:checks.append(check('financial_contract',r['id']+':'+pid,'PASS' if 0<=v<=1 else 'FAIL','Variable expense share must be between zero and one.'))
+            if r['id'].endswith('_effective_activity_sensitivity'):
+                v=value(r['id'],pid)
+                if v is not None:checks.append(check('financial_contract',r['id']+':'+pid,'PASS' if v>=0 else 'FAIL','Effective activity sensitivity must be nonnegative; it is one structural estimate, not duplicated elasticity and variable share.'))
         cashfx=value('cash_fx',pid);cashoci=value('cash_translation_oci',pid)
         allocation=value('active_da_allocation_total',pid);group_da=value('da',pid)
         if allocation is not None and group_da is not None:
             missing_allocation=abs(allocation)<1e-12 and abs(group_da)>1e-8
             checks.append(check('financial_contract','depreciation_allocation:'+pid,'FAIL' if missing_allocation else 'PASS',
                 'Nonzero group D&A requires a supported remaining-business allocation; a zero allocation denominator leaves the model incomplete rather than inventing a recipient.'))
-        if cashfx is not None and cashoci is not None and abs(cashfx-cashoci)>1e-8:
+        if not spec.get('fx_accounting_contract') and cashfx is not None and cashoci is not None and abs(cashfx-cashoci)>1e-8:
             checks.append(check('financial_contract','cash_fx_attribution:'+pid,'FAIL',
                 'Cash-flow currency movement and independently specified translated cash exposure differ; supply the missing exposure/reconciliation rather than using an equity plug.',cashfx-cashoci,1e-8))
     for contract in spec['financial_contracts'].get('drivers',[]):
@@ -1401,6 +2569,7 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
     from .construction import expression_tree, dependencies
     from datetime import date
     from collections import Counter, defaultdict
+    data=functional_structure_inputs(historical_eligibility_inputs(data))
     annual=build_integrated_spec(data,forecast_years)
     config=data.get('model_configuration',{})
     if not data.get('fiscal_calendar'):
@@ -1462,8 +2631,9 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
         'owned_ppe','right_of_use_assets','lease_liabilities','nonlease_debt','total_debt',
         'net_debt','net_operating_working_capital','shares_end_outstanding',
         'closing_cash','cf_to_bs_cash','held_for_sale_cash','held_for_sale_cash_input'}
+    stocks.update(r['id'] for r in spec['rows'] if r.get('metric_type')=='stock')
     # A balance-sheet residual is a closing-date control, never an additive flow.
-    weighted={'shares_basic'}
+    weighted={'shares_basic','shares_diluted'}
     ratios={r['id'] for r in spec['rows'] if r['unit']=='ratio' or '/shares_m' in r['unit']} | {'eps_basic'}
     overrides=config.get('row_overrides',{})
     for r in spec['rows']:
@@ -1501,7 +2671,7 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
     for allocation in data.get('schedule_anchor_policy',{}).get('assumptions',[]):
         ingredients.update(x['row_id'] for x in allocation.get('bindings',{}).values())
     for observation in data.get('observations',[]):
-        if observation.get('expression'):
+        if observation.get('expression') and observation.get('model_selection_eligible',True):
             ingredients.update(x['row_id'] for x in observation.get('bindings',{}).values())
     for rid in sorted(ingredients-set(rows)):
         source=source_roles.get(rid)
@@ -1518,7 +2688,7 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
                 add_row(rid,o.get('label',rid.replace('_',' ').capitalize()),'working_capital',o['unit'],'reported',o['metric_type'],
                         'Reported ingredient for an explicit forecast-opening allocation; original disclosure remains separate from the proxy.')['supporting_input']=True
     observations=copy.deepcopy(data.get('observations',[]))
-    existing={(o['row_id'],o['period_id']) for o in observations}
+    existing={(o['row_id'],o['period_id']) for o in observations if o.get('model_selection_eligible',True)}
     # Annual source roles remain useful when a normalized interim archive omits
     # ancillary schedule disclosures. Never copy a temporary initializer as fact.
     for r in spec['rows']:
@@ -1554,7 +2724,7 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
     def select(r,pid):
         choices=candidates.get((r['id'],pid),[])
         choices=[o for o in choices if o.get('status') not in ('unverified','conflict','excluded','vendor_unverified','primary_conflict')
-                 and o.get('eligible',True)]
+                 and o.get('eligible',True) and o.get('model_selection_eligible',True)]
         if not choices:return None
         is_segment=r['section'].startswith('segment_') or r['section']=='corporate' and r['id'].startswith('corporate_')
         intended=active.get(pid,{})
@@ -1605,7 +2775,8 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
             if preferred_id is not None:
                 if chosen is None or chosen.get('row_id')!=r['id'] or chosen.get('period_id')!=pid:
                     raise ValueError('Preferred observation must match the exact row and fiscal period: '+str(preferred_id))
-                if not chosen.get('eligible',True) or chosen.get('status') not in ('actual','reported','derived_actual','estimate','forecast'):
+                if (not chosen.get('eligible',True) or not chosen.get('model_selection_eligible',True)
+                        or chosen.get('status') not in ('actual','reported','derived_actual','estimate','forecast')):
                     raise ValueError('Preferred observation is ineligible: '+str(preferred_id))
                 if chosen.get('start')!=p['start'] or chosen.get('end')!=p['end'] or chosen.get('unit')!=r['unit']:
                     raise ValueError('Preferred observation dates or units disagree: '+str(preferred_id))
@@ -1638,6 +2809,13 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
                     'not_applicable':'Forecast-only control has no reported historical equivalent',
                     'not_disclosed':'Not disclosed for this period'}
                 r['cells'][pid]=missing(status,reason.get(status,'Unresolved source or calculation error'))
+    for r in spec['rows']:
+        for year,item in r.get('estimated_historical',{}).items():
+            pid=by_year[int(year),'FY']
+            r['cells'][pid]=dict(value=item['amount'],status='estimated_historical',editable=False,required=False,
+                data_role='estimated_historical_baseline',calibration_eligible=False,reason=item['method'],
+                allocation_source_refs=copy.deepcopy(item['source_refs']))
+    spec['historical_allocations']=copy.deepcopy(config.get('historical_allocations',[]))
     before=Counter(c['status'] for r in spec['rows'] for c in r['cells'].values())
     # Promote exact period arithmetic to live formulas when its source cells match.
     for r in spec['rows']:
@@ -1669,6 +2847,13 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
         held_for_sale_cash='closing_cash - cash',
         total_debt='short_debt + long_debt',
         corporate_cash_cost='-corporate_utop - corporate_da',eps_basic='parent_profit / shares_basic')
+    cash_scope=cash_scope_policy(data)
+    if cash_scope is not None:
+        history_equations.pop('held_for_sale_cash',None)
+        for target in cash_scope['components']:
+            expression='closing_cash - cash'+''.join(
+                (' - ' if item['coefficient']==1 else ' + ')+item['role'] for item in cash_scope['components'] if item['role']!=target['role'])
+            history_equations[target['role']]=expression if target['coefficient']==1 else '-('+expression+')'
     # Supporting source roles are named economic concepts, never fixed source cells.
     for role in {dep for expr in history_equations.values() for dep,n in dependencies(expression_tree(expr)) if not n}:
         if role not in rows:
@@ -1725,8 +2910,10 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
                     if inactive_ratio(expr,{},pid):
                         rows[rid]['cells'][pid]=missing('not_applicable','Undefined historical 0/0 ratio; no observed ratio is asserted')
                         continue
-                    estimated=any(rows[dep]['cells'][pid].get('status') in ('estimate','forecast') for dep,n in deps)
-                    rows[rid]['cells'][pid]=formula(expr,status='estimate' if estimated else 'derived_actual',reason='Calculated from disclosed components on the selected period view')
+                    estimated=any(rows[dep]['cells'][pid].get('status') in ('estimate','estimated','estimated_historical','forecast') for dep,n in deps)
+                    status='estimated_historical' if estimated and p['end']<=actual_through else 'estimate' if estimated else 'derived_actual'
+                    rows[rid]['cells'][pid]=formula(expr,status=status,reason='Calculated from selected components; any allocation estimate remains an estimate.')
+                    if estimated:rows[rid]['cells'][pid].update(data_role='estimated_historical_baseline',calibration_eligible=False)
                     changed=True
             for r in spec['rows']:
                 if r['metric_type']!='stock' or not applicable(r,p) or available(r['id'],pid):continue
@@ -1816,7 +3003,8 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
     yearfrac=add_row('period_year_fraction','Period duration / fiscal year','shared',kind='assumption',note='Explicit time fraction for annual rates; not applied to year-on-year pricing or activity growth.')
     for p in periods:
         fy=pmap[by_year[p['fiscal_year'],'FY']]
-        yearfrac['cells'][p['id']]=dict(value=p['duration_days']/fy['duration_days'],status='actual',editable=False)
+        yearfrac['cells'][p['id']]=dict(value=p['duration_days']/fy['duration_days'],status='actual',editable=False,
+                                      data_role='structural_parameter',calibration_eligible=False)
     # Weighted shares are time averages, not additive flows. An H2 average can be
     # reconstructed from compatible full-year and H1 share-days; EPS then uses H2
     # parent earnings / H2 weighted shares. Published EPS is never subtracted.
@@ -1902,6 +3090,9 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
                         c=formula(expr,bindings,'forecast',ar.get('initialization',''));c['editable']=True
                 else:
                     c=dict(value=ar['inputs'][str(year)],status='forecast',editable=True,reason=ar.get('initialization',''))
+                    held_growth_ids={s['id']+'_'+suffix for s in data['segments'] for suffix in ('pricing','rig','organic')}
+                    if rid in held_growth_ids and rid not in overrides and available(rid,base_pid):
+                        c['initialization_anchor_periods']=[base_pid]
                 # Monetary flow policies are annual amounts allocated explicitly
                 # by period duration. Stock assumptions and prices are not divided.
                 if ar['unit']==data['currency']+'m' and rid not in stocks:
@@ -1921,7 +3112,7 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
                 denominator=base_pid
                 prior_base=by_year.get((year-1,'FY'))
                 if prior and available_or_planned(key+'_sales',prior) and available_or_planned(key+'_sales',prior_base):
-                    season['cells'][pid]=formula('part / whole',{'part':dict(row_id=key+'_sales',period_id=prior),
+                    season['cells'][pid]=formula('if_zero(whole, 0, part / whole)',{'part':dict(row_id=key+'_sales',period_id=prior),
                         'whole':dict(row_id=key+'_sales',period_id=prior_base)},'forecast','Observed prior-period sales weight; cost use is an explicit proxy')
                 else:
                     season['cells'][pid]=dict(value=yearfrac['cells'][pid]['value'],status='forecast',
@@ -1936,10 +3127,11 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
                         'annual':dict(row_id=target,period_id=prior_base),
                         'seasonality':dict(row_id=season['id'],period_id=pid)},'forecast','Explicit allocation proxy; undisclosed historical period remains N/D')
                 seed['cells'][pid]['editable']=True
-            if p['kind'] in row_leaves(rows[key+'_sales'],p):rows[key+'_sales']['cells'][pid]=formula(f'{key}_sales_seed * (1 + {key}_pricing + {key}_rig + {key}_fx)',status='forecast',reason='Year-on-year contributions applied to the same prior-year period; no division by four')
+            if p['kind'] in row_leaves(rows[key+'_sales'],p):rows[key+'_sales']['cells'][pid]=formula(f'{key}_sales_seed * (1 + {key}_organic + {key}_fx)',status='forecast',reason='Company-defined organic growth applied to the same prior-year period; no division by four')
             if statement_leaf(p):rows[key+'_cash_cost']['cells'][pid]=formula(f'{key}_cash_cost_seed * (1 + {key}_rig + {key}_cost_fx) * (1 + {key}_cost_inflation)',status='forecast')
             for suffix,driver in (('pricing_effect','pricing'),('rig_effect','rig'),('fx_effect','fx')):
                 if p['kind'] not in row_leaves(rows[key+'_sales'],p):continue
+                if driver=='pricing' and config.get('revenue_models',{}).get(key,{}).get('method')=='aggregate_organic':driver='organic'
                 rows[key+'_'+suffix]['cells'][pid]=formula(f'{key}_sales_seed * {key}_{driver}',status='forecast')
         if statement_leaf(p):
             for role,payout,profit in (('dividends_parent','dividend_payout','parent_profit'),('dividends_nci','nci_dividend_payout','nci_profit')):
@@ -2059,7 +3251,22 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
                     prior_parts=[by_year.get((pmap[part]['fiscal_year']-1,pmap[part]['kind'])) for part in parts]
                     if not all(q and available(key+'_sales',q) for q in prior_parts):continue
                     for i,q in enumerate(prior_parts):bindings[f'w{i}']=dict(row_id=key+'_sales',period_id=q)
-                    expr='('+' + '.join(f'x{i} * w{i}' for i in range(len(parts)))+') / ('+' + '.join(f'w{i}' for i in range(len(parts)))+')'
+                    # Keep the lazy zero guard on short references. Expanding
+                    # weighted arithmetic inside it duplicates missing/error
+                    # checks enough to exceed Excel's formula length limit.
+                    numerator=add_row(rid+'_weighted_amount',r['label']+' weighted monetary contribution',r['section'],
+                        unit=rows[key+'_sales']['unit'],metric_type='flow')
+                    denominator=add_row(rid+'_comparable_revenue',r['label']+' comparable revenue denominator',r['section'],
+                        unit=rows[key+'_sales']['unit'],metric_type='flow')
+                    for support in (numerator,denominator):
+                        support['layout']='assumption_support';support['assumption_support']=True
+                    numerator['cells'][pid]=formula(' + '.join(f'x{i} * w{i}' for i in range(len(parts))),bindings,'forecast',
+                        'Growth contribution weighted by compatible prior-period revenue; read-only aggregation support.')
+                    denominator['cells'][pid]=formula(' + '.join(f'w{i}' for i in range(len(parts))),bindings,'forecast',
+                        'Comparable prior-period revenue; zero for a fully exited business.')
+                    bindings={'amount':dict(row_id=numerator['id'],period_id=pid),
+                              'base':dict(row_id=denominator['id'],period_id=pid)}
+                    expr='if_zero(base, 0, amount / base)'
                 else:
                     # Driver summaries are duration-weighted displays, never a
                     # second set of editable assumptions or annual forecast inputs.
@@ -2158,6 +3365,11 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
             cash_translation='cash_fx_assumption',exposure_weights={},closing_rates={},
             warning='No quantified exposure inferred from geography; reported-currency historical amounts are not translated again.')
     apply_financial_contracts(spec,data)
+    spec['revenue_models']=copy.deepcopy(config.get('revenue_models',{}))
+    if fx_source is not None:
+        from .fx import apply_fx_accounting_contracts
+        apply_fx_accounting_contracts(spec,data,fx_source)
+    apply_cash_scope_contract(spec,data)
     rows={r['id']:r for r in spec['rows']}
     # Headers summarize mixed disclosure coverage; detailed status remains per cell.
     for p in periods:
@@ -2174,12 +3386,28 @@ def build_periodic_spec(data, forecast_years=5, fx_source=None):
     spec['policies'].update(periods='Flows aggregate; stocks use closing dates; shares use duration weights; ratios recompute. Published historical quarter growth is read directly.',
         annual_rates='Annual interest/depreciation/yields use period_year_fraction; year-on-year growth contributions do not.',
         seasonality='Editable prior-period revenue weights; temporary disclosed calendar-day or revenue-weighted cost allocation where quarter cost history is not reported.',
-        assumptions='Assumptions is authoritative. Model driver boxes are linked displays; historical calibration may feed forecast inputs, but forecast results cannot feed their own assumptions.')
+        assumptions='Backend inputs are authoritative. Excel Assumptions and Model boxes project the same controls; edits to Excel do not modify saved backend inputs.')
     spec['gaps']=[g for g in spec['gaps'] if 'next year' not in g and 'Prior years in current-basis' not in g]
     spec['gaps']+=list(config.get('limitations',[]))
     scope_change=data.get('schedule_anchor_policy',{}).get('scope_change',{})
     if scope_change.get('text'):
         spec['gaps'].append('Reported subsequent scope context; compare the dated scope-event calculations and unresolved closing-accounting disclosures: '+scope_change['text'])
+    from .periods import assumption_contract
+    # Published rounded contributions may differ from reported organic growth.
+    # Preserve all facts and expose the difference rather than rewriting a source.
+    for segment in data['segments']:
+        entity=segment['id']
+        if config.get('revenue_models',{}).get(entity,{}).get('method')=='aggregate_organic':continue
+        rr=dict(id=entity+'_reported_growth_rounding',label='Reported organic growth less rounded pricing and RIG',
+            section='segment_'+entity,unit='ratio',kind='calculated',metric_type='ratio',cells={},
+            note='Published rounding reconciliation; forecast organic growth remains the exact sum of assumed contributions.')
+        for p in periods:
+            cells=[rows[entity+'_'+k]['cells'].get(p['id'],{}) for k in ('organic','pricing','rig')]
+            if all(c.get('value') is not None or c.get('expression') for c in cells):
+                rr['cells'][p['id']]=formula(f'{entity}_organic - {entity}_pricing - {entity}_rig',status='derived_actual' if all(c.get('status') in ('actual','reported','derived_actual') for c in cells) else 'forecast')
+            else:rr['cells'][p['id']]=missing()
+        spec['rows'].append(rr)
+    spec['input_contract']=assumption_contract(spec)
     return spec
 
 
@@ -2210,14 +3438,15 @@ def periodic_sensitivities(spec, values):
         if funding:
             checks.append(check('period_sensitivity',name+':funding','WARNING','Stress scenario requires additional financing; no cash floor or automatic borrowing applied. '+json.dumps(funding)))
         checks.append(check('period_sensitivity',name+':integrity','FAIL' if failures else 'PASS','Financial identities remain valid' if not failures else json.dumps(failures[:5])))
-    primary_cases=[('pricing',segment+'_pricing'),('inventory','inventory_ratio'),('capex','capex_ppe_ratio'),('borrowing','borrowing_input')]
+    aggregate_organic=spec.get('revenue_models',{}).get(segment,{}).get('method')=='aggregate_organic'
+    primary_cases=[('organic' if aggregate_organic else 'pricing',segment+('_organic' if aggregate_organic else '_pricing')),('inventory','inventory_ratio'),('capex','capex_ppe_ratio'),('borrowing','borrowing_input')]
     if not spec.get('financial_contracts'):primary_cases.insert(1,('cost',segment+'_cost_inflation'))
     for name,driver in primary_cases:
         periods=eligible(driver)
         if not periods:
             checks.append(check('period_sensitivity',name,'MISSING','No active input at the supported cadence'));continue
         pid=periods[0];second=periods[1] if len(periods)>1 else None;fraction=values['period_year_fraction'][pid]
-        if name=='pricing':
+        if name in ('pricing','organic'):
             fx_factor=values.get(segment+'_revenue_fx_adjusted',{}).get(pid,0) or 0
             convention=spec.get('fx_interfaces',{}).get('exposures',{}).get(segment,{}).get('revenue_bridge')
             amount=values.get(segment+'_organic_comparable_sales',values[segment+'_sales_seed'])[pid]*.01*(1+fx_factor if convention=='translation_of_constant_currency' else 1)
@@ -2227,14 +3456,16 @@ def periodic_sensitivities(spec, values):
             amount=values[segment+'_cash_cost_seed'][pid]*((1+activity)*(1+fx) if spec.get('fx_interfaces',{}).get('exposures') else 1+activity+fx)*.01
             case(name,driver,pid,.01,[('utop',pid,-amount)])
         elif name=='inventory':
-            amount=-values['cogs'][pid]/fraction*.01
+            amount=-values.get('closing_operating_cogs_base',values.get('operating_cogs_base',values['cogs']))[pid]/fraction*.01
             case(name,driver,pid,.01,[('inventories',stock(pid),amount),('cfo',pid,-amount)])
         elif name=='capex':
             amount=values['sales'][pid]*.01;effects=[('owned_ppe',stock(pid),amount),('cfi',pid,-amount),('da',pid,0)]
             if second:effects.append(('da',second,amount*values['owned_depreciation_rate'][second]*values['period_year_fraction'][second]))
             case(name,driver,pid,.01,effects)
         else:
-            effects=[('total_debt',stock(pid),100),('closing_cash',stock(pid),100),('debt_interest',pid,0)]
+            interest=100*(1-values.get('borrowing_elapsed_fraction',{}).get(pid,1))*values['borrowing_rate'][pid]*fraction
+            tax=values.get('effective_tax_rate_policy',values['effective_tax_rate'])[pid];cash_tax=values['cash_tax_ratio'][pid];current_share=1-values.get('deferred_tax_share',{}).get(pid,0)
+            effects=[('total_debt',stock(pid),100),('closing_cash',stock(pid),100-interest*(1-tax*cash_tax*current_share)),('debt_interest',pid,interest)]
             if second:effects.append(('debt_interest',second,100*values['borrowing_rate'][second]*values['period_year_fraction'][second]))
             case(name,driver,pid,100,effects)
     if spec.get('fx_interfaces',{}).get('exposures'):
@@ -2258,14 +3489,27 @@ def periodic_sensitivities(spec, values):
         pools=spec['financial_contracts']['cost_pools']
         marketing=next((p for p in pools if p['id']=='marketing'),next(p for p in pools if p['destination']=='marketing_admin'))
         production=next(p for p in pools if p['destination']=='cogs')
-        for name,pool,suffix,bump in [('marketing_budget',marketing,'budget_change',100),('production_unit_cost',production,'unit_cost_change',.01)]:
+        marketing_suffix={'budget_growth':'spending_change','absolute_budget':'budget_amount'}.get(marketing.get('method'),'budget_change')
+        for name,pool,suffix,bump in [('marketing_budget',marketing,marketing_suffix,.01 if marketing_suffix=='spending_change' else 100),('production_unit_cost',production,'unit_cost_change',.01)]:
             rid=segment+'_pool_'+pool['id'];driver=rid+'_'+suffix;targets=eligible(driver)
             if not targets:continue
-            pid=targets[0];fx=(1+values[rid+'_transaction_fx'][pid])*(1+values[rid+'_translation_fx'][pid])
-            amount=bump*fx*values[segment+'_scope_activity_factor'][pid] if suffix=='budget_change' else values[rid+'_activity_base'][pid]*(1+values[rid+'_activity_change'][pid]*values[rid+'_elasticity'][pid]*values[rid+'_variable_share'][pid])*(1+values[rid+'_spending_change'][pid])*bump*fx
-            tax=values['effective_tax_rate'][pid];current_share=1-values.get('deferred_tax_share',{}).get(pid,0)
+            pid=targets[0];fx=(1+(0 if pool.get('input_cost_includes_transaction_fx') else values[rid+'_transaction_fx'][pid]))*(1+values[rid+'_translation_fx'][pid])
+            scope=values[segment+'_scope_activity_factor'][pid]
+            base=values[rid+'_activity_base'][pid]-values[rid+'_sbc_seed'][pid]*scope
+            amount=bump*fx*scope if suffix in ('budget_change','budget_amount') else base*bump*fx*(1 if suffix=='spending_change' else 1+values[rid+'_activity_change'][pid]*values[rid+'_effective_activity_sensitivity'][pid])
+            tax=values.get('effective_tax_rate_policy',values['effective_tax_rate'])[pid];current_share=1-values.get('deferred_tax_share',{}).get(pid,0)
             cash_tax=values['cash_tax_ratio'][pid];cash=-amount*(1-tax*current_share*cash_tax)
-            if pool['destination']=='cogs':cash+=amount/(1+values[rid+'_translation_fx'][pid])/values['period_year_fraction'][pid]*(values['payables_ratio'][pid]-values['inventory_ratio'][pid])
+            if pool['destination']=='cogs':
+                closing_expense=amount/(1+values[rid+'_translation_fx'][pid])
+                closing_expense*=1+(values.get(segment+'_closing_scope_correction_factor',{}).get(pid) or 0)
+                if suffix=='unit_cost_change':
+                    for event in spec.get('scope_event_audit',[]):
+                        if event.get('entity_id')!=segment or event.get('entity_scope_fraction') is not None:continue
+                        control='scope_'+event['id']+'_'+pool['id']+'_closing_cost_correction_run_rate'
+                        extra=values.get(control,{}).get(pid)
+                        if extra is not None and extra<0:
+                            closing_expense+=extra*(1+values[rid+'_activity_change'][pid]*values[rid+'_effective_activity_sensitivity'][pid])*bump*(1+(0 if pool.get('input_cost_includes_transaction_fx') else values[rid+'_transaction_fx'][pid]))
+                cash+=closing_expense/values['period_year_fraction'][pid]*(values['payables_ratio'][pid]-values['inventory_ratio'][pid])
             case(name,driver,pid,bump,[('operating_profit',pid,-amount),('cfo',pid,cash)])
         fx_candidates=[(r['id'],r['id'][:-len('_translation_multiplier')]) for r in spec['rows'] if r['id'].endswith('_translation_multiplier')]
         for driver,rid in fx_candidates:
@@ -2373,9 +3617,40 @@ REVIEW_SCHEMA=_object(findings=_array(_object(severity=_enum(('error','warning')
     source_references=_array(TEXT))),summary=TEXT)
 
 
+def freeze_model_sources(data, archive, source_folder, *, previous=None, outputs=None):
+    """Freeze originals, retaining verified historical files removed from the live archive.
+
+    A changed live original is never replaced by an old copy. Missing originals
+    may use an identical source from a verified parent; this is evidence reuse,
+    not a company-specific input migration.
+    """
+    from .evidence import _local_file
+    frozen=[];reused=[]
+    prior_sources={s['id']:s for s in (previous or {}).get('sources',[])}
+    descriptors=data['sources'].values() if isinstance(data['sources'],dict) else data['sources']
+    for source in descriptors:
+        try:
+            raw=_local_file(archive,source['local_path']).read_bytes()
+        except FileNotFoundError:
+            prior=prior_sources.get(source['id'])
+            if not previous or not previous.get('_reuse_verified') or not outputs or not prior or prior.get('sha256')!=source.get('sha256'):
+                raise ValueError('Original is absent and no identical verified parent source is available: '+source['local_path'])
+            prior_path=Path(prior['path']).resolve()
+            raw=_local_file(Path(outputs).resolve(),str(prior_path.relative_to(Path(outputs).resolve()))).read_bytes()
+            reused.append(dict(source_id=source['id'],local_path=source['local_path'],
+                parent_path=str(prior_path),sha256=source['sha256'],reason='Original absent from current archive; verified frozen original retained'))
+        if hashlib.sha256(raw).hexdigest()!=source['sha256']:
+            raise ValueError('Source changed before freezing: '+source['local_path'])
+        target=source_folder/(source['id']+Path(source['local_path']).suffix)
+        target.write_bytes(raw)
+        frozen.append(dict(source,path=str(target)))
+    return frozen,reused
+
+
 def construct_integrated(root, company, archive, inputs_file, *, reference_workbook=None,
         budget_usd=20, forecast_years=5, recalculate=True, progress=None, provider=None, escalation_file=None,
-        fx_file=None, fx_database=None, resume=None, as_of=None, historical_vintage=False):
+        fx_file=None, fx_database=None, resume=None, as_of=None, historical_vintage=False,
+        include_valuation=False, valuation_date=None, valuation_inputs=None):
     """Resume a sourced company specification and construct its complete model.
 
     Inputs are generated company research data, not a user-filled forecast. Source
@@ -2386,6 +3661,9 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
     data=json.loads(Path(inputs_file).read_text(encoding='utf-8'))
     data.setdefault('model_configuration',{})['as_of']=as_of or data.get('model_configuration',{}).get('as_of') or datetime.now(timezone.utc).date().isoformat()
     data['model_configuration']['historical_vintage']=bool(historical_vintage)
+    valuation_configuration=dict(enabled=bool(include_valuation),
+        date=(valuation_date or data['model_configuration']['as_of']) if include_valuation else None,
+        inputs_sha256=hashlib.sha256(Path(valuation_inputs).read_bytes()).hexdigest() if include_valuation and valuation_inputs else None)
     if not data.get('fiscal_calendar'):
         raise ValueError('Construction requires the company fiscal calendar; annual reporters use statement_forecast_frequency=annual through the same period engine')
     periodic=True
@@ -2412,7 +3690,7 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
     if (root/'pyproject.toml').is_file():
         import tomllib
         defaults=tomllib.loads((root/'pyproject.toml').read_text(encoding='utf-8')).get('tool',{}).get('research-platform',{})
-    with _initiation_lock(outputs):
+    with _initiation_lock(outputs,scope=company_key(company)):
         ledger=BudgetLedger(ledger_path(outputs,company),company,budget_usd)
         prior=[]
         for file in outputs.glob('construct_*/record.json'):
@@ -2424,7 +3702,7 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
         cache_key=integrated_source_cache_key(data,inventory,runtime)
         configuration=dict(company=company,sources=str(archive),manifest=inventory['manifest_sha256'],
             provider=provider.metadata(),mode='integrated_periodic_v2' if periodic else 'integrated_v1',input_hash=digest(dict(data=data,fx=fx_identity)) if fx_identity else digest(data),forecast_years=forecast_years,
-            runtime=runtime,source_cache_key=cache_key,
+            runtime=runtime,source_cache_key=cache_key,valuation=valuation_configuration,
             limits=dict(usd=budget_usd,calls=None,repairs=2,retries=0,generated_tokens=None),escalations=escalations,
             review_policy=dict(cheap_repairs=data['model_configuration'].get('cheap_review_repairs',defaults.get('cheap-review-repairs',1))))
         if previous and continuation_recovery is None and compatible_integrated_result(previous,configuration,runtime,cache_key):
@@ -2440,18 +3718,12 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
             if progress:progress('Explicit continuation from verified ancestor '+previous['directory']+'; excluded newer artifacts remain preserved and all charges remain in the cumulative ledger.')
         journal.artifact('inventory.json',inventory);journal.artifact('company_model_inputs.json',data)
         journal.artifact('reservation_recovery.json',recovery)
-        from .evidence import _local_file
         source_folder=directory/'sources';source_folder.mkdir()
-        frozen=[]
-        descriptors=data['sources'].values() if isinstance(data['sources'],dict) else data['sources']
-        for source in descriptors:
-            raw=_local_file(archive,source['local_path']).read_bytes()
-            if hashlib.sha256(raw).hexdigest()!=source['sha256']:
-                raise ValueError('Source changed before freezing: '+source['local_path'])
-            target=source_folder/(source['id']+Path(source['local_path']).suffix)
-            target.write_bytes(raw)
-            frozen.append(dict(source,path=str(target)))
+        frozen,reused_originals=freeze_model_sources(data,archive,source_folder,previous=previous,outputs=outputs)
         journal.state['sources']=frozen
+        journal.artifact('source_freeze_audit.json',dict(reused_missing_originals=reused_originals,
+            policy='Current archive originals must match their hashes. Only absent originals may reuse verified parent bytes.'))
+        verification_data=dict(data,sources={s['id']:dict(s,local_path=Path(s['path']).name) for s in frozen})
         if fx_snapshot:
             journal.artifact('fx_snapshot.json',fx_snapshot)
             configuration['fx_database']=str(Path(fx_database).resolve())
@@ -2470,15 +3742,15 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
                 architecture=['Shared assumptions','Operating segment blocks','Corporate consolidation','Group income statement',
                     'Cash flow','Balance sheet','Working capital','Asset and financing schedules'],
                 conventions='Dark headers; pink historical pulls; inline yellow assumption boxes; hidden IDs; live formulas and checks'))
-        journal.artifact('code_snapshot.json',{name:Path(__file__).with_name(name).read_text(encoding='utf-8') for name in ('integrated.py','construction.py','model_excel.py','periods.py','fx.py','fx_store.py','ibkr.py','budget.py','ai.py','evidence.py')})
+        journal.artifact('code_snapshot.json',{name:Path(__file__).with_name(name).read_text(encoding='utf-8') for name in runtime['code']})
         if progress:progress('Cumulative budget: '+json.dumps(ledger.summary()))
         try:
             from .evidence import verify_model_input_sources
             source_checks=cached_integrated_source_checks(previous,cache_key) if previous else None
-            if source_checks is None:source_checks=verify_model_input_sources(data,archive)
+            if source_checks is None:source_checks=verify_model_input_sources(verification_data,source_folder)
             elif progress:progress('Reused verified source checks for identical inputs, originals and parser code.')
             from .workflow import freshness_checks, model_financial_completeness
-            source_checks+=freshness_checks(data,archive,historical_vintage=historical_vintage)
+            source_checks+=freshness_checks(verification_data,source_folder,historical_vintage=historical_vintage)
             journal.artifact('source_validation.json',source_checks)
             if any(c['status']=='FAIL' for c in source_checks):
                 raise ValueError('Source validation has discrepancies; inspect source_validation.json before model acceptance')
@@ -2551,6 +3823,7 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
                         asset_scope=asset_scope_context(data) if stage=='integrated_schedules' else [],
                         forecast_horizon=spec.get('forecast_horizon'),frequency_policy=spec.get('frequency_policy'),
                         scope_events=spec.get('scope_event_audit',[]),
+                        research_limitations=data.get('model_configuration',{}).get('limitations',[]),
                         complete_forecast_graph=[dict(id=r['id'],unit=r['unit'],kind=r['kind'],period_cells=review_cells(r)) for r in spec['rows']],
                         source_controls=data.get('independent_controls',[]),evidence=[dict(e,unit_id=e.get('unit_id','sheet:'+e.get('sheet',''))) for e in data.get('review_evidence',{}).get(evidence_key,[])]),REVIEW_SCHEMA,repair_context=repair_review_context)
                 for finding in review['findings']:
@@ -2564,9 +3837,15 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
                     review_scope='AI reviews target this final causal period graph; deterministic checks independently test its stated financial contracts.'))
                 journal.artifact('model_specification.json',spec);journal.artifact('forecast.json',values)
                 journal.artifact('drivers.json',[r for r in spec['rows'] if r['kind']=='assumption'])
+            valuation=None
+            if include_valuation:
+                from .workflow import valuation_snapshot
+                valuation=valuation_snapshot(spec,values,data,valuation_date=valuation_configuration['date'],inputs_file=valuation_inputs)
+                for name,value in valuation['artifacts'].items():journal.artifact(name,value)
+                checks.extend(valuation['checks'])
             status='complete_provisional' if not any(c['status'] in ('FAIL','MISSING') for c in checks) else 'incomplete_model'
             journal.artifact('validation.json',dict(status=status,financial_completeness=spec['financial_completeness'],checks=checks,gaps=spec['gaps']))
-            inspection=export_integrated(directory/'model.xlsx',spec,values,checks)
+            inspection=export_integrated(directory/'model.xlsx',spec,values,checks,**({'valuation':valuation['result']} if valuation else {}))
             if recalculate:
                 inspection['recalculation']=recalculate_workbook(directory/'model.xlsx',inspection)
                 if inspection['recalculation'].get('status')=='passed':
@@ -2595,7 +3874,7 @@ def integrated_runtime_fingerprint():
     """Exact local code/parser identity for reuse, without reading credentials."""
     from importlib.metadata import version, PackageNotFoundError
     import platform
-    names=('integrated.py','construction.py','model_excel.py','periods.py','fx.py','fx_store.py','ibkr.py','budget.py','ai.py','evidence.py','initiation.py','workflow.py')
+    names=('__main__.py','project.py','integrated.py','construction.py','model_excel.py','periods.py','fx.py','fx_store.py','ibkr.py','budget.py','ai.py','evidence.py','initiation.py','workflow.py','valuation.py')
     code={name:hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() for name in names}
     parsers={}
     for name in ('openpyxl','pypdf','xlrd'):
@@ -2674,7 +3953,7 @@ def verified_integrated_record(run, outputs):
     if not isinstance(calls,list):
         raise ValueError('Saved construction has no valid call journal')
     journal=run/'calls.jsonl'
-    saved_calls=[json.loads(line) for line in journal.read_text(encoding='utf-8').splitlines() if line.strip()] if journal.exists() else []
+    saved_calls=[json.loads(line) for line in journal.read_text(encoding='utf-8').split('\n') if line.strip()] if journal.exists() else []
     if saved_calls!=calls:
         raise ValueError('Saved calls.jsonl differs from record; response reuse is prohibited')
     seen=set()
@@ -2715,6 +3994,8 @@ def compatible_integrated_result(record, configuration, runtime, source_cache_ke
     old=record.get('configuration',{})
     required=('company','sources','manifest','provider','mode','input_hash','forecast_years')
     if any(key not in old or old[key]!=configuration.get(key) for key in required):
+        return False
+    if old.get('valuation')!=configuration.get('valuation'):
         return False
     if old.get('runtime')!=runtime or old.get('source_cache_key')!=source_cache_key:
         return False

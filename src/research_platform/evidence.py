@@ -30,12 +30,193 @@ from pypdf import PdfReader
 import xlrd
 
 
-MAX_BYTES = 25 * 1024 * 1024
+MAX_BYTES = 50 * 1024 * 1024
 MAX_UNITS = 3000
 FORMATS = {"dot_decimal", "comma_decimal"}
 LOCAL_CATEGORIES = {"visible_alpha", "financial_reports", "transcripts"}
 LOCAL_FORMATS = {".pdf": "pdf", ".xlsx": "xlsx", ".xls": "xls", ".html": "html", ".htm": "html",
                  ".txt": "txt", ".csv": "csv"}
+
+
+def date_phrase_matches(phrase, iso_date):
+    """Verify one explicit calendar date, without inventing a numeric-date locale.
+
+    Supports ISO, English/French month names and unambiguous numeric dates.
+    The caller separately verifies that the exact phrase occurs in the original.
+    Unsupported, ambiguous, invalid or multiple different dates return False.
+    """
+    import unicodedata
+    try:
+        target = date.fromisoformat(iso_date)
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(phrase, str):
+        return False
+    normalized = ''.join(c for c in unicodedata.normalize('NFKD', phrase.casefold())
+                         if not unicodedata.combining(c))
+    months = (
+        ('january', 'jan', 'janvier', 'janv'), ('february', 'feb', 'february', 'fevrier', 'fevr'),
+        ('march', 'mar', 'mars'), ('april', 'apr', 'avril', 'avr'), ('may', 'mai'),
+        ('june', 'jun', 'juin'), ('july', 'jul', 'juillet', 'juil'), ('august', 'aug', 'aout'),
+        ('september', 'sep', 'sept', 'septembre'), ('october', 'oct', 'octobre'),
+        ('november', 'nov', 'novembre'), ('december', 'dec', 'decembre'))
+    month_number = {name: index for index, names in enumerate(months, 1) for name in names}
+    month_pattern = '(?:' + '|'.join(sorted(month_number, key=len, reverse=True)) + ')'
+    candidates = []
+    for match in re.finditer(r'(?<!\d)(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?!\d)', normalized):
+        candidates.append(tuple(map(int, match.groups())))
+    for match in re.finditer(r'(?<!\d)(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})(?!\d)', normalized):
+        first, second, year = map(int, match.groups())
+        if first <= 12 and second <= 12 and first != second:
+            return False
+        candidates.append((year, second, first) if first > 12 else (year, first, second))
+    day_first = r'(?<!\w)(\d{1,2})(?:st|nd|rd|th|er)?\s+(' + month_pattern + r')\.?\s*,?\s*(\d{4})(?!\d)'
+    month_first = r'(?<!\w)(' + month_pattern + r')\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s*,?\s*(\d{4})(?!\d)'
+    for match in re.finditer(day_first, normalized):
+        day, month, year = match.groups()
+        candidates.append((int(year), month_number[month], int(day)))
+    for match in re.finditer(month_first, normalized):
+        month, day, year = match.groups()
+        candidates.append((int(year), month_number[month], int(day)))
+    try:
+        dates = {date(*parts) for parts in candidates}
+    except ValueError:
+        return False
+    return dates == {target}
+
+
+def official_html_link_metadata(payload, page_url):
+    """Read observed links and date-labelled HTML metadata within their cards.
+
+    This source-format adapter never infers a date from a filename, CSS class or
+    retrieval time. Exact raw attributes and native timestamp conventions remain
+    attached to immutable HTML/container identities.
+    """
+    from html.parser import HTMLParser
+    from datetime import datetime, timedelta, timezone
+    from urllib.parse import urljoin, urlsplit, urlunsplit
+    import hashlib
+    sha=hashlib.sha256(payload).hexdigest()
+    def identity(kind,*parts):return kind+'_'+hashlib.sha256((sha+'|'+ '|'.join(map(str,parts))).encode()).hexdigest()[:16]
+    def normalize(url):
+        p=urlsplit(url)
+        return urlunsplit(('https' if p.scheme.lower()=='http' else p.scheme.lower(),p.netloc.lower(),'' if p.path in ('','/') else p.path,p.query,''))
+    def interpret(raw):
+        if raw.startswith('java.util.GregorianCalendar['):
+            values={k:int(v) for k,v in re.findall(r'(?:\[|,)(time|YEAR|MONTH|DAY_OF_MONTH|HOUR_OF_DAY|MINUTE|SECOND|MILLISECOND|ZONE_OFFSET|DST_OFFSET)=(-?\d+)',raw)}
+            required={'time','YEAR','MONTH','DAY_OF_MONTH','ZONE_OFFSET','DST_OFFSET'}
+            if not required<=values.keys():return None
+            offset=values['ZONE_OFFSET']+values['DST_OFFSET'];zone=timezone(timedelta(milliseconds=offset))
+            moment=datetime.fromtimestamp(values['time']/1000,zone)
+            expected=(values['YEAR'],values['MONTH']+1,values['DAY_OF_MONTH'],values.get('HOUR_OF_DAY',moment.hour),values.get('MINUTE',moment.minute),values.get('SECOND',moment.second))
+            if (moment.year,moment.month,moment.day,moment.hour,moment.minute,moment.second)!=expected:return None
+            label=re.search(r'ZoneInfo\[id="([^"]+)"',raw)
+            return dict(date=moment.date().isoformat(),instant=moment.isoformat(),representation='java_gregorian_calendar',
+                native_unit='epoch_milliseconds',native_timezone=label.group(1) if label else None,utc_offset_milliseconds=offset,
+                epoch_milliseconds=values['time'],month_indexing='zero_based',interpretation='Python reconciled epoch milliseconds with explicit calendar fields and timezone offsets')
+        if re.fullmatch(r'\d{13}',raw):
+            moment=datetime.fromtimestamp(int(raw)/1000,timezone.utc)
+            return dict(date=moment.date().isoformat(),instant=moment.isoformat(),representation='date_labelled_epoch_milliseconds',
+                native_unit='epoch_milliseconds',native_timezone='UTC instant; display timezone not supplied',utc_offset_milliseconds=0,
+                epoch_milliseconds=int(raw),interpretation='Explicit date-labelled 13-digit epoch value; UTC calendar date, not an inferred local display date')
+        if re.fullmatch(r'\d{4}-\d{2}-\d{2}(?:[T ].*)?',raw):
+            if len(raw)==10:
+                day=date.fromisoformat(raw)
+                return dict(date=day.isoformat(),representation='iso_date',native_unit='calendar_date',native_timezone=None,
+                    interpretation='Explicit ISO calendar date; no time or timezone inferred')
+            moment=datetime.fromisoformat(raw.replace('Z','+00:00'))
+            return dict(date=moment.date().isoformat(),instant=moment.isoformat(),representation='iso_datetime',native_unit='datetime',
+                native_timezone=str(moment.tzinfo) if moment.tzinfo else None,interpretation='Explicit ISO date/time; native offset preserved')
+        return None
+    class Parser(HTMLParser):
+        void={'area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr'}
+        def __init__(self):super().__init__();self.nodes=[];self.stack=[]
+        def handle_starttag(self,tag,attrs):
+            node=dict(index=len(self.nodes),tag=tag,attributes=dict(attrs),children=[],parent=self.stack[-1] if self.stack else None)
+            self.nodes.append(node)
+            if self.stack:self.stack[-1]['children'].append(node)
+            if tag not in self.void:self.stack.append(node)
+        def handle_startendtag(self,tag,attrs):
+            self.handle_starttag(tag,attrs)
+            if tag not in self.void:self.handle_endtag(tag)
+        def handle_endtag(self,tag):
+            for index in range(len(self.stack)-1,-1,-1):
+                if self.stack[index]['tag']==tag:self.stack=self.stack[:index];break
+        def handle_data(self,data):
+            if self.stack:self.stack[-1]['children'].append(data)
+    parser=Parser();parser.feed(payload.decode('utf-8',errors='replace'))
+    def text(node):
+        if '_text' not in node:
+            node['_text']=('' if node['tag'] in ('script','style') else (node['attributes'].get('alt') or '') if node['tag']=='img'
+                else ' '.join(' '.join((text(child) if isinstance(child,dict) else child) for child in node['children']).split()))
+        return node['_text']
+    def ancestors(node):
+        while node is not None:
+            yield node;node=node['parent']
+    def inside(node,container):return any(parent is container for parent in ancestors(node))
+    anchors=[node for node in parser.nodes if node['tag']=='a' and node['attributes'].get('href')]
+    headings=[node for node in parser.nodes if node['tag'] in ('h1','h2','h3','h4','h5','h6')]
+    def card(node):
+        chain=list(ancestors(node))
+        article=next((item for item in chain if item['tag']=='article'),None)
+        if article is not None:return article
+        for item in chain:
+            if item['tag'] not in ('div','section','li','tr'):continue
+            if any(child['tag']=='article' and inside(child,item) for child in parser.nodes):continue
+            if any(inside(a,item) for a in anchors) and any(inside(h,item) for h in headings):return item
+        return None
+    date_attributes={'datetime','startdate','data-startdate','data-start-date','data-published-at','data-publication-date','data-publish-date','datepublished','publicationdate','publishedat'}
+    dated=[];rejected=[]
+    for node in parser.nodes:
+        for key,raw in node['attributes'].items():
+            if key not in date_attributes or not raw:continue
+            container=card(node)
+            if container is None:continue
+            try:parsed=interpret(raw)
+            except (ValueError,OverflowError,OSError):parsed=None
+            descriptor=dict(date_id=identity('date',node['index'],key),element_id=node['index'],tag=node['tag'],attribute=key,raw_value=raw,
+                container_id=identity('container',container['index']),page_url=page_url,sha256=sha)
+            if parsed:dated.append((node,container,dict(descriptor,**parsed)))
+            else:rejected.append(dict(descriptor,status='unsupported_or_inconsistent',interpretation='No calendar date inferred'))
+    for _,container,entry in dated:
+        if entry['representation']=='date_labelled_epoch_milliseconds':
+            explicit=[other for _,owner,other in dated if owner is container and other['representation']=='java_gregorian_calendar'
+                and other['epoch_milliseconds']==entry['epoch_milliseconds']]
+            if explicit and len({(other['date'],other['utc_offset_milliseconds']) for other in explicit})==1:
+                native=explicit[0]
+                entry.update(date=native['date'],instant=native['instant'],native_timezone=native['native_timezone'],
+                    utc_offset_milliseconds=native['utc_offset_milliseconds'],timezone_source_date_id=native['date_id'],
+                    interpretation='Epoch milliseconds reconciled to the identical instant and explicit native timezone in the same HTML card')
+        entry['eligible']=not any(item['container_id']==entry['container_id'] for item in rejected)
+    containers={}
+    def describe(container):
+        cid=identity('container',container['index'])
+        if cid not in containers:
+            attrs=container['attributes']
+            containers[cid]=dict(container_id=cid,element_id=container['index'],tag=container['tag'],attributes=dict(attrs),text=text(container),
+                headings=[text(h) for h in headings if inside(h,container)],
+                explicit_year_attributes={key:value for key,value in attrs.items() if 'year' in key and value and re.fullmatch(r'(?:19|20)\d{2}',value)},
+                page_url=page_url,sha256=sha)
+        return containers[cid]
+    link_context=[];links=[]
+    for anchor in anchors:
+        attrs=anchor['attributes'];url=urljoin(page_url,attrs['href'])
+        if urlsplit(url).scheme.lower() not in ('http','https'):continue
+        url=normalize(url)
+        if url not in links:links.append(url)
+        item=dict(url=url,label=text(anchor))
+        for source,target in [('title','title'),('aria-label','accessible_label'),('hreflang','language'),('type','mime_type'),('data-file-mimetype','mime_type'),('download','download')]:
+            if attrs.get(source):item[target]=attrs[source]
+        container=card(anchor)
+        if container is not None:
+            described=describe(container);item['container_id']=described['container_id']
+            # A shared page-level wrapper with unrelated event dates is not an
+            # evidence link. All source dates remain visible in the catalogue.
+            matches=[entry for _,owner,entry in dated if owner is container]
+            if matches and all(entry['eligible'] for entry in matches) and len({entry['date'] for entry in matches})==1:item['structured_date_ids']=[entry['date_id'] for entry in matches]
+        if item not in link_context:link_context.append(item)
+    for _,container,_ in dated:describe(container)
+    return dict(sha256=sha,links=links,link_context=link_context,containers=list(containers.values()),structured_dates=[entry for _,_,entry in dated],rejected_date_attributes=rejected)
 
 
 def _binary_format(payload: bytes):
@@ -96,11 +277,11 @@ def _local_file(root: Path, relative: str) -> Path:
 
 def _local_payload(path: Path) -> bytes:
     if not 0 < path.stat().st_size <= MAX_BYTES:
-        raise ValueError(f"Local source is empty or exceeds 25 MB: {path.name}")
+        raise ValueError(f"Local source is empty or exceeds {MAX_BYTES / (1024 * 1024):g} MiB: {path.name}")
     with path.open("rb") as source:
         payload = source.read(MAX_BYTES + 1)
     if not payload or len(payload) > MAX_BYTES:
-        raise ValueError(f"Local source is empty or exceeds 25 MB: {path.name}")
+        raise ValueError(f"Local source is empty or exceeds {MAX_BYTES / (1024 * 1024):g} MiB: {path.name}")
     return payload
 
 
@@ -149,12 +330,28 @@ def inventory_local_sources(root: Path) -> dict:
                 if relative in metadata:
                     raise ValueError(f"sources.csv repeats a filename: {relative}")
                 metadata[relative] = row
-    sources, members = [], []
+    def required_input(row):
+        return (any(row.get(key,'').casefold() in ('true','yes','1','required')
+                    for key in ('required_input','required_for_model','required'))
+                or row.get('source_role','').casefold().replace(' ','_')=='required_input')
+    sources, members, ancillary = [], [], []
     for child in sorted(root.iterdir(), key=lambda path: path.name.casefold()):
         if child.name == "sources.csv" or child.name.startswith(".") or child.name == "Thumbs.db":
             continue
         if child.is_symlink() or (hasattr(child, "is_junction") and child.is_junction()):
             raise ValueError("Local source archives must not contain symbolic links or junctions.")
+        if child.is_file():
+            relative=child.relative_to(root).as_posix();row=metadata.get(relative,{})
+            if required_input(row):
+                raise ValueError(f'Explicitly required source input cannot be excluded: {relative}; place supported originals in a source category folder.')
+            path=_local_file(root,relative)
+            with path.open('rb') as source_file:digest=hashlib.file_digest(source_file,'sha256').hexdigest()
+            supplied_hash=row.get('sha_256_hash') or row.get('sha256') or row.get('sha_256')
+            if supplied_hash and supplied_hash.lower() not in {'unknown','not_calculated','not calculated','n/a'} and supplied_hash.lower()!=digest:
+                raise ValueError(f'sources.csv hash disagrees with the actual file: {relative}')
+            ancillary.append(dict(local_path=relative,sha256=digest,bytes=path.stat().st_size,status='excluded_source_input',
+                reason='Archive-root ancillary file outside the declared financial-source folders; preserved in inventory, never parsed or supplied as financial evidence.',supplied_metadata=row))
+            continue
         if child.name not in LOCAL_CATEGORIES or not child.is_dir():
             raise ValueError(f"Place source files in visible_alpha/, financial_reports/ or transcripts/: {child.name}")
         for path in sorted(child.rglob("*"), key=lambda item: item.as_posix().casefold()):
@@ -211,10 +408,66 @@ def inventory_local_sources(root: Path) -> dict:
             members.append({"local_path": relative, "sha256": digest})
     if not sources:
         raise ValueError("No source documents found; place originals in the archive's visible_alpha/, financial_reports/ or transcripts/ folders.")
+    included={source['local_path'] for source in sources}
+    for relative,row in metadata.items():
+        if required_input(row) and relative not in included:
+            raise ValueError(f'Explicitly required source input is missing or unsupported: {relative}')
     manifest = {"members": members, "index_sha256": index_hash}
+    source_manifest_hash=hashlib.sha256(json.dumps(manifest,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    if ancillary:manifest['ancillary']=ancillary
     manifest_hash = hashlib.sha256(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    return {"root": str(root), "sources": sources, "manifest_sha256": manifest_hash,
-            "index_sha256": index_hash, "index_rows": index_rows}
+    result={"root": str(root), "sources": sources, "manifest_sha256": manifest_hash,
+            "source_manifest_sha256":source_manifest_hash,"ancillary":ancillary,"index_sha256": index_hash, "index_rows": index_rows}
+    result['source_input_sha256']=source_inventory_fingerprint(result)
+    return result
+
+
+def source_inventory_fingerprint(inventory):
+    """Hash financial originals and their metadata separately from ancillary files.
+
+    Legacy inventories can be compared without recreating or editing them.
+    Financial source, classification or metadata changes remain incompatible.
+    """
+    fields=('id','local_path','sha256','format','category','url','title','published_at',
+        'filename_publication_hint','supplied_metadata','dataset_role','dataset_role_origin')
+    originals=[{key:source.get(key) for key in fields} for source in inventory['sources']]
+    originals.sort(key=lambda source:source['local_path'])
+    return hashlib.sha256(json.dumps(originals,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+
+def saved_source_inventory_compatibility(record, current, outputs):
+    """Match a verified saved archive to known originals, including frozen ones.
+
+    Unchanged originals in its hashed inventory remain known even when they were
+    not selected for financial mapping. Additional current files are compatible
+    only if that exact source descriptor was already frozen in the saved run.
+    """
+    if not record.get('_reuse_verified'):raise ValueError('Saved source compatibility requires a verified construction record')
+    outputs=Path(outputs).resolve();expected=record.get('configuration',{}).get('manifest')
+    baseline=None;baseline_path=None
+    for path in outputs.glob('construct_*/inventory.json'):
+        try:
+            candidate=json.loads(path.read_text(encoding='utf-8'))
+            if candidate.get('manifest_sha256')!=expected:continue
+            owner=json.loads((path.parent/'record.json').read_text(encoding='utf-8'))
+            if owner.get('artifacts',{}).get('inventory.json')!=hashlib.sha256(path.read_bytes()).hexdigest():continue
+            baseline=candidate;baseline_path=str(path);break
+        except (OSError,ValueError,KeyError):continue
+    frozen=[source for source in record.get('sources',[]) if source.get('local_path') and
+        Path(source['local_path']).parts[0] in LOCAL_CATEGORIES]
+    known=(baseline or {}).get('sources',[])+frozen
+    fingerprints={source_inventory_fingerprint({'sources':[source]}) for source in known}
+    unmatched=[source['local_path'] for source in current['sources']
+        if source_inventory_fingerprint({'sources':[source]}) not in fingerprints]
+    current_paths={source['local_path'] for source in current['sources']}
+    frozen_ids={(source['local_path'],source['sha256']) for source in frozen}
+    withdrawn=[source for source in (baseline or {}).get('sources',[]) if source['local_path'] not in current_paths]
+    unavailable=[source['local_path'] for source in withdrawn if (source['local_path'],source['sha256']) not in frozen_ids]
+    return dict(compatible=not unmatched and not unavailable,baseline_inventory=baseline_path,
+        unmatched_current_originals=unmatched,withdrawn_without_frozen_original=unavailable,
+        retained_frozen_originals=[source['local_path'] for source in withdrawn if source['local_path'] not in unavailable],
+        ancillary=[dict(local_path=item['local_path'],sha256=item['sha256'],status=item['status']) for item in current.get('ancillary',[])],
+        method='Compare every current original and source metadata with the prior hashed inventory or verified frozen source. Missing previous originals require their preserved frozen bytes; new or changed originals remain incompatible.')
 
 
 def parse_number(value, number_format="dot_decimal"):
@@ -333,7 +586,7 @@ def download(url):
         final_url = _public_url(response.url)
         payload = response.read(MAX_BYTES + 1)
         if len(payload) > MAX_BYTES:
-            raise ValueError("Source exceeds the 25 MB download limit.")
+            raise ValueError(f"Source exceeds the {MAX_BYTES / (1024 * 1024):g} MiB download limit: {final_url}")
         return payload, final_url, response.headers.get_content_type()
 
 
@@ -368,6 +621,19 @@ def _units(payload, file_format):
         if len(pdf.pages) > 500:
             raise ValueError("PDF exceeds the 500-page source limit.")
         for index, page in enumerate(pdf.pages, 1):
+            if "/Contents" not in page:
+                resources=page.get("/Resources");annotations=page.get("/Annots")
+                resources=resources.get_object() if hasattr(resources,"get_object") else resources
+                annotations=annotations.get_object() if hasattr(annotations,"get_object") else annotations
+                if resources or annotations:
+                    raise ValueError(f"PDF page {index} has no /Contents but has resources or annotations; it cannot be classified as an empty page.")
+                # A genuine blank page has no content stream. Layout extraction
+                # in some pypdf versions raises KeyError instead of returning an
+                # empty string. Preserve the page's identity and explicit state.
+                yield {"unit_id":f"page:{index}","text":"","numbers":[],"warnings":[],
+                       "extraction_status":"verified_empty_page",
+                       "empty_page_reason":"No content stream, resources or annotations; original page numbering preserved."}
+                continue
             messages = []
             capture = logging.Handler()
             capture.emit = lambda record: messages.append(record.getMessage())
@@ -375,13 +641,18 @@ def _units(payload, file_format):
             logger.addHandler(capture)
             try:
                 text = page.extract_text(extraction_mode="layout") or ""
+            except Exception as exc:
+                raise ValueError(f"PDF page {index} layout text extraction failed: {type(exc).__name__}: {exc}") from exc
             finally:
                 logger.removeHandler(capture)
             yield {"unit_id": f"page:{index}", "text": text, "numbers": _tokens(text), "warnings": messages}
             if messages:
                 # Rotated headings can be omitted by layout extraction. Give the
                 # reviewer the complementary plain extraction instead of hiding it.
-                plain = page.extract_text(extraction_mode="plain") or ""
+                try:
+                    plain = page.extract_text(extraction_mode="plain") or ""
+                except Exception as exc:
+                    raise ValueError(f"PDF page {index} alternative text extraction failed: {type(exc).__name__}: {exc}") from exc
                 yield {"unit_id": f"page:{index}:plain", "text": plain, "numbers": _tokens(plain),
                        "warnings": ["Alternative text order; verify column meanings against the original page."]}
     elif file_format == "xls":
@@ -556,6 +827,51 @@ def _vendor_period(value):
     slot = (match["part"].upper() + match["n"] if match["part"] else
             "9M" if match["ytd"] else "FY")
     return {"year": int(match["year"]), "slot": slot, "estimate": bool(match["estimate"])}
+
+
+def _vendor_reference_period(period, fiscal_periods=None):
+    """Adapt construction's explicit periods to the vendor eligibility contract.
+
+    Historical initiation already supplies that contract and is unchanged.
+    Construction calendars remain authoritative: an interim obtains its annual
+    boundaries only from the supplied matching FY, never from a calendar guess.
+    This temporary view changes neither model periods nor source coordinates.
+    """
+    slot = period.get("kind")
+    if slot not in {"FY", "Q1", "Q2", "Q3", "Q4", "H1", "H2", "9M"}:
+        return period
+    year = period.get("fiscal_year")
+    if isinstance(year, bool) or not isinstance(year, int):
+        raise ValueError("Construction vendor validation requires an explicit integer fiscal_year.")
+    if "year" in period and period["year"] != year:
+        raise ValueError("Conflicting fiscal-year fields in the historical period.")
+    def check_named_slot(item):
+        identifier = str(item.get("id", ""))
+        if re.fullmatch(r"\d{4}-(?:FY|Q[1-4]|H[12]|9M)", identifier):
+            if identifier != str(year) + "-" + item["kind"]:
+                raise ValueError("Canonical historical period ID conflicts with its fiscal year or slot.")
+    check_named_slot(period)
+    annuals = [item for item in (fiscal_periods or [])
+               if item.get("fiscal_year") == year and item.get("kind") == "FY"]
+    if slot == "FY":
+        annuals = annuals + [period]
+    if not annuals:
+        raise ValueError("Vendor interim validation requires the supplied matching FY fiscal-year anchor.")
+    for annual in annuals:
+        check_named_slot(annual)
+    boundaries = {(item.get("start"), item.get("end")) for item in annuals}
+    if len(boundaries) != 1:
+        raise ValueError("Conflicting matching FY fiscal-year anchors for vendor validation.")
+    fiscal_start, fiscal_end = next(iter(boundaries))
+    if not fiscal_start or not fiscal_end:
+        raise ValueError("Vendor validation requires explicit annual fiscal-year dates.")
+    for key, expected in (("fiscal_year_start", fiscal_start), ("fiscal_year_end", fiscal_end)):
+        if key in period and period[key] != expected:
+            raise ValueError("Explicit vendor fiscal-year dates conflict with the matching FY anchor.")
+    return dict(period, year=year, id=str(year) + ("" if slot == "FY" else "-" + slot),
+                kind="annual" if slot == "FY" else "quarter" if slot.startswith("Q") else
+                     "half_year" if slot.startswith("H") else "year_to_date",
+                fiscal_year_start=fiscal_start, fiscal_year_end=fiscal_end)
 
 
 def _vendor_profile(payload, file_format, units, dataset_role=None):
@@ -745,7 +1061,7 @@ class SourceStore:
             raise ValueError("The run reached its 12-source limit.")
         payload, final_url, content_type = self.fetcher(spec["url"])
         if not isinstance(payload, bytes) or not payload or len(payload) > MAX_BYTES:
-            raise ValueError("Source is empty, invalid or exceeds 25 MB.")
+            raise ValueError(f"Source is empty, invalid or exceeds {MAX_BYTES / (1024 * 1024):g} MiB.")
         if payload.startswith(b"%PDF"):
             file_format = "pdf"
         elif payload.startswith(b"PK\x03\x04"):
@@ -852,7 +1168,7 @@ class SourceStore:
         if not path.is_file() or path.name != f"{source_id}.{file_format}":
             raise ValueError("Archived source path does not match its ID and format.")
         if not 0 < path.stat().st_size <= MAX_BYTES:
-            raise ValueError("Archived source is empty or exceeds 25 MB.")
+            raise ValueError(f"Archived source is empty or exceeds {MAX_BYTES / (1024 * 1024):g} MiB: {path.name}")
         with path.open("rb") as original:
             payload = original.read(MAX_BYTES + 1)
         if not payload or len(payload) > MAX_BYTES or hashlib.sha256(payload).hexdigest() != descriptor["sha256"]:
@@ -1015,7 +1331,7 @@ class SourceStore:
                 result.extend(copy.deepcopy(unit) for unit in self._units[source_id].values())
         return result
 
-    def validate_historical_reference(self, reference, period):
+    def validate_historical_reference(self, reference, period, *, fiscal_periods=None):
         """Reject vendor estimates, standardized/helper rows and wrong periods.
 
         This is eligibility, not source acceptance. Independent company-source
@@ -1046,6 +1362,7 @@ class SourceStore:
             raise ValueError("Consensus, estimate or unknown vendor columns cannot be historical observations.")
         if str(number["raw"]).strip() in {"-", "\u2013", "\u2014"}:
             raise ValueError("A vendor dash is missing/ambiguous evidence, not a verified historical zero.")
+        period = _vendor_reference_period(period, fiscal_periods)
         if period.get("year") != header["year"]:
             raise ValueError("Vendor cell fiscal year does not match the historical period.")
         slot = header["slot"]

@@ -3195,6 +3195,67 @@ class LocalSourceTests(unittest.TestCase):
         self.assertEqual(indexed["sources"][0]["supplied_metadata"]["reporting_basis"], "restated")
         self.assertEqual(indexed["sources"][0]["url"], "https://example.com/results")
 
+    def test_root_ancillary_files_are_hashed_but_never_financial_inputs(self):
+        from research_platform.evidence import source_inventory_fingerprint
+        self.report();before=self.inventory()
+        ancillary=self.archive/'research_context.json';ancillary.write_text('{"note":"Synthetic context, not a company observation"}',encoding='utf-8')
+        (self.archive/'factor_reference.pdf').write_bytes(b'%PDF synthetic ancillary reference')
+        after=self.inventory()
+        self.assertEqual(after['sources'],before['sources'])
+        self.assertEqual(after['source_manifest_sha256'],before['manifest_sha256'])
+        self.assertEqual(source_inventory_fingerprint(before),after['source_input_sha256'])
+        self.assertNotEqual(after['manifest_sha256'],before['manifest_sha256'])
+        self.assertEqual(len(after['ancillary']),2)
+        self.assertTrue(all(item['status']=='excluded_source_input' for item in after['ancillary']))
+        entry=next(item for item in after['ancillary'] if item['local_path']==ancillary.name)
+        self.assertEqual(entry['sha256'],hashlib.sha256(ancillary.read_bytes()).hexdigest())
+        ancillary.write_text('{"note":"Changed ancillary content"}',encoding='utf-8')
+        changed=self.inventory()
+        self.assertNotEqual(changed['manifest_sha256'],after['manifest_sha256'])
+        self.assertEqual(changed['source_input_sha256'],after['source_input_sha256'])
+
+    def test_explicit_required_root_or_missing_input_cannot_be_silently_excluded(self):
+        self.report();(self.archive/'required.json').write_text('{}',encoding='utf-8')
+        (self.archive/'sources.csv').write_text('relative_filename,required_input\nrequired.json,true\n',encoding='utf-8')
+        with self.assertRaisesRegex(ValueError,'required source input cannot be excluded'):self.inventory()
+        (self.archive/'sources.csv').write_text('relative_filename,required_input\nfinancial_reports/missing.pdf,true\n',encoding='utf-8')
+        with self.assertRaisesRegex(ValueError,'required source input is missing'):self.inventory()
+
+    def test_ancillary_index_metadata_does_not_change_financial_compatibility(self):
+        from research_platform.evidence import source_inventory_fingerprint
+        path=self.report();before=self.inventory()
+        (self.archive/'context.json').write_text('{}',encoding='utf-8')
+        (self.archive/'sources.csv').write_text('relative_filename,required_input,reason\ncontext.json,false,Ancillary research only\n',encoding='utf-8')
+        after=self.inventory()
+        self.assertNotEqual(before['manifest_sha256'],after['manifest_sha256'])
+        self.assertEqual(source_inventory_fingerprint(before),after['source_input_sha256'])
+        (self.archive/'sources.csv').write_text('relative_filename,reporting_basis\nfinancial_reports/'+path.name+',restated\n',encoding='utf-8')
+        self.assertNotEqual(source_inventory_fingerprint(before),self.inventory()['source_input_sha256'])
+
+    def test_saved_inventory_accepts_frozen_withdrawal_but_rejects_new_changed_or_unpreserved_originals(self):
+        from research_platform.evidence import saved_source_inventory_compatibility
+        from research_platform.integrated import verified_integrated_record
+        first=self.report();second=self.report('second.html','456');before=self.inventory()
+        outputs=self.root/'outputs';run=outputs/'construct_fixture';run.mkdir(parents=True)
+        store=SourceStore(run/'sources')
+        for source in before['sources']:store.add_local(source,root=self.archive)
+        inventory_file=run/'inventory.json';inventory_file.write_text(json.dumps(before),encoding='utf-8')
+        record=dict(directory=str(run),configuration={'manifest':before['manifest_sha256']},calls=[],sources=store.sources,
+                    artifacts={'inventory.json':hashlib.sha256(inventory_file.read_bytes()).hexdigest()})
+        (run/'record.json').write_text(json.dumps(record),encoding='utf-8');(run/'calls.jsonl').write_text('',encoding='utf-8')
+        verified=verified_integrated_record(run,outputs)
+        first.unlink();current=self.inventory()
+        compatible=saved_source_inventory_compatibility(verified,current,outputs)
+        self.assertTrue(compatible['compatible']);self.assertIn('financial_reports/'+first.name,compatible['retained_frozen_originals'])
+        missing=dict(verified,sources=[])
+        self.assertFalse(saved_source_inventory_compatibility(missing,current,outputs)['compatible'])
+        extra=self.report('new.html','789')
+        self.assertFalse(saved_source_inventory_compatibility(verified,self.inventory(),outputs)['compatible'])
+        extra.unlink();second.write_text('<html>Changed original 999</html>',encoding='utf-8')
+        self.assertFalse(saved_source_inventory_compatibility(verified,self.inventory(),outputs)['compatible'])
+        with self.assertRaisesRegex(ValueError,'verified construction'):
+            saved_source_inventory_compatibility(record,current,outputs)
+
     def test_local_archive_rejects_unsupported_files_and_modified_claimed_hash(self):
         path = self.report()
         unsupported = self.archive / "financial_reports" / "report.docx"

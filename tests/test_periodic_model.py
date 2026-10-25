@@ -297,6 +297,47 @@ class DifferentCompanyPeriodModelTests(unittest.TestCase):
         data['model_configuration']['preferred_observation_ids']={'sales:2025-Q1':wrong['id']}
         with self.assertRaises(ValueError):build_periodic_spec(data,1)
 
+    def test_evidence_only_version_preserves_selected_history_and_derivations(self):
+        data=copy.deepcopy(self.data)
+        original=next(o for o in data['observations'] if o['row_id']=='sales' and o['period_id']=='2025-Q1')
+        alternative=copy.deepcopy(original)
+        alternative.update(id='independently_reconstructed_alternative',value=30.,restatement='restated',
+            eligible=True,model_selection_eligible=False)
+        alternative['source_refs'][0]['raw']=30.
+        data['observations'].append(alternative)
+        before=copy.deepcopy(data)
+        spec=build_periodic_spec(data,2);values=calculate_periodic(spec)
+        self.assertEqual(data,before)
+        retained=next(o for o in spec['observations'] if o['id']==alternative['id'])
+        self.assertTrue(retained['eligible'])
+        self.assertFalse(retained['model_selection_eligible'])
+        self.assertEqual(retained['value'],30.)
+        self.assertEqual(retained['source_refs'],alternative['source_refs'])
+        self.assertEqual(spec['observation_selection'],self.spec['observation_selection'])
+        self.assertEqual(values,self.values)
+        self.assertEqual(values['sales']['2025-Q1'],27.)
+        self.assertEqual(values['sales']['2025-Q2'],45.)
+        self.assertFalse([c for c in validate_periodic(spec,values) if c['status'] in ('FAIL','MISSING')])
+        data['model_configuration']['preferred_observation_ids']={'sales:2025-Q1':alternative['id']}
+        with self.assertRaisesRegex(ValueError,'Preferred observation is ineligible'):
+            build_periodic_spec(data,1)
+
+    def test_evidence_only_version_does_not_suppress_sourced_annual_fallback(self):
+        data=copy.deepcopy(self.data)
+        alternative=copy.deepcopy(next(o for o in data['observations'] if o['row_id']=='sales' and o['period_id']=='2025-FY'))
+        data['observations']=[o for o in data['observations'] if not (o['row_id']=='sales' and o['period_id']=='2025-FY')]
+        baseline=build_periodic_spec(data,1)
+        alternative.update(id='unselected_annual_restatement',value=190.,model_selection_eligible=False)
+        alternative['source_refs'][0]['raw']=190.
+        data['observations'].append(alternative)
+        spec=build_periodic_spec(data,1)
+        self.assertEqual(spec['observation_selection'],baseline['observation_selection'])
+        self.assertEqual(calculate_periodic(spec),calculate_periodic(baseline))
+        cell=next(r for r in spec['rows'] if r['id']=='sales')['cells']['2025-FY']
+        self.assertEqual(cell['observation_id'],'annual_sales_2025')
+        self.assertEqual(cell['value'],180.)
+        self.assertTrue(any(o['id']==alternative['id'] for o in spec['observations']))
+
     def test_group_basis_selection_does_not_fall_back_to_incompatible_perimeter(self):
         data=copy.deepcopy(self.data)
         source=next(o for o in data['observations'] if o['row_id']=='sales' and o['period_id']=='2025-Q1')

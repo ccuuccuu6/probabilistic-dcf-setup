@@ -525,13 +525,42 @@ class IntegratedReuseTests(unittest.TestCase):
 
     def test_changed_runtime_configuration_or_pending_call_never_returns_accepted_result(self):
         verified=verified_integrated_record(self.run,self.outputs)
-        for field,value in [('input_hash','changed'),('forecast_years',5),('manifest','changed'),('provider',{})]:
+        for field,value in [('input_hash','changed'),('forecast_years',5),('manifest','changed'),('provider',{}),
+                ('valuation',dict(enabled=True,date='2026-10-25',inputs_sha256='changed'))]:
             changed=copy.deepcopy(self.config);changed[field]=value
             self.assertFalse(compatible_integrated_result(verified,changed,self.runtime,self.key))
         runtime=copy.deepcopy(self.runtime);runtime['code']['integrated.py']='changed'
         self.assertFalse(compatible_integrated_result(verified,self.config,runtime,self.key))
         verified['pending_call']={'call_id':'still-unknown'}
         self.assertFalse(compatible_integrated_result(verified,self.config,self.runtime,self.key))
+
+
+class ConstructionScopeLockTests(unittest.TestCase):
+    def test_independent_companies_can_run_but_same_company_cannot_branch(self):
+        from research_platform.budget import company_key
+        from research_platform.initiation import _initiation_lock
+        with tempfile.TemporaryDirectory() as temp:
+            outputs=Path(temp)/'outputs'
+            first=company_key('Synthetic Alpha plc');second=company_key('Synthetic Beta plc')
+            with _initiation_lock(outputs,scope=first):
+                with self.assertRaisesRegex(AIError,'this company is active'):
+                    with _initiation_lock(outputs,scope=company_key('SYNTHETIC ALPHA PLC')):pass
+                with _initiation_lock(outputs,scope=second):
+                    with self.assertRaisesRegex(AIError,'this company is active'):
+                        with _initiation_lock(outputs,scope=second):pass
+            with _initiation_lock(outputs,scope=first):pass
+            self.assertTrue((outputs/('.construction_'+first+'.lock')).exists())
+
+    def test_invalid_scope_rejected_and_error_releases_real_os_lock(self):
+        from research_platform.budget import company_key
+        from research_platform.initiation import _initiation_lock
+        with tempfile.TemporaryDirectory() as temp:
+            outputs=Path(temp)/'outputs';scope=company_key('Synthetic Alpha plc')
+            with self.assertRaisesRegex(ValueError,'hexadecimal company key'):
+                with _initiation_lock(outputs,scope='../outside'):pass
+            with self.assertRaisesRegex(RuntimeError,'synthetic failure'):
+                with _initiation_lock(outputs,scope=scope):raise RuntimeError('synthetic failure')
+            with _initiation_lock(outputs,scope=scope):pass
 
 
 class JournalReservationContinuationTests(unittest.TestCase):
@@ -657,6 +686,8 @@ class IntegratedEscalationTests(unittest.TestCase):
             argv=["research_platform","construct","Synthetic Company","--sources",str(root),
                   "--model-inputs","synthetic-inputs.json","--escalation-evidence","synthetic-escalation.json"]
             with patch("sys.argv",argv),patch("research_platform.__main__.find_project_root",return_value=root), \
+                    patch("research_platform.workflow.ensure_company_history_research",return_value=Path('synthetic-inputs.json')), \
+                    patch("research_platform.workflow.ensure_valuation_research",return_value=Path('synthetic-inputs.json')), \
                     patch("research_platform.integrated.construct_integrated",return_value=root) as construct, \
                     patch("research_platform.project.read_json",return_value=dict(status="complete_provisional",usage={},issues=[])), \
                     patch("research_platform.ai.format_usage",return_value="synthetic"), \
@@ -666,7 +697,7 @@ class IntegratedEscalationTests(unittest.TestCase):
 
 
 class AutomaticReviewTests(unittest.TestCase):
-    def run_review(self, answers, *, repair=None, limit=20, payload=None):
+    def run_review(self, answers, *, repair=None, limit=20, payload=None, calls=8):
         from research_platform.integrated import REVIEW_SCHEMA
         provider=OpenAIProvider(api_key='SYNTHETIC-TEST-KEY',max_output_tokens=500)
         routes=[]
@@ -676,7 +707,8 @@ class AutomaticReviewTests(unittest.TestCase):
             provider.last_response=dict(model=model,usage=dict(input_tokens=100,output_tokens=50,total_tokens=150),output=[])
             return answers[len(routes)-1]
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
-        journal=RunJournal(Path(temp.name),provider,dict(limits=dict(usd=limit,calls=8,repairs=1,retries=0,generated_tokens=10000)))
+        journal=RunJournal(Path(temp.name),provider,dict(limits=dict(usd=limit,calls=calls,repairs=1,retries=0,generated_tokens=10000)))
+        self.last_review_journal=journal;self.last_review_routes=routes
         with patch.object(provider,'complete',side_effect=complete),patch('research_platform.ai.urlopen') as network:
             result=journal.review_stage('integrated_schedules','Evidence-based fixture review',payload or {},REVIEW_SCHEMA,repair_context=repair)
             network.assert_not_called()
@@ -696,6 +728,80 @@ class AutomaticReviewTests(unittest.TestCase):
         _,routes,journal,_=self.run_review([self.answer(True,False),self.answer()],repair=repair)
         self.assertEqual(routes,['gpt-6-luna','gpt-6-luna'])
         self.assertEqual(journal.entries[1]['request']['payload']['missing_note'],'Synthetic original scope note')
+
+    def test_last_acquisition_gets_exactly_one_cheap_completion_review(self):
+        original=dict(source_id='original',unit_id='page:1',text='Verbatim supplied statement.',numbers=[])
+        added=dict(source_id='note',unit_id='page:2',text='Verbatim omitted primary note 100.',numbers=[dict(index=0,raw='100')])
+        repairs=[]
+        def repair(payload,failures):
+            repairs.append(copy.deepcopy(payload))
+            return dict(payload,evidence=payload['evidence']+[added]) if len(repairs)==2 else payload
+        _,routes,journal,_=self.run_review([self.answer(True,False),self.answer(True,False),self.answer()],repair=repair,payload=dict(evidence=[original]))
+        self.assertEqual(routes,['gpt-6-luna']*3);self.assertEqual(len(repairs),2)
+        self.assertEqual(journal.entries[2]['request']['payload']['evidence'],[original,added])
+        self.assertEqual([entry['request']['attempt'] for entry in journal.entries],[0,1,2])
+        routing=json.loads((journal.directory/'integrated_schedules_routing.json').read_text())
+        self.assertTrue(routing['history'][-1]['terminal_evidence_review_pending'])
+        self.assertEqual(routing['status'],'passed')
+
+    def test_terminal_evidence_completion_cannot_acquire_again_or_waive_missing_support(self):
+        repairs=[]
+        def repair(payload,failures):
+            repairs.append(None)
+            return dict(payload,evidence=payload.get('evidence',[])+[dict(source_id='original',unit_id='page:'+str(len(repairs)),text='Complete new primary note.',numbers=[])])
+        with self.assertRaisesRegex(ValueError,'premium model cannot repair'):
+            self.run_review([self.answer(True,False)]*3,repair=repair)
+        self.assertEqual(self.last_review_routes,['gpt-6-luna']*3)
+        self.assertEqual(len(repairs),2)
+        self.assertNotIn('integrated_schedules',self.last_review_journal.configuration.get('escalations',{}))
+
+    def test_feedback_only_reordering_encoding_or_removal_cannot_extend_review(self):
+        units=[dict(source_id='original',unit_id='page:1',text='Source statement 100.',numbers=[dict(index=0,raw='100')]),
+            dict(source_id='original',unit_id='page:2',text='Source notes.',numbers=[])]
+        for change in ('feedback','ordering','encoding','removal'):
+            attempts=[]
+            def repair(payload,failures):
+                attempts.append(None);result=copy.deepcopy(payload)
+                result['review_challenge']='Changed feedback '+str(len(attempts))
+                if change=='ordering':result['evidence'].reverse()
+                elif change=='encoding':result['evidence'][0]['numbers']=dict(encoding='token_columns_v1',columns=['index','raw'],rows=[[0,'100']])
+                elif change=='removal':result['evidence']=result['evidence'][:1]
+                return result
+            with self.subTest(change=change),self.assertRaisesRegex(ValueError,'premium model cannot repair'):
+                self.run_review([self.answer(True,False)]*2,repair=repair,payload=dict(evidence=units))
+            self.assertEqual(self.last_review_routes,['gpt-6-luna']*2)
+            self.assertEqual(len(attempts),2)
+
+    def test_financial_escalation_retains_acquired_originals_and_unique_attempts(self):
+        note=dict(source_id='original',unit_id='page:2',text='Primary reconciliation note.',numbers=[])
+        repairs=[]
+        def repair(payload,failures):
+            repairs.append(None)
+            return dict(payload,evidence=[note]) if len(repairs)==2 else payload
+        _,routes,journal,_=self.run_review([self.answer(True,False),self.answer(True,False),self.answer(True),self.answer()],repair=repair)
+        self.assertEqual(routes,['gpt-6-luna']*3+['gpt-6.1-sol'])
+        self.assertEqual(len(repairs),2)
+        self.assertEqual([entry['request']['attempt'] for entry in journal.entries],[0,1,2,3])
+        self.assertEqual(journal.entries[-1]['request']['payload']['evidence'],[note])
+
+    def test_completion_dispatch_still_obeys_budget_and_call_limits(self):
+        repairs=[]
+        def repair(payload,failures):
+            repairs.append(None)
+            if len(repairs)==2:
+                self.last_review_journal.configuration['limits']['usd']=0
+                return dict(payload,evidence=[dict(source_id='original',unit_id='page:2',text='New original.',numbers=[])])
+            return payload
+        with self.assertRaisesRegex(AIError,'remaining cumulative budget'):
+            self.run_review([self.answer(True,False)]*2,repair=repair)
+        self.assertEqual(self.last_review_routes,['gpt-6-luna']*2)
+        repairs.clear()
+        def bounded_repair(payload,failures):
+            repairs.append(None)
+            return dict(payload,evidence=[dict(source_id='original',unit_id='page:2',text='New original.',numbers=[])]) if len(repairs)==2 else payload
+        with self.assertRaisesRegex(AIError,'Call/generated-token limit reached'):
+            self.run_review([self.answer(True,False)]*2,repair=bounded_repair,calls=2)
+        self.assertEqual(self.last_review_routes,['gpt-6-luna']*2)
 
     def test_cited_persistent_financial_disagreement_generates_evidence(self):
         _,routes,journal,provider=self.run_review([self.answer(True),self.answer(True),self.answer()])
@@ -731,3 +837,29 @@ class AutomaticReviewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FrozenOriginalReuseTests(unittest.TestCase):
+    def test_absent_original_reuses_exact_verified_parent_and_changed_live_file_rejects(self):
+        from research_platform.integrated import freeze_model_sources
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);archive=root/'archive';archive.mkdir()
+            outputs=root/'outputs';old=outputs/'old'/'sources';old.mkdir(parents=True)
+            target=outputs/'new'/'sources';target.mkdir(parents=True)
+            raw=b'Immutable original evidence';saved=old/'s.txt';saved.write_bytes(raw)
+            source=dict(id='s',local_path='withdrawn.txt',sha256=hashlib.sha256(raw).hexdigest(),format='txt')
+            data=dict(sources={'s':source});parent=dict(_reuse_verified=True,sources=[dict(source,path=str(saved))])
+            frozen,audit=freeze_model_sources(data,archive,target,previous=parent,outputs=outputs)
+            self.assertEqual(Path(frozen[0]['path']).read_bytes(),raw)
+            self.assertEqual(audit[0]['source_id'],'s')
+            self.assertEqual(data['sources']['s']['local_path'],'withdrawn.txt')
+            (archive/'withdrawn.txt').write_bytes(b'changed original')
+            with self.assertRaisesRegex(ValueError,'changed before freezing'):
+                freeze_model_sources(data,archive,target,previous=parent,outputs=outputs)
+            (archive/'withdrawn.txt').unlink()
+            for wrong in (None,dict(parent,_reuse_verified=False),dict(parent,sources=[])):
+                with self.assertRaisesRegex(ValueError,'no identical verified'):
+                    freeze_model_sources(data,archive,target,previous=wrong,outputs=outputs)
+            saved.write_bytes(b'changed frozen original')
+            with self.assertRaisesRegex(ValueError,'changed before freezing'):
+                freeze_model_sources(data,archive,target,previous=parent,outputs=outputs)

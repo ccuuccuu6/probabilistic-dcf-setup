@@ -60,6 +60,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Research, check and export a company's historical financial model.")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor", help="Check the project, Python and installed dependencies without API calls")
+    evaluate = commands.add_parser("evaluate", help="Evaluate saved backend model and export its typed input contract; zero AI and no Excel")
+    evaluate.add_argument("run")
+    evaluate.add_argument("--assumptions", help="Typed dated financial_assumptions_v1 JSON payload")
+    evaluate.add_argument("--valuation-assumptions", help="Typed valuation-v1 scenario payload; no AI calls")
     saved_review = commands.add_parser("review-saved", help="Export saved partial work or recalculate saved forecasts without AI/credentials")
     saved_review.add_argument("run")
     saved_review.add_argument("--assumptions", help="Changed JSON driver inputs; requires a completed saved forecast specification")
@@ -85,12 +89,16 @@ def main() -> int:
             command.add_argument("--diagnostic",action="store_true")
     export = commands.add_parser("export", help="Re-export and recalculate saved validated inputs; zero AI calls")
     export.add_argument("run", help="Saved run directory or its name in outputs")
+    export.add_argument("--rebuild", action="store_true", help="Recompile saved company evidence with current shared calculation code; no new source acceptance")
+    export.add_argument("--valuation-date", help="Explicit DCF date, YYYY-MM-DD; defaults to the saved model date")
     update = commands.add_parser("update", help="Discover newer official actuals, preserve history and rebuild the saved company model")
     update.add_argument("run", help="Saved run directory or its name in outputs")
     update.add_argument("--as-of", help="Information date, YYYY-MM-DD; defaults to today")
     construct = commands.add_parser("construct", help="Construct history, company drivers and executable temporary forecasts from local originals")
     construct.add_argument("company")
     construct.add_argument("--as-of", help="Model information date, YYYY-MM-DD; defaults to today's date and is saved")
+    construct.add_argument("--valuation-date", help="DCF date, YYYY-MM-DD; defaults to the model information date")
+    construct.add_argument("--valuation-assumptions", help="Optional typed valuation-v1 overrides; normal construction generates its inputs")
     construct.add_argument("--historical-vintage", action="store_true", help="Require every source to have verified publication by the as-of date")
     construct.add_argument("--sources", required=True)
     construct.add_argument("--model-inputs", help="Saved sourced company research specification for the integrated segment/three-statement workflow")
@@ -139,6 +147,15 @@ def main() -> int:
                 raise ValueError("A required package is missing; install the project with python -m pip install -e .") from error
             print(f"Saved runs: {root / 'outputs'}")
             print("PASS: project found and required Python packages are installed. No company config is needed. Doctor does not read credentials or contact OpenAI.")
+        elif arguments.command == "evaluate":
+            from research_platform.periods import evaluate_saved_model
+            directory=evaluate_saved_model(root,arguments.run,arguments.assumptions,valuation_payload_file=arguments.valuation_assumptions)
+            print(f"Backend evaluation: {directory}")
+            print("No AI calls or Excel. Reported history and financial formulas are unchanged.")
+            from research_platform.project import read_json
+            evaluation=read_json(directory/'evaluation.json')
+            print('Status: '+evaluation['status'])
+            return 0 if evaluation['status']=='scenario_evaluated_provisional' else 1
         elif arguments.command == "api-check":
             from research_platform.ai import OpenAIProvider, aggregate_usage, format_usage, response_usage
             provider = OpenAIProvider.from_env(root / ".env")
@@ -192,32 +209,41 @@ def main() -> int:
                 inputs=update_company_inputs(root,parent,as_of=as_of,progress=TerminalProgress())
                 directory=construct_integrated(root,config['company'],config['sources'],inputs,
                     fx_database=root/defaults['fx-database'] if defaults.get('fx-database') else None,as_of=as_of,
-                    forecast_years=config.get('forecast_years',5),progress=TerminalProgress())
+                    forecast_years=config.get('forecast_years',5),include_valuation=True,progress=TerminalProgress())
             else:
                 directory = offline_export(root, arguments.run, fx_file=fx,
                     fx_database=root/fx_database if fx_database else None,
-                    snapshot_id=getattr(arguments,'snapshot',None),fx_as_of=getattr(arguments,'fx_as_of',None),inputs_file=getattr(arguments,'model_inputs',None),progress=TerminalProgress())
+                    snapshot_id=getattr(arguments,'snapshot',None),fx_as_of=getattr(arguments,'fx_as_of',None),inputs_file=getattr(arguments,'model_inputs',None),
+                    include_valuation=True,valuation_date=getattr(arguments,'valuation_date',None),rebuild=getattr(arguments,'rebuild',False),progress=TerminalProgress())
             print(f"Workbook: {directory / 'model.xlsx'}")
             from research_platform.project import read_json
             return 0 if read_json(directory / "record.json")["status"] == "complete_provisional" else 1
         elif arguments.command == "construct":
             from research_platform.project import read_json
             from research_platform.ai import format_usage, format_stage_usage
+            from pathlib import Path
             print("Constructing a provisional model from company originals. Python reads source numbers; unknown inputs remain missing.", flush=True)
             if arguments.model_inputs:
                 from research_platform.integrated import construct_integrated
-                directory = construct_integrated(root, arguments.company, arguments.sources, arguments.model_inputs,
+                from research_platform.workflow import ensure_company_history_research, ensure_valuation_research
+                inputs=ensure_company_history_research(root,arguments.company,arguments.sources,arguments.model_inputs,
+                    budget_usd=arguments.budget_usd,as_of=arguments.as_of,progress=TerminalProgress())
+                inputs=ensure_valuation_research(root,arguments.company,arguments.sources,inputs,
+                    budget_usd=arguments.budget_usd,as_of=arguments.as_of,progress=TerminalProgress())
+                directory = construct_integrated(root, arguments.company, arguments.sources, inputs,
                     reference_workbook=arguments.reference_workbook, budget_usd=arguments.budget_usd,
                     forecast_years=arguments.forecast_years, recalculate=arguments.recalculate, progress=TerminalProgress(),
-                    escalation_file=arguments.escalation_evidence,fx_file=arguments.fx_source,fx_database=arguments.fx_database,resume=arguments.resume,
-                    as_of=arguments.as_of,historical_vintage=arguments.historical_vintage)
+                    escalation_file=arguments.escalation_evidence,fx_file=arguments.fx_source,fx_database=arguments.fx_database,
+                    resume=str(inputs.parent) if arguments.resume and inputs!=Path(arguments.model_inputs).resolve() else arguments.resume,
+                    as_of=arguments.as_of,historical_vintage=arguments.historical_vintage,include_valuation=True,
+                    valuation_date=arguments.valuation_date,valuation_inputs=arguments.valuation_assumptions)
             else:
-                from research_platform.workflow import research_company_inputs
+                from research_platform.workflow import research_company_inputs, ensure_company_history_research, ensure_valuation_research
                 from research_platform.integrated import construct_integrated
                 from datetime import date
                 import tomllib
                 from pathlib import Path
-                from research_platform.evidence import inventory_local_sources
+                from research_platform.evidence import inventory_local_sources, source_inventory_fingerprint, saved_source_inventory_compatibility
                 from research_platform.workflow import update_company_inputs
                 from research_platform.budget import company_key
                 defaults=tomllib.loads((root/'pyproject.toml').read_text(encoding='utf-8')).get('tool',{}).get('research-platform',{})
@@ -238,12 +264,20 @@ def main() -> int:
                     if Path(latest['configuration']['sources']).resolve()!=Path(arguments.sources).resolve():
                         raise ValueError('Resume source archive differs; use an explicit fresh research run under the same company budget')
                 inputs=Path(latest['directory'])/'company_model_inputs.json' if latest else None
+                archive_compatibility=None
                 if inputs is not None and inputs.exists():
                     from research_platform.integrated import verified_integrated_record
-                    verified_integrated_record(latest['directory'],root/'outputs')
+                    latest=verified_integrated_record(latest['directory'],root/'outputs')
                     saved_data=read_json(inputs)
                     same_date=saved_data.get('model_configuration',{}).get('as_of')==as_of
-                    same_archive=latest['configuration'].get('manifest')==inventory_local_sources(Path(arguments.sources))['manifest_sha256']
+                    current_inventory=inventory_local_sources(Path(arguments.sources))
+                    same_archive=latest['configuration'].get('manifest') in {current_inventory['manifest_sha256'],current_inventory['source_manifest_sha256']}
+                    if not same_archive and 'inventory.json' in latest.get('artifacts',{}):
+                        old_inventory=read_json(Path(latest['directory'])/'inventory.json')
+                        same_archive=source_inventory_fingerprint(old_inventory)==current_inventory['source_input_sha256']
+                    if not same_archive:
+                        archive_compatibility=saved_source_inventory_compatibility(latest,current_inventory,root/'outputs')
+                        same_archive=archive_compatibility['compatible']
                     requested=sorted(set(arguments.years)) if arguments.years else None
                     if requested and requested!=saved_data['history_years']:
                         raise ValueError('Requested years differ from saved research; use --fresh for a different history scope')
@@ -252,14 +286,19 @@ def main() -> int:
                 else:
                     inputs=research_company_inputs(root,arguments.company,arguments.sources,as_of=as_of,
                         historical_years=arguments.history_years,years=arguments.years,budget_usd=arguments.budget_usd,
-                        historical_vintage=arguments.historical_vintage,progress=TerminalProgress())
+                        historical_vintage=arguments.historical_vintage,fresh=arguments.fresh,include_valuation=True,progress=TerminalProgress())
+                inputs=ensure_company_history_research(root,arguments.company,arguments.sources,inputs,
+                    budget_usd=arguments.budget_usd,as_of=as_of,archive_compatibility=archive_compatibility,progress=TerminalProgress())
+                inputs=ensure_valuation_research(root,arguments.company,arguments.sources,inputs,
+                    budget_usd=arguments.budget_usd,as_of=as_of,archive_compatibility=archive_compatibility,progress=TerminalProgress())
                 fx=arguments.fx_source
                 if fx and arguments.fx_database:raise ValueError('Choose the shared FX database or the legacy workbook adapter, not both')
                 fx_database=arguments.fx_database or (None if fx else defaults.get('fx-database'))
                 directory=construct_integrated(root,arguments.company,arguments.sources,inputs,
                     fx_file=root/fx if fx else None,fx_database=root/fx_database if fx_database else None,as_of=as_of,historical_vintage=arguments.historical_vintage,
                     forecast_years=arguments.forecast_years,budget_usd=arguments.budget_usd,
-                    recalculate=True,resume=arguments.resume,progress=TerminalProgress())
+                    recalculate=True,resume=str(inputs.parent) if arguments.resume and inputs.parent!=Path(latest['directory']) else arguments.resume,include_valuation=True,
+                    valuation_date=arguments.valuation_date,valuation_inputs=arguments.valuation_assumptions,progress=TerminalProgress())
             record = read_json(directory / "record.json")
             print(f"Status: {record['status']}; outputs: {directory}")
             print(format_usage(record["usage"]))

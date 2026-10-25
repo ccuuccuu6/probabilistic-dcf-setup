@@ -12,188 +12,362 @@ Nestlé is the first proving case, not a company-specific Python model.
 operation, verification, next steps and dated decisions. These remain the only
 maintained project documents.
 
-## Current state - 24 October 2026
+## Current state - 25 October 2026
 
-The reusable construction engine now has a causal functional-cost build, dated
-regional scope events, separate transaction/translation FX, direct annual forecasts
-beyond the detailed horizon, and explicit economic-driver contracts. The
-[current Nestlé workbook](outputs/construct_refresh_20261024T164024Z_4c33b3f4/model.xlsx)
-contains company information through 23 October and the preserved FX snapshot of
-24 October at 15:01 UTC. It is a **provisional model with incomplete portfolio
-closing accounting**, visibly labelled on the opening sheet. Passing arithmetic
-checks does not resolve missing economic evidence.
+**New revision in progress:** the latest request authorizes backend DCF plus actual
+CLI construction of Nestle, L'Oreal and Danone using each company's raw sources.
+The earlier stop on the latter two and shared $20 budget are superseded: each now
+has a separate cumulative $20 allowance, with attributable prior charges and
+reservations preserved. The 25 October completed output below is the baseline,
+not completion of this new milestone. Record fresh/cached stages and every manual
+intervention; no company-specific output patch can count as unattended success.
 
-All 389 offline tests passed in 359.0 seconds on the final code, including 27
-causal financial tests and fresh-company construction/refresh fixtures. Setup doctor
-passed. Desktop Excel matched 131,703 cells with zero differences and passed seven
-restored sensitivity cases. Python reports 23,771 PASS, zero FAIL/MISSING and 80 warnings.
-These include unavailable currency coverage, unmeasured transaction exposure and
-material accounting limitations. Actual Excel views were rendered and inspected;
-the saved workbook opens on Model near the operating build. See
-[delivery verification](outputs/construct_refresh_20261024T164024Z_4c33b3f4/delivery_validation.json)
-for exact test, source, layout, visual, budget and reuse evidence. Excel agreement
-verifies implementation consistency, not economic calibration or forecast accuracy.
+The new shared code implements visible portfolio/FX CFO components, a separate
+estimated diluted denominator where disclosure is insufficient, continuing-profit
+anti-dilution treatment, independent current/prior hedge terms, deterministic FCFF
+valuation and one Valuation audit sheet. Focused valuation and export tests pass;
+saved scenarios propagate into valuation without AI or Excel. An earlier full
+offline suite passed **516 tests in 636.271 seconds** in
+`outputs/unattended_full_offline_20261025_final.log`. Later source-context,
+discovery, valuation-unit and date-validation fixes have focused passing tests;
+the latest completed frozen full suite passed **724 tests in 906.142 seconds** in
+`outputs/unattended_full_offline_20261025_frozen_v14.log`. Its execution receipt
+records the same package hashes as Nestle attempt 18, L'Oreal attempt 20 and Danone
+attempt 20 at dispatch. These tests do not establish real-company financial acceptance;
+the subsequent live failures and their shared corrections are recorded below.
 
-The generic fiscal calendar/as-of policy gives Nestlé Q1, Q2, Q3, Q4, H1, H2 and FY
-for 2026–2027, then FY only for 2028–2030. No hidden forecast halves or quarters are
-created beyond that horizon. Annual flows, opening balances, financing, depreciation,
-tax, working capital and equity roll forward directly. Model and Assumptions have
-no 9M columns; source 9M observations and derivations live internally on Historics.
-FY shading is darker. Quarterly sales coexist with half-year financial flows and
-H1/FY stocks; unsupported quarterly statements and H2 closing stocks remain absent.
-Other fiscal calendars and annual/half-year/quarterly statement policies use the
-same compiler and entry point; fresh research prompts explicitly permit annual
-reporters and distinguish sales from full-statement frequency.
+The current public continuations are **Nestle attempt 22, L'Oreal attempt 24 and
+Danone attempt 24**, started at 18:17 UTC with identical hashes for 16 package
+modules. Source/tests are frozen and full offline suite v17 is running alongside
+them. The combined focused check passes **141 tests in 12.661 seconds**. Actual
+Nestle preparation and scope replay preserves the saved review and targets only
+four failed dispositions; full financial acceptance remains pending.
+The prior cycle added no API charges: Nestle 20
+stopped on an input-digest check, and the other companies stopped at the code guard.
+Normal preparation had appended four saved source-selection notes; financial
+observations were unchanged. The correction accepts only that exact delta from a
+hash-verified selection artifact and preserves the full saved review context.
+Actual N20 preparation replay passes, 88 related tests pass, and the combined
+root check passes 117 tests in 8.751 seconds.
 
-Functional cash-cost pools are authoritative. Their source-reconciled historical
-baselines feed independent activity, variable/fixed share, unit-cost, spending and
-absolute-budget controls, then translation and separately scheduled D&A. Segment
-and group profits aggregate those costs. No forecast function expense is backed
-out of a predetermined UTOP or margin. Nestlé uses production/procurement,
-distribution/freight, marketing, administration and R&D pools. The marketing split
-starts from the disclosed, rounded 8.6% historical advertising/marketing ratio;
-future marketing is an independent spending budget, never a sales percentage.
-COGS responds to its activity proxy and input costs, independently of selling-price
-inflation. RIG includes mix, so its elasticity and variable share are provisional
-inputs, not a claim of physical-volume measurement. Segment-by-function baseline
-allocations are estimates, while presentation allocations are read-only diagnostics.
+The current full suite, v17, is running against the frozen combined changes.
+V16 was intentionally stopped before completion (exit -1, 435.777 seconds), so it
+is not a pass. V15 is also preserved: 730 tests in 746.428 seconds, with 14
+source-change-guard failures/errors after edits began. The latest completed
+passing full suite remains v14 above. Start/end hashes now record code drift
+explicitly for every new public execution.
 
-Dated operating scope events now sit within their regions and consolidate once.
-Russia removes Europe operations from October 2026. The Peranel/Waters venture and
-mainstream VMS disposal use explicit end-H1 2027 closing scenarios, with the retained
-Waters interest distinct from full consolidation. yfood is added to Europe from its
-control date; the regional assignment and undisclosed operating economics are
-labelled estimates. Blue Bottle is recorded but cannot be independently quantified
-from the supplied disclosures. Partial periods and the following year's annualisation
-are handled once; whole-business disposal does not leave ghost revenue or negative
-costs. The first annual-only sales/cost base carries the preceding modelled FY,
-including its partial-year scope, instead of resetting to the last historical FY.
-Full-entity depreciation stops use supplied dates; Waters receives no forecast
-D&A after July 2026. Remaining group D&A is allocated proportionally as an explicit
-estimate, with no second group deduction. Reporting reorganisations remain separate
-from operating scope changes.
+Nestle 21 successfully recovered the saved version-review route. Its final scope
+answer still omits Q1/9M from four structured dispositions, although the prose
+discusses sales-only releases. No historical fact was reconstructed or accepted.
+The shared correction now freezes valid targets and unaffected dispositions,
+retains its own prior answer, and revalidates every required period. Its durable
+protocol retains prior paid attempts and prevents a continuation resetting the
+bounded correction allowance. Genuine primary-evidence gaps stop without
+whole-answer regeneration.
 
-**Closing-accounting limitation:** consideration, gross assets/liabilities, retained
-JV values/earnings and complete acquisition/disposal bridges are not all disclosed.
-Known proceeds and net-asset/CTA amounts are preserved as evidence, but absent
-counterparty balances are not invented to force reconciliation. The record and
-specification therefore separately report `financial_completeness=incomplete_scope_accounting`.
-Operational scope effects are modelled; portfolio cash/equity/asset integration is
-not complete. Unknown transferred working-capital balances can affect projected
-operating cash flow as well as missing disposal proceeds. Where closing transfers
-are supplied, ratio-based closing stocks and cash bridges count them once. Synthetic known-answer closing entries prove the generic interface,
-not these unresolved Nestlé transactions.
+Danone 23 repaired all ten invalid source-token bindings across two bounded
+patches while preserving all 57 entries and unaffected bindings. It then stopped
+on incompatible free-text reporting-basis labels. Separately, coverage inspection
+found that the latest selection omitted an available H1 financial report and
+cumulative 9M disclosure. Numeric validity does not make that reduced scope
+complete. The shared coverage fix now inspects relevant primary candidates and
+retains hash-verified prior cadence as obligations for current revalidation;
+metadata and earlier AI claims cannot themselves establish financial facts.
+L'Oreal 23 reached mapping with complete selected evidence and retained H1/9M
+coverage. Its initial candidate contains 29 source-binding errors and seven
+growth contributions incorrectly assigned to the monetary sales role. Four of
+those ratios have valid bindings. The new shared role check identifies 33 rows
+requiring correction and prevents ratios/stocks from satisfying revenue coverage;
+identity corrections retain the source amount, units, type and definition. All
+38 related tests pass. The saved first patch remains unaccepted after the code guard.
+No current real-company run has passed the new historical and valuation gates.
 
-Costs follow one FX route: functional-currency cost, invoice-to-functional transaction
-effect with explicit lag/hedge terms, then functional-to-reporting translation once.
-Each pool can have its own mix. Unmeasured Nestlé cost translation and procurement
-exposures are independent editable zero scenarios with labelled stress ranges;
-zero does not assert domestic costs or no exposure. Revenue translation retains the
-organic cross-term. Annual applied financial percentages divide summed monetary
-impacts by summed bases. Where historical attribution was never disclosed, 144 mixed
-2026 FY FX/OCI/share-count support summaries remain unavailable with exact component
-reasons; they are not filled with zero. Future controls and statement totals remain
-required. Reported historical company FX is unchanged.
+A further read-only audit found a closing-share provenance defect to correct
+before final acceptance: an explicitly estimated historical closing count is
+currently written as a reported fact. The saved Nestle 2025 count of 2,572.2m
+matches its cited original disclosure, but lacks a machine-verified observation
+binding. Preserve estimates as estimates; reported closing counts and legacy
+dilution claims need an exact validated observation or Python-resolved source
+terms. This correction is queued while the frozen history trials and suite run;
+no company value has been changed and it is not yet implemented.
 
-Cash currency effects, operating transaction FX, financing remeasurement, foreign
-balance movements and OCI have separate inputs. Working-capital FX/scope movements
-do not become operating cash movements; cash FX does not automatically feed reserves.
-Cash-translation and OCI attribution mismatches fail validation. Foreign asset/D&A
-currency exposure remains incomplete: the independent translation test establishes
-cash-operating-margin invariance, not complete foreign-operation EBIT/asset translation.
+Two shared corrections are now under live verification. Numeric repairs previously
+received errors but not their own prior answer, causing valid rows to be
+regenerated or lost. The new bounded correction identifies exact entries, freezes
+unaffected facts and reporting versions, scopes missing additions and revalidates
+the complete result. Blind reconstruction sees only its own prior answer. All 43
+focused tests pass; D20 replay identifies 37 corrections and 84 frozen entries
+with unchanged originals and zero API calls.
 
-The FX database preserves originals, native observations, revisions and frozen
-snapshots. Valid direct observations take priority; same-currency crosses use aligned
-underlying dates/timestamps and retain their lineage. Crosses are calculated daily
-before averaging. Reciprocal/cross checks quarantine inconsistencies using the stated
-5% tolerance; this is not a claim of exact no-arbitrage across differently sampled
-providers. Completed dates use actuals, current periods mix actuals and spot held over
-remaining publication dates, and future periods hold eligible spot. Past gaps stay
-missing. Reference fixings and broker MIDPOINT closes have distinct definitions.
+A verified, unconsumed historical version-repair route can now resume independent
+reconstruction without repeating its completed cohort review. Exact source,
+input, request, provider/model/parser and retained-allegation checks precede
+replay; the complete history gate remains mandatory afterward. All 88 related
+tests pass. N19 replay reproduces the exact scope signature without an API call
+and preserves its rejection, with precise concept/period/reference feedback.
+Independent review is clear and the combined root check passes 117 tests in
+8.751 seconds after the preparation correction.
+
+L'Oreal and Danone began from supplied VA originals and application-retrieved
+public disclosures; their continuations are not wholly fresh initiations. No
+company mappings, financial values or workbook outputs have been manually repaired.
+
+The shared corrections now under live verification are:
+
+- Exact source-token, unit, temporal-metric, row and period checks reject invalid
+  mapping answers and report all independent errors in one bounded repair. A
+  construction-only source adapter translates explicit fiscal periods for the
+  vendor validator, including June year-ends and custom IDs. It preserves original
+  cells and strict actual/estimate eligibility. The actual L'Oreal Q1 reference
+  now passes unchanged; earlier failures at this boundary were application errors.
+- Numeric-format guidance explains decimal/thousands conventions and separates
+  source interpretation from unit scaling. The strict initiation schema is
+  unchanged. The new construction mapping schema intentionally prevents exact
+  cache reuse of older numeric requests. Danone attempt 19 had 16 invalid rows
+  after repair. Attempt 20 under the new guidance has no locale, fiscal-slot or
+  role errors, but exact source-token mismatches increase from 37 of 121 proposed
+  rows to 82 of 141 in its saved repair. Those candidates remain rejected; saved
+  responses are not accepted facts. Attempt 21 then saved a smaller 57-observation
+  answer: read-only binding replay finds ten exact-token mismatches and no locale
+  errors. The other 47 pass only that narrow binding check, not financial acceptance.
+  Twenty-four focused mapping tests pass.
+- Official discovery preserves complete observed-link evidence, structured HTML
+  dates, original-PDF datelines, unresolved coverage obligations and deferred
+  releases. Repeated continuation follows hash-bound navigation ancestry. It
+  retains completed metadata over identical interrupted raw selections, while
+  new claims, dates, period references or bytes require review. Twenty focused
+  metadata/checkpoint tests pass; zero-AI L'Oreal replay restores the identical
+  67-source catalogue and its two resolved datelines without changing originals.
+- Discovery research contexts retain each distinct complete claim while keeping
+  repeated restoration provenance in the raw audit. Concise selection purposes
+  prevent the full obligation context from being repeated inside every limitation.
+  L'Oreal's failed request shrank from 3.51 MB to 0.99 MB in offline replay with all
+  389 units and 5,815 numeric indexes unchanged; no new live L'Oreal mapping has
+  yet verified that request. Danone 21 used 444 units and 3,506 numeric indexes.
+- Source contexts retain complete selected sections and every numeric index.
+  Parsed originals are keyed by source/parser hashes. Lossless historical matrices
+  retain all observations and reporting versions. Verified provider context/output
+  failures allow bounded topic or period decomposition; identical capped requests
+  cannot be redispatched. Changed prompts/schemas are different requests and do
+  not qualify as exact cache hits. The original byte limit is 50 MiB; the separate
+  500-page PDF limit remains explicit.
+- Combined-history review retains substantive allegations across continuations.
+  Source-present missing versions may enter independent additive reconstruction;
+  missing originals or unresolved accounting interpretations cannot be waived.
+  Every scope finding now needs a cited typed disposition. Proposal-only results
+  preserve facts, checkpoint inputs and trigger the full gate again. Repeated
+  unchanged proposals and duplicate source bindings stop. The actual Nestle
+  replay retains all 12 findings, 268 original units and 1,262 observations.
+  Its real restated cash-flow gaps remain unaccepted; a guessed basis label cannot
+  establish that an already-saved version is absent. Eighty-one related tests pass
+  and independent review is clear.
+- Shared accounting extensions support cited extra expense functions, net
+  adjustment accounts, ordinary equity issuance, noncommon-equity principal and
+  coupons, investment movements and cash-flow overdraft scope. Structural empty
+  buckets remain separate from reported zero facts and calibration. Cash coupons
+  and after-tax EPS attribution remain distinct; senior equity and debt enter
+  common-equity valuation once.
+- Valuation research must resolve all six dated cited claim/dilution inputs
+  before completion or cache reuse. Unsupported zeros and material unknown event
+  dates/payment/tax block acceptance. DCF requires complete elapsed cash/stock
+  bridges and the declared forecast horizon; missing statement halves cannot hide
+  behind annual aggregates. Forty-seven valuation/scenario/export checks pass,
+  and the populated Nestle diagnostic's cash flows, opening bridge, terminal value
+  and per-share value are exactly unchanged. Its six unsupported claim inputs
+  still make that old diagnostic incomplete under current gates.
+
+The earlier combined focused run passed **113 tests in 9.009 seconds**. The latest full
+fresh-entry fixtures passed in **1,146.050 seconds** using actual synthetic XLSX
+source reading, compilation and export, with mocked providers/discovery/desktop
+bridges. They exercise different segments, GBP, a June year-end, statement cadence
+and a reporting reorganisation, plus zero-AI shared-FX refresh. These are fixture
+results, not validation of another real company. The new frozen full suite and
+real-company continuations remain incomplete; the latest completed full suite
+and subsequent focused verification are reported above.
+
+The 18:10 UTC budget audit reconciles **436 uniquely owned requests across 81
+originating journals**, with no pending/active calls at that stopped checkpoint.
+All 426 prior proofs and original journal bytes are unchanged; ten new settled
+charges reconcile (two Nestle, six L'Oreal and two Danone). All 14 old unresolved
+reservations and the legacy shared ledger are
+preserved. Invoice-confirmed charges are zero; incurred amounts below are
+usage-priced estimates, not an invoice reconciliation. Current active-call
+allowances can temporarily reduce availability beyond this checkpoint.
+
+| Company | Incurred estimate | Unresolved reserve | Remaining allowance |
+|---|---:|---:|---:|
+| Nestle | $7.894490025 | $5.205755625 | $6.899754350 |
+| L'Oreal | $7.012676055 | $3.476854500 | $9.510469445 |
+| Danone | $3.789511120 | $0.264994500 | $15.945494380 |
+
+Request-level proof: `outputs/cross_company_budget_audit_20261025T181014_743430Z.json`.
+The matching chronology records 67 stopped attempt logs and 39 execution receipts:
+`outputs/cross_company_execution_audit_20261025T181026_890779Z.json`.
+Earlier attempts without receipts have no invented wall-clock duration. Each new
+CLI receipt records the command, start/end, exit status and package hashes.
+Source changes stop a process after settling an in-flight response and before
+another dispatch; only exact compatible completed work is reused. Application
+costs exclude Codex development work and are independent for each company.
+
+A preserved zero-AI diagnostic DCF at
+`outputs/construct_refresh_20261025T061418Z_255cca33` passed 24,909 checks with 94
+warnings and no FAIL/MISSING under its then-current gates, plus 241,753 actual
+Excel cell comparisons and seven restored sensitivities. An independent 161-check
+numerical audit covered DCF, dilution and procurement FX (maximum residual
+3.64e-12). A normal-renderer presentation review at
+`outputs/nestle_valuation_display_review_20261025T062728Z` matched all 334 valuation
+targets and sampled seven actual Excel PDF pages. These are diagnostic evidence,
+not completion of current historical/valuation research or unattended acceptance.
+
+The public `evaluate` command was exercised on that diagnostic twice with zero
+AI/Excel calls: `outputs/evaluate_20261025T072958_3e973d9c` changes a typed operating
+pricing input; `outputs/evaluate_20261025T073024_df4d6b01` changes only the risk-free
+rate. Operating changes propagate into DCF, while the valuation-only change
+preserves operating outputs. All snapshots retain source-input hashes and equation
+identities. `outputs/backend_scenario_cli_proof_20261025.json` records the numerical
+comparisons. These are interface tests, not researched forecasts or recommendations.
+The earlier completed operating-model baseline follows.
+
+The backend construction revision is verified on Nestlé and synthetic reuse
+fixtures. The [current Nestlé workbook](outputs/construct_refresh_20261025T004450Z_20b38540/model.xlsx)
+contains 1,927 rows, six segments and 557 assumptions, with 2016-2025 history and
+2026-2030 temporary forecasts. Company evidence is dated through 23 October; the
+preserved FX snapshot is dated 24 October at 15:01 UTC. The final preserved run is
+`construct_refresh_20261025T004450Z_20b38540`. Earlier runs and interrupted attempts
+remain preserved. The [delivery audit](outputs/construct_refresh_20261025T004450Z_20b38540/delivery_validation.json)
+records checks, limitations, costs and preserved execution issues.
+
+The [full offline suite](outputs/backend_engine_delivery_tests_20261025.log)
+passed **438 tests in 457.636 seconds**. After the final calendar classification
+and presentation changes, 32 focused tests also passed. The final run reports 24,810 PASS,
+80 WARNING and zero FAIL/MISSING checks. Microsoft Excel compared **236,622 cells
+with zero differences**, passed seven sensitivity cases with inputs restored, and
+passed saved-workbook layout checks. Seventeen candidate views and six final actual-Excel rendered views were sampled
+across the operating build, statements and support sheets; this is not an
+inspection of every cell. Small support-label clipping and source-label glyph
+issues remain. Final coverage headers, calendar classifications and backend-authority labels
+were checked in the last export. Excel agreement establishes implementation consistency,
+not economic calibration or forecasting accuracy.
+
+**These are temporary scenarios, not researched forecasts.** The baseline reaches
+26.37% underlying trading margin and CHF7.91 adjusted EPS in FY2030. The saved
+[driver bridge](outputs/construct_refresh_20261025T004450Z_20b38540/driver_bridge.json) explains the increase
+from FY2025: pricing and RIG continue at their temporary historical settings while
+input-cost inflation and nominal marketing/administration/research budget increases
+remain zero; scope and currency assumptions also reduce expenses. No profit or
+margin target is imposed, but these optimistic operating assumptions need research
+before the result can be used as an investment base case.
+
+Saved backend inputs, financial equations and validated scenario payloads are
+authoritative. Excel is an inspectable projection; editing its yellow input cells
+changes that workbook only. `input_contract.json` identifies each writable driver,
+entity, period, unit, currency, frequency, value type and model version. Typed
+payloads reject incompatible periods, units, history, formulas and read-only
+calibration controls. `evaluate` recalculates a saved model without AI, Excel or
+source discovery; export and refresh preserve validated overrides and the pinned
+FX snapshot unless an explicit FX refresh selects a new snapshot.
+
+The [typed scenario demonstration](outputs/evaluate_20261025T014749_2781a65a/scenario_demo.json)
+changed regional pricing, an independent marketing budget and a cost-currency mix.
+It passed 6,026 backend checks with 69 warnings and no FAIL/MISSING, plus eleven
+independently calculated numerical effects. All 8,207 historical/derived cells,
+row definitions, equations, paid-call journal and FX snapshot were preserved.
+This demonstration uses the final delivered model. It produced no workbook and
+made no API call. Ordinary input
+changes do not renew frozen source or AI review acceptance.
+
+The reusable financial build now includes:
+
+- Functional cash-cost pools with one method per pool: activity and unit cost, an
+  incremental budget, budget growth or an absolute budget. One effective activity
+  sensitivity avoids overlapping variable-share/elasticity controls. Corporate
+  costs and segment allocations reconcile to disclosed group functions; allocation
+  estimates are distinct from reported facts. Marketing is an independent budget.
+- Dated operating and closing events, separate control/accounting/held-for-sale
+  dates, partial-period annualisation, retained-investment income and explicit
+  gain/goodwill bridges. Held-for-sale assets and working capital are removed once;
+  stopped depreciation is not deducted twice. Reporting reorganisations retain
+  predecessor identities and are not acquisition growth.
+- Separate transaction FX, functional-currency translation, cash translation,
+  monetary remeasurement and foreign-balance/OCI accounting. Reported historical
+  FX remains unchanged. Native observations and timestamps are preserved; crosses
+  are formed daily before averaging, and missing past rates are never filled with
+  current spot. Exposure coverage and uncertainty are distinct from rate coverage.
+- SBC expense/addback/equity links, company-defined adjusted-earnings bridges,
+  basic/diluted EPS and sourced closing shares, plus timed financing, maturities,
+  refinancing and share issuance. Legal share capital is distinguished from share
+  premium where supported. Financial ratios use their correct aggregate bases.
+
+Nestlé's portfolio closing accounts and treasury exposures remain **estimated**,
+not newly disclosed facts. Russia, Peranel/Waters, mainstream VMS, yfood and
+Blue Bottle are represented with cited facts and explicit provisional amounts or
+limits. Undisclosed gross balances, consideration allocations, retained values,
+profitability and event timing require judgment. The saved
+[eight portfolio alternatives](outputs/construct_refresh_20261025T004450Z_20b38540/scope_alternatives_20261025.json)
+exercise earlier closing, Russia sales/profit shares and yfood valuation; all are
+deterministic configuration tests, not probabilities. The record's
+`financial_completeness=provisional` does not certify those estimated economics.
+
+The [company driver map](outputs/construct_refresh_20261025T004450Z_20b38540/company_driver_map.json),
+[portfolio estimates and sources](outputs/construct_refresh_20261025T004450Z_20b38540/financial_research.json)
+and [writable input contract](outputs/construct_refresh_20261025T004450Z_20b38540/input_contract.json)
+are preserved beside the workbook. The
+source preparation under `outputs/nestle_backend_configuration_20261024/` is a
+preserved research artifact, not a reusable-engine dependency. Thirteen
+[targeted primary-source checks](outputs/construct_refresh_20261025T004450Z_20b38540/primary_revalidation.json)
+pass on material recent history and opening balances. They do **not** recertify
+the full ten-year history. Original, restated and derived observations retain
+their separate identities and reporting bases; standardized VA analytics and
+consensus are not substituted for company actuals. Existing source/AI reviews
+remain frozen, with their earlier scope disclosed.
+
+Nestlé uses quarterly sales/drivers, half-year financial flows and H1/FY stock
+snapshots. Visible detailed columns are Q1, Q2, Q3, Q4, H1, H2 and FY for 2026-2027,
+then FY only through 2030; 9M remains internal. Unsupported quarterly statements
+and H2 closing stocks stay absent. These calendars, frequencies, segment identities,
+currencies, disclosures and accounting policies come from company inputs.
 
 | Currency | Selected coverage and limitation |
 |---|---|
-| BRL | Genuine ECB EUR crosses through 23 October. Q4 CHF per BRL average 0.1636198521; dated fixing proxy 0.1633531026. It is not blank and is not a live IBKR BRL quote. |
-| CNH | Five native broker daily bars are retained but unapproved for historical selection; the required overlap was insufficient. Frozen USD cross spot exists; the Q4 period average remains unavailable. CNY stays separate. |
-| ARS | Last selected genuine observation 25 September; stale spot/current-period gaps remain explicit. |
-| VES | No genuine observations or eligible spot. No substitute currency is used. |
+| BRL | Genuine ECB EUR crosses through 23 October; populated historical/forecast rates. The forward anchor is a dated fixing proxy, not a live IBKR BRL quote. |
+| CNH | Five native broker daily bars retained but not approved for historical selection because overlap was insufficient. Frozen USD-cross spot exists; missing historical/current-period averages stay missing. CNY is separate. |
+| ARS | Last selected genuine observation 25 September; stale spot and missing current-period coverage remain explicit. |
+| VES | No genuine observations or eligible spot; no substitute currency is used. |
 
-The daily archive starts in 2018; the 2016–2017 model-history gap remains visible.
-The FX sheet exposes per-currency provider, observation date, spot date/time, type,
-gaps and transition status; a global latest date does not imply universal coverage.
-The previous read-only TWS handshake succeeded at 127.0.0.1:7496/client 71, server
-178; this continuation did not repeat live broker requests or change account settings.
+Customer-geography revenue baskets, cost translation/transaction mixes and foreign
+asset/debt/cash exposures are provisional hypotheses. Unallocated portions and
+scenario-neutral treatment remain explicit; a 1.00x adjustment multiplier is an
+unfitted control, not evidence that exposures are accurate. The daily FX archive
+starts in 2018, leaving 2016-2017 coverage absent. Provider transitions require
+recorded overlap approval. The previously successful read-only TWS handshake was
+not repeated during this delivery; no broker orders or account changes were made.
 
-Factory-count revenue allocations and ARS/VES-to-BRL substitutions are removed.
-Only principal-country customer-sales estimates remain, with unresolved residuals:
+The public fresh-company fixtures pass using a synthetic GBP company with two
+different segments, a June year-end, half-year forecast and quarterly statement
+policies, and a dated predecessor split. Actual local XLSX source reading,
+compilation, Python checks and workbook export run; provider responses, official
+discovery and desktop Excel bridges are mocked. Separate tests cover annual
+reporters, aggregate-only organic growth and estimated segment D&A. Repeated
+shared-database FX refreshes make zero AI calls and preserve warning counts and
+budget totals. **No second real company has been validated.** Fresh ten-year
+research accuracy/cost and unattended official-site access remain unproven; the
+current operating-company contract is not a universal bank/insurance model.
 
-| Revenue basket | Unallocated share |
-|---|---:|
-| Americas | 15.82% |
-| Asia/Oceania/Africa | 60.44% |
-| Europe | 55.92% |
-| Nespresso, Waters, Other | 100% each |
+Before the latest 25 October authorization, L'Oréal and Danone were stopped
+examples. At that earlier checkpoint, L'Oréal had $0.03760855 known charges and a
+$1.25407475 unresolved reservation; Danone had no paid calls. The new trials have
+since incurred further calls under separate company ledgers. Preserve the earlier
+originals, records and attributable charges; the earlier stop is superseded.
 
-The weighted unallocated share is about 44.57% using the selected FY2025 segment
-reference. Even the allocated amounts are customer-geography proxies, not verified
-functional currencies: all baskets are flagged as weak exposure evidence. Costs do
-not copy revenue baskets. The 1.00x calibration remains an unfitted scenario
-multiplier and cannot cure missing data, hedges or unknown exposures.
-
-Repurchases no longer infer an execution price from book equity. Inactive buybacks
-allow a missing price; positive cash requires a valid price and explicit share timing.
-Closing and weighted-average shares are distinct. The current opening share count
-still uses weighted-average history as a disclosed proxy. Dividend amounts are
-annual cash pools with separate payment schedules; annual payout diagnostics divide
-annual dividends by matching annual profit instead of averaging interim ratios.
-Recurring restructuring and
-operating adjustments persist under explicit temporary policies, and their effects
-are separated from underlying profit growth. Lease renewal, capex, tax settlement,
-flat balance-sheet accounts and foreign-asset FX remain provisional. The research
-artifact classifies supported policies, simplifications and unresolved inputs,
-including future IFRS 18 presentation not yet certified in this management model.
-
-All supplied company observations remain unchanged. Active history uses 2,608
-company-document cells, 2,070 calculations, ten company-reported VA cells and 99
-calendar calculations; these are cell counts, not unique disclosures. Standardized
-VA analytics and consensus do not become company actuals. Native Model, Assumptions,
-Historics, FX and Historical Segments remain self-contained. Workbook edits do not
-update Python inputs or renew frozen reviews; there is no Bunzl runtime dependency.
-
-The same fresh CLI path passes a synthetic GBP company with a June year-end,
-different segments and a published predecessor split, including database consumption
-and zero-AI refresh. Separate fixtures cover genuine quarterly and annual reporters.
-Provider and Excel bridges are mocked in onboarding tests; Nestlé's Excel checks are
-real desktop runs. **No second real company has been validated.** Fresh ten-year
-research accuracy and cost remain unmeasured. The operating-company role contract
-is not a universal bank/insurance model; official-index unattended HTTP access also
-remains unresolved.
-
-This work made zero application LLM calls. The cumulative known cost is $3.200947785,
-with $0.923841500 unresolved reservations: $4.124789285 committed and $15.875210715
-remaining under the original $20 ledger. There are 64 settled and two unresolved
-requests. Reservations are not charged usage or an invoice ceiling. Luna remains
-the inexpensive default; fresh reviews now receive the actual causal period graph.
-This deterministic continuation preserves earlier source/AI reviews and does not
-claim renewed live AI semantic acceptance.
-
-Repeated refreshes replace current FX-contract and transaction-FX checks rather
-than accumulating duplicate warnings; source/AI reviews remain frozen. The renderer
-writes unique pane selections and compact review comments. Commentary exceeding
-its Excel output limit is preserved in full in the audit artifact with an explicit
-cell pointer; source/review inputs are not truncated. One presentation export failed
-to open in Excel and remains recorded as incomplete; the corrected export passes.
-A later D&A guard exceeded Excel's formula limit; splitting it into a named support
-calculation preserved the financial logic. The failed attempt and test logs remain.
-The final visual review verified annual carry-forward, stopped depreciation and
-payout ratios; eight unchanged views were byte-compared with inspected renders,
-and final opening/financing views were inspected directly.
-
-Earlier runs, failed exports and their evidence are preserved. The formerly delivered
-12:30 workbook's hash changed after completion, so continuation used its verified
-12:07 parent without rewriting that altered file or its record. Company-specific
-economics, dates and mappings live in cited run inputs; generic calculations,
-source-format adapters and rendering remain separate.
+The preserved former shared ledger covers the earlier work:
+`outputs/construction_budget_8a61bc040e9925d621ac9562.json`. It records
+**$3.238556335 known**, **$2.177916250 reserved**, $5.416472585 committed and
+$14.583527415 then available under its $20 limit: 70 settled and three
+unresolved requests. Reservations are not confirmed charges or an invoice ceiling.
+Luna remains the initial research/review route; bounded context repairs precede
+any justified narrow escalation. Ordinary evaluation, FX operations and export
+remain zero-AI.
 
 ## Construct, update and export
 
@@ -205,6 +379,23 @@ python -m research_platform update RUN
 python -m research_platform refresh-fx RUN
 python -m research_platform export RUN
 ```
+
+To evaluate a backend scenario without opening Excel or calling an AI provider:
+
+```powershell
+python -m research_platform evaluate RUN --assumptions path/to/assumptions.json
+python -m research_platform export EVALUATION_RUN
+```
+
+Build the `financial_assumptions_v1` payload from the saved `input_contract.json`:
+include company, scenario ID, as-of date, model digest and an `inputs` array. Every
+entry identifies `driver_id`, `period_id`, `unit`, `currency`, `frequency`,
+`value_type` and `value`. Use exact contract values; percentage-point contributions
+are decimals (one point is 0.01). History, formulas and read-only structural/calibration
+parameters cannot be overwritten through this interface. Writable exposure or
+structural controls are explicitly listed in the contract. Each evaluation saves a
+new immutable run with its payload, contract, results and validation; it does not
+renew source acceptance. Exporting that run creates the optional review workbook.
 
 `RUN` is the directory name printed by the previous command, or an absolute run
 path. Construction generates company research inputs when absent; repeating a
@@ -271,7 +462,7 @@ python -m research_platform construct "Nestlé S.A., NESN, SIX, Switzerland" --s
 
 The default is ten completed fiscal years and five forecast years. `--years` selects
 specific completed history; `--fresh` deliberately starts new research under the
-same company budget; `--resume RUN` selects a verified ancestor. A changed archive
+same application budget; `--resume RUN` selects a verified ancestor. A changed archive
 or as-of date invokes coverage update. `--historical-vintage --as-of YYYY-MM-DD`
 requires known publication dates no later than that date; current vendor exports
 with unknown availability cannot be represented as point-in-time history.
@@ -395,17 +586,21 @@ local_store/nestle/
   sources.csv
 ```
 
-Create categories when storing actual originals. No company originals were added;
+Create categories when storing actual originals. Company originals remain Git-ignored;
 synthetic test inputs live under ignored `outputs/` with explicit labels. Readable primary company evidence in
 `financial_reports/` is required. Vendor exports can supply structured actuals;
 they cannot independently verify themselves. Transcripts and `sources.csv` are
 optional. Storing a file does not automatically send it to an AI.
 
-The current inventory accepts 439 originals: 372 financial-report files, 66 transcripts
+The 22 October inventory accepted 439 originals: 372 financial-report files, 66 transcripts
 and `visible_alpha/NESN_CH Visible Alpha.xlsx`. The index includes restatements,
 accounting definitions and transaction documents. Its five `not-found` entries
 concern event transcripts, not a demonstrated absence of financial statements.
 Collection metadata still needs source-level verification during initiation.
+Current archives now contain separate `VA Company Reported.xlsx` and
+`VA Standardised.xlsx` exports for each of Nestlé, L'Oréal and Danone, plus
+application-retrieved public disclosures. Use each run's hashed inventory for its
+actual source set; file counts are not evidence of accepted historical coverage.
 Earlier local checks accepted the 438 public originals and verified their supplied
 hashes; all 136 public spreadsheets (38 XLS and 98 XLSX) parsed. The additional
 VA workbook also parses, with no formulas or Excel error cells. Its original bytes
@@ -711,11 +906,12 @@ Supported local originals are PDF, XLS/XLSX, HTML and UTF-8 CSV/TXT. Legacy XLS
 uses pinned `xlrd==2.0.2` (Excel 5 or newer), needed for 38 official tables in the user's archive.
 Originals remain unchanged; no macros, vendor add-ins or formulas are executed.
 Saved formula results are not proof of freshness. No OCR or rendered
-PDF vision is implemented. Parser failures remain explicit. Limits include 25 MiB
+PDF vision is implemented. Parser failures remain explicit. Limits include 50 MiB
 per original, 500 PDF pages, 3,000 indexed units per document, spreadsheet dimensions of
 10,000 rows/300 columns and archive checks. The twelve-document cap does not apply
-to local archives. History accepts 1–30 fiscal years, default ten; the combined
-model retains a 500-row limit. Provider context/output limits and unusual financial
+to local archives. History accepts 1–30 fiscal years, default ten. Historical-only
+`initiate` retains its 500-row limit; the integrated `construct` model is not subject
+to that row cap. Provider context/output limits and unusual financial
 structures can still prevent completion. These limits cannot justify omissions.
 
 | Location | Purpose |
@@ -752,22 +948,40 @@ reference are historical artifacts, not current inputs.
 
 ## Next milestone
 
-Complete material portfolio closing bridges and obtain verified functional/invoice
-currency, hedge and foreign-asset exposures before promoting the Nestlé baseline.
-Replace provisional activity, spending, opening-share, lease and flat-balance policies
-with source-backed inputs while keeping the causal equations and driver contracts stable.
+Complete the newly authorized public-CLI builds for Nestlé, L'Oréal and Danone,
+including the remaining financial corrections and deterministic backend DCF.
+L'Oréal and Danone must begin from their supplied originals without manually
+prepared model inputs. Preserve ten annual years and disclosed interims, independent
+source checks, cumulative company budgets and prior unresolved reservations.
+Record every shared-code intervention and distinguish fresh stages from cached
+responses. Final outputs must use the same code and retain specific incomplete
+statuses where evidence, external access or the budget prevents completion.
 
-Resolve unattended official-site access and validate fresh archive-to-model construction
-on a second real operating company. Preserve the synthetic calendar/reorganisation
-coverage, but measure real source accuracy, omissions and cumulative cost before
-claiming autonomous ten-year onboarding or quoting a new-company build price.
-Defensible uncertainty, forecast records and empirical evaluation should precede
-DCF; later statistical/qualitative forecasting agents remain outside this step.
+After construction, challenge temporary operating and terminal assumptions using
+the typed input interface and dated evidence. The forecasting agent, probability
+distributions and Monte Carlo remain deferred. Numerical agreement does not
+establish forecasting skill, and synthetic fixtures do not substitute for the
+three requested real-company trials.
 
 ## Decisions
 
 | Date | Status | Decision |
 |---|---|---|
+| 25 October 2026 | New scope authorized; implementation and real trials in progress | Add deterministic backend DCF and complete public-CLI Nestlé, L'Oréal and Danone builds. Each company has its own cumulative $20 cap, including attributable old charges and unresolved reservations; the old shared ledger remains preserved. New-company inputs must be application-generated from raw sources. This supersedes the earlier pause on L'Oréal/Danone and DCF exclusion. No forecasting agent or probabilistic engine is authorized. |
+| 25 October 2026 | Coverage and scope corrections verified locally; live continuation running | An annual-only source selection can omit available interim statements despite passing token checks. Relevant primary candidates now require examination or cited exclusion, and positive cadence survives compatible continuations as pending revalidation. Cited basis adjudication preserves accounting distinctions without exact prose matching; substantive negative findings stop outside output-repair retries. Scope repairs retain their own prior answer and freeze unaffected records; full validation remains mandatory. The combined focused check passes 141 tests. |
+| 25 October 2026 | Numeric repair and exact continuation verified locally; real trials running | Whole-answer numeric repairs lacked their previous answer and could lose valid rows. Preserve the own-task response, bind corrections to exact entry identities, freeze unaffected rows and validate the complete merged answer. Blind reconstruction sees only its own previous response. A validated but unconsumed historical version-repair route should resume from exact saved evidence and response identity, with the full gate still required afterward. |
+| 25 October 2026 | Runtime recovery verified; final tests pending | Long construction processes stop if application source changes. Returned responses and usage settle before stopping and exact compatible requests can be reused after restart. Final company runs and offline checks must use frozen code; no claim of acceptance from a process mixing loaded and edited source. |
+| 25 October 2026 | Correction contracts verified locally; live continuations running | Report all independent numerical-mapping errors in one bounded repair while rejecting partial answers. Preserve company/historical identifiers and reject only exact known-role formatting aliases. After demonstrated review progress, permit one targeted structured-disposition correction against the exact completed context, preserving raw answers and later obligations; full financial gates still apply. Never infer references from narrative or silently repair company facts. |
+| 25 October 2026 | Continuation and claim-completeness fixes verified locally | Repeated discovery continuations trace exact hash-bound navigation ancestry and keep the newest evidence state. Valuation research cannot complete or reuse a cache while a required bridge claim or dilution input is absent/unresolved; existing bounded repair handles all such gaps together. Supported dated cited estimates remain provisional, and source review still determines semantic support. |
+| 25 October 2026 | Vendor period boundary corrected and verified locally | Adapt construction periods at the source-validation boundary using explicit matching FY dates. Preserve custom model IDs and unchanged legacy initiation, reject contradictory canonical IDs/dates and retain strict vendor row/actual-column eligibility. No source coordinates, company assumptions or AI request period layouts are rewritten. |
+| 25 October 2026 | Scope and availability corrections verified locally | Require a cited proposal for every historical-version allegation, then rerun the full gate without waiving findings or relabelling existing facts. Preserve completed publication metadata across identical interrupted replays. DCF cannot omit an elapsed balance bridge, skip required statement periods or change the declared horizon. Construction-only numeric-format guidance clarifies source conventions; changed request schemas do not qualify as exact cache reuse. |
+| 25 October 2026 | Recovery and valuation gates verified locally; real trials pending | Compatible concrete history allegations survive retries and require explicit cited disposition; mandatory source support reaches the review. A verified output-token failure permits bounded period mapping without dropping evidence, coverage or financial versions. Unknown material event timing/payment/tax makes DCF incomplete; supported cashless reorganisations and completed events already captured in opening balances remain eligible. These controls preserve charges and make no manual company-data repairs. |
+| 25 October 2026 | Continuation verified locally; final trials pending | A valid version-only review may proceed directly to independent additive reconstruction, then rerun the complete gate. Verified output exhaustion can use bounded topic review. A matching completed or navigation-complete discovery checkpoint is revalidated against preserved originals and current contracts before continuing; it is not a new website check or financial acceptance. Changed user sources or metadata cannot be silently ignored, and prior obligations, dates, charges and reservations remain intact. |
+| 25 October 2026 | Evidence-routing corrections tested; real trials pending | Missing-period obligations survive empty responses; cited navigation corrections can establish scope but cannot certify financial coverage. Impossible citations receive contract feedback. A recorded context failure permits one complete-section topic decomposition retaining all observations, versions and substantive findings. Identical saved oversized requests are not redispatched; unresolved reservations remain. These are shared application changes, not manual company mappings. |
+| 25 October 2026 | Shared fixes verified locally; live completion pending | Blank PDF pages retain explicit indexed empty units; malformed pages still fail. Combined-history review checks required primary evidence even when a reviewer labels its absence a warning. Observed official-link recovery reaches both new-company sites; bounded discovery currently needs better handling of repeated navigation and large contexts. Interrupted requests retain reservations. No new workbook has yet passed final acceptance. |
+| 25 October 2026 | Delivered and verified; economic inputs provisional | The full offline suite passes 438 tests. The final run has 24,810 PASS, 80 WARNING and no FAIL/MISSING; actual Excel compares 236,622 cells with no differences and passes seven restored sensitivities. Seventeen candidate views and six final views were sampled. Thirteen targeted source checks and eight portfolio alternatives pass; neither is full historical or forecasting acceptance. Final run: construct_refresh_20261025T004450Z_20b38540; typed scenario: evaluate_20261025T014749_2781a65a. Thirty-two focused tests passed after final metadata and label corrections. |
+| 25 October 2026 | Implemented; economic assumptions remain provisional | Backend inputs and validated typed scenario payloads are authoritative; Excel is their audit projection, superseding earlier Assumptions-authoritative wording. Evaluate is deterministic and uses no AI or Excel; refresh/export preserve validated overrides and pinned snapshots. One effective activity sensitivity and one budget method per pool, dated scope/closing/HFS mechanics, linked FX accounting, SBC, adjusted/diluted EPS and financing contracts use reusable inputs. The optimistic FY2030 margin/EPS is a temporary scenario, not a forecast. |
+| 25 October 2026 | Earlier checkpoint; scope and budget policy superseded above | L'Oréal and Danone were stopped examples at the earlier checkpoint. The then-shared ledger held $3.238556335 known plus $2.177916250 reserved, before the newly authorized separate-company trials. The 24 October Wi-Fi pause and its interrupted tests remain preserved. |
 | 24 October 2026 | Implemented; company economic completeness limited | Causal functional costs replace forecast residual allocations; regional scope, separate transaction/translation/OCI FX, timed shares, annual dividend pools and recurring normalisation have explicit contracts and independent tests. Direct annual forecasts follow the configured detailed horizon; 9M is absent from Model/Assumptions. Factory and substitute-currency proxies are removed. Material closing-accounting and exposure gaps remain explicit; arithmetic acceptance is separate from financial completeness. All 389 offline tests pass, with 131,703 real Excel cell comparisons and seven sensitivities. Final visual review corrected annual sales/cost carry-forward, held-for-sale D&A, scope working-capital double-counting and payout-ratio aggregation. Zero new application AI spend. |
 | 24 October 2026 | Implemented; exposure estimates provisional | Shared SQLite FX history, read-only IBKR updates, daily-cross spot-held forecasts, separate revenue/cost baskets and editable 1.0 calibration. Nestlé statements use supported half-year cadence; stocks use H1/FY, 9M is internal and FY is shaded. Separated company-reported VA roles replace positional selection. Routine operations are zero-AI; the cumulative ledger and unresolved reservations remain intact. |
 | 24 October 2026 | Implemented; live access limitation explicit | Native compact workbook, per-cell actual precedence, dated release coverage, zero-AI FX refresh/export and fresh-company input generation replace the reproduction-only workflow. Q3/9M Nestlé source numbers reconciled independently; synthetic GBP half-year/reorganisation fresh generation passes. Direct official-index access is blocked by HTTP 403; browser-assisted verification supports this delivery, not an unattended discovery claim. |

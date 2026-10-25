@@ -1,5 +1,7 @@
 """Financial-renderer checks use small explicit synthetic specifications."""
 import copy
+import ast
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -200,6 +202,20 @@ def periodic_example():
 
 
 class PeriodicExcelTests(unittest.TestCase):
+    def test_readonly_support_rows_collapse_without_hiding_editable_missing_controls(self):
+        spec,values=periodic_example()
+        for row in spec['rows']:
+            if row['id'] in ('missing','seasonality'):row['support_matrix']=True
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/'periods.xlsx';inspection=export_integrated(path,spec,values,[])
+            workbook=load_workbook(path);self.addCleanup(workbook.close)
+            self.assertIn('missing',inspection['hidden_assumption_rows'])
+            self.assertNotIn('seasonality',inspection['hidden_assumption_rows'])
+            row=inspection['hidden_assumption_rows']['missing']
+            self.assertTrue(workbook['Assumptions'].row_dimensions[row].hidden)
+            self.assertEqual(workbook['Assumptions'].row_dimensions[row].outlineLevel,1)
+            self.assertIn('missing',inspection['assumption_cells'])
+
     def test_large_comment_evidence_is_preserved_outside_excel_and_panes_are_unique(self):
         import json
         spec,values=periodic_example()
@@ -326,6 +342,111 @@ class PeriodicExcelTests(unittest.TestCase):
             self.assertEqual(display.value,f'=IF(ISBLANK(\'Assumptions\'!{optional}),"",\'Assumptions\'!{optional})')
             self.assertIsNone(result["expected_model_cells"][display.coordinate])
             self.assertIsNone(result["expected_assumption_cells"][optional])
+
+
+class ValuationExcelTests(unittest.TestCase):
+    def render(self, *, transition=0, market=False, event=False):
+        from test_valuation import fixture
+        from research_platform.valuation import value_company
+        spec, values, inputs = fixture()
+        spec.update(historical_years=[2024],forecast_years=[2025],sections=[dict(id='financials',label='Synthetic financial statements')],identities=[],sources=[],gaps=[])
+        for row in spec['rows']:row.update(label=row['id'].replace('_',' ').capitalize(),section='financials',kind='reported')
+        inputs['assumptions']['transition_years']['value']=transition
+        if market:inputs['market'].update(price=dict(value=1000.,as_of='2024-12-30',status='observed',method='Synthetic quote'),price_unit_scale=.01)
+        if event:inputs['events']=[dict(id='acquisition',date='2025-12-31',effective_date='2025-12-31',net_cash=dict(value=-80.),cash_tax=dict(value=0.),balance_movements={'associates':-7.,'nonlease_debt':20.,'nci_equity':3.})]
+        valuation=value_company(spec,values,inputs);valuation['input_snapshot']=inputs
+        temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup)
+        path=Path(temporary.name)/'model.xlsx'
+        inspection=export_integrated(path,spec,values,[],valuation=valuation)
+        workbook=load_workbook(path,data_only=False);self.addCleanup(workbook.close)
+        return workbook,inspection,valuation
+
+    def evaluate_sheet(self, workbook, inspection):
+        """Small independent Excel arithmetic interpreter, without Python equations."""
+        sheet=workbook['Valuation'];cache={}
+        def cell(address):
+            if address in cache:return cache[address]
+            value=sheet[address].value
+            if isinstance(value,str) and value.startswith('='):
+                expression=value[1:].replace('^','**')
+                def external(match):
+                    title, coordinate=match.groups()
+                    namespace={'Model':'expected_model_cells','Assumptions':'expected_assumption_cells','FX':'expected_fx_cells','Historics':'expected_history_cells'}[title]
+                    return repr(inspection[namespace][coordinate])
+                expression=re.sub(r"'([^']+)'!([A-Z]+[0-9]+)",external,expression)
+                expression=re.sub(r'\b[A-Z]+[0-9]+\b',lambda match:repr(cell(match[0])),expression)
+                def calc(node):
+                    if isinstance(node,ast.Expression):return calc(node.body)
+                    if isinstance(node,ast.Constant):return node.value
+                    if isinstance(node,ast.UnaryOp):return -calc(node.operand) if isinstance(node.op,ast.USub) else calc(node.operand)
+                    if isinstance(node,ast.Call) and isinstance(node.func,ast.Name) and node.func.id=='SUM':return sum(calc(a) for a in node.args)
+                    if isinstance(node,ast.BinOp):
+                        a,b=calc(node.left),calc(node.right)
+                        if isinstance(node.op,ast.Add):return a+b
+                        if isinstance(node.op,ast.Sub):return a-b
+                        if isinstance(node.op,ast.Mult):return a*b
+                        if isinstance(node.op,ast.Div):return a/b
+                        if isinstance(node.op,ast.Pow):return a**b
+                    raise AssertionError('Unsupported Excel test expression '+ast.dump(node))
+                value=calc(ast.parse(expression,mode='eval'))
+            cache[address]=value;return value
+        return cell
+
+    def test_live_model_links_shared_equations_and_independent_known_value(self):
+        workbook,inspection,valuation=self.render()
+        self.assertEqual(workbook.sheetnames[:2],['Model','Valuation'])
+        locations=inspection['valuation_cells']['2025-FY']
+        self.assertIn("'Model'!",workbook['Valuation'][locations['operating_profit']].value)
+        self.assertIn(locations['cash_lease_cost'],workbook['Valuation'][locations['operating_profit_after_cash_leases']].value)
+        evaluate=self.evaluate_sheet(workbook,inspection)
+        expected=(63.5/1.1**(183/365)+765/1.1**.5)/10
+        self.assertAlmostEqual(evaluate(inspection['valuation_cells']['fair_value_per_share']),expected)
+        for coordinate,target in inspection['expected_valuation_cells'].items():self.assertAlmostEqual(evaluate(coordinate),target,places=7,msg=coordinate)
+        self.assertTrue(inspection['valuation_print_area'].startswith('B2:'))
+        self.assertGreater(inspection['valuation_formula_count'],20)
+        sheet=workbook['Valuation']
+        claim_row=sheet[inspection['valuation_assumption_cells']['assumptions.pension_claim']].row
+        dilution_row=sheet[inspection['valuation_assumption_cells']['assumptions.dilution_shares']].row
+        self.assertEqual(sheet.cell(claim_row,3).value,'GBPm')
+        self.assertEqual(sheet.cell(dilution_row,3).value,'m shares')
+        self.assertTrue(sheet.cell(claim_row,6).alignment.wrap_text)
+        self.assertEqual(sheet.cell(claim_row,6).comment.text,valuation['input_snapshot']['assumptions']['pension_claim']['status'])
+        share_row=next(r for r in range(1,sheet.max_row+1) if sheet.cell(r,2).value=='Valuation-date basic outstanding shares')
+        self.assertEqual(sheet.cell(share_row,3).value,'m shares')
+        self.assertTrue(inspection['valuation_page_breaks'])
+        self.assertEqual(inspection['valuation_page_breaks'],[item.id for item in sheet.row_breaks.brk])
+        self.assertIn('0.00',sheet[inspection['valuation_cells']['fair_value_per_share']].number_format)
+
+    def test_transition_event_market_and_all_export_targets_match_backend(self):
+        workbook,inspection,valuation=self.render(transition=2,market=True,event=True)
+        evaluate=self.evaluate_sheet(workbook,inspection)
+        for coordinate,target in inspection['expected_valuation_cells'].items():self.assertAlmostEqual(evaluate(coordinate),target,places=7,msg=coordinate)
+        self.assertAlmostEqual(valuation['portfolio_events'][0]['present_value'],-110/1.1)
+        self.assertEqual(workbook['Valuation'][inspection['valuation_assumption_cells']['market.price']].value,1000.)
+        self.assertTrue(any('backend snapshots' in str(c.value).lower() for row in workbook['Valuation'] for c in row))
+        self.assertTrue(all((d.height or 15)<=72 for d in workbook['Valuation'].row_dimensions.values()))
+        sheet=workbook['Valuation']
+        event_start=next(r for r in range(1,sheet.max_row+1) if sheet.cell(r,2).value=='DATED PORTFOLIO CASH AND RETAINED OWNERSHIP')
+        factor_row=next(r for r in range(event_start,sheet.max_row+1) if sheet.cell(r,2).value=='Discount factor')
+        self.assertEqual(sheet.cell(factor_row,3).value,'%')
+        self.assertIn('%',sheet.cell(factor_row,4).number_format)
+        sensitivity_row=next(r for r in range(1,sheet.max_row+1) if str(sheet.cell(r,2).value).startswith('VALUATION SENSITIVITIES'))
+        self.assertTrue(sheet.cell(sensitivity_row+1,5).alignment.wrap_text)
+        for heading in inspection['valuation_section_rows']:
+            self.assertNotIn(heading,inspection['valuation_page_breaks'])
+            self.assertNotIn(heading+1,inspection['valuation_page_breaks'])
+
+    def test_incomplete_valuation_is_visible_for_annual_and_periodic_exports(self):
+        for periodic in (False,True):
+            spec,values=periodic_example() if periodic else example()
+            with tempfile.TemporaryDirectory() as directory:
+                path=Path(directory)/'model.xlsx'
+                inspection=export_integrated(path,spec,values,[],valuation=dict(status='incomplete',diagnostics=[dict(message='No supported lease principal cash flow')]))
+                workbook=load_workbook(path);self.addCleanup(workbook.close)
+                self.assertIn('Valuation',workbook)
+                self.assertEqual(inspection['valuation_status'],'incomplete')
+                self.assertEqual(inspection['expected_valuation_cells'],{})
+                self.assertIn('No supported lease',workbook['Valuation']['B9'].value)
 
 
 if __name__ == "__main__":

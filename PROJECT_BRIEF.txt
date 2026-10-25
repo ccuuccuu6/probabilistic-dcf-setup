@@ -37,8 +37,29 @@ revenue/cost distinctions, proxies and calibration remain separately cited input
 geographic footprint estimates are provisional exposure hypotheses, not disclosures.
 Sales and financial-statement modelling frequencies may differ within one company.
 Do not create unsupported quarterly financial statements to serve a shared factor.
-Assumptions is the authoritative forecast input/formula layer; Excel Model boxes
-display those controls and the same equations used by Python.
+The saved backend owns observations, company structure, dated inputs, equations,
+events, FX and scenario evaluation. Excel Assumptions and Model boxes are audit
+projections of those inputs and the same equation definitions used by Python.
+Workbook edits remain local unless a validated import explicitly updates backend
+inputs. Stable business identifiers, typed periods and dated scenario payloads
+provide the interface for a future forecasting agent; evaluation needs neither
+Excel nor an LLM. Reported history, derived history and estimated allocations are
+distinct, and estimates cannot become independent reported calibration evidence.
+
+Construction includes identifying material drivers and estimating the effects of
+announced or completed portfolio events using facts, explicit estimation methods
+and timing/magnitude alternatives. The 25 October milestone now includes a reusable
+backend DCF consuming these operating models and dated valuation inputs, with
+unlevered cash flow, coherent leases, explicit timing and sustainable terminal
+reinvestment. A forecasting agent, probability distributions, Monte Carlo and
+options valuation remain future work. The user now authorizes Nestle, L'Oreal and
+Danone builds from their own raw sources through the public CLI, including supplied
+VA exports and application-retrieved primary disclosures. The application must
+create company mappings/configuration; Codex improves shared code rather than
+manually constructing each company. Each company has an independent cumulative
+$20 application budget, preserving its attributable prior costs and reservations.
+The primary consolidation hierarchy remains separate from overlapping geography
+or product analyses. Synthetic fixtures do not substitute for these real builds.
 
 Financial causality is a construction contract: independent spending, activity,
 unit costs and evidenced currency exposures determine operating expenses and profit.
@@ -408,7 +429,7 @@ not the initiation architecture. Later segment restatements are separate reporti
 versions, not silent relabelings. README distinguishes offline workflow tests from
 live AI research, provider configuration and outstanding accuracy validation.
 
-Implementation sequence, with driver interfaces and temporary forecasts now authorized; probabilistic forecasting and valuation remain later work:
+Implementation sequence, with driver interfaces, temporary forecasts and deterministic valuation now authorized; probabilistic forecasting remains later work:
 1. Establish a requested company's identity, reporting periods, authoritative evidence,
    financial rows and definitions from its local archive through the reusable AI workflow.
 2. Preserve originals, extract cited history with whole-document context, independently review sources
@@ -416,7 +437,7 @@ Implementation sequence, with driver interfaces and temporary forecasts now auth
    history with blank forecasts, or explicit incomplete results. Validate first on
    Nestlé and then unrelated real companies; synthetic fixtures prove mechanics only.
 3. Develop supported operating drivers and linked forecast equations with temporary
-   assumptions now. DCF follows as a separate milestone; preserve historical evidence.
+   assumptions and a reusable deterministic DCF now; preserve historical evidence.
 4. Add defensible uncertainty to selected drivers, with shared coherent factor paths.
 5. Record provisional forecasts as soon as meaningful targets and resolution rules
    exist; add reverse valuation alongside or afterward. Its completion must not
@@ -495,7 +516,7 @@ requirements describe the separate historical-initiation workflow, not a mandato
 gate before making this real company model useful. Actual source comparisons,
 financial identities, independent expectations, sensitivity behaviour and Excel
 inspection remain required; balanced statements and synthetic tests are insufficient.
-The construction budget follows one cumulative attempt ledger. Unknown requests
+Each company's construction budget follows its own cumulative attempt ledger. Unknown requests
 retain conservative reservations and may coexist with further work inside the
 authorized allowance; they are never assumed free or silently reset by migration.
 

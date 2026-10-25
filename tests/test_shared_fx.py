@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from openpyxl import Workbook,load_workbook
-from research_platform.fx import forecast_rate,publication_dates,spot_quote,exposure_quality,currency_coverage,transaction_fx_for_period
+from research_platform.fx import forecast_rate,publication_dates,spot_quote,exposure_quality,currency_coverage,transaction_fx_for_period,apply_fx_accounting_contracts
 from research_platform.fx_store import FXStore
 from research_platform.ibkr import BrokerError,overlap_check,update_fx,validate_spot
 from research_platform.integrated import build_periodic_spec,periodic_sensitivities,financial_cost_pools
@@ -35,6 +35,17 @@ class SharedRateTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.store=FXStore(Path(self.temp.name)/'fx.sqlite');self.addCleanup(self.store.db.close)
+
+    def test_empty_accounting_profile_without_rates_is_explicitly_incomplete(self):
+        spec={};data=dict(financial_contracts=dict(fx_accounting=dict(exposures=[])))
+        apply_fx_accounting_contracts(spec,data,None)
+        self.assertEqual(spec['fx_accounting_coverage']['market_snapshot'],'missing')
+        self.assertEqual(spec['fx_accounting_coverage']['company_exposures'],'unquantified')
+        self.assertEqual(spec['fx_validation'][0]['status'],'WARNING')
+        self.assertNotIn('fx_accounting_contract',spec)
+        data['financial_contracts']['fx_accounting']['exposures']=[dict(id='disclosed_cash')]
+        with self.assertRaisesRegex(ValueError,'company exposure is distinct from missing market data'):
+            apply_fx_accounting_contracts({},data,None)
 
     def test_workbook_bootstrap_idempotence_and_projected_summary_separation(self):
         path=Path(self.temp.name)/'original.xlsx';source_workbook(path)
@@ -250,6 +261,19 @@ class SharedRateTests(unittest.TestCase):
         self.assertAlmostEqual(half_hedged['value'],.1)
         hedged=transaction_fx_for_period(snapshot,dict(component,hedge_coverage=1,hedge_rate=5),'2025-01-01','2025-01-31')
         self.assertEqual(hedged['value'],0)
+        independently_hedged=transaction_fx_for_period(snapshot,dict(component,hedge_coverage=.5,hedge_rate=4,
+            prior_hedge_coverage=.5,prior_hedge_rate=6),'2025-01-01','2025-01-31')
+        self.assertAlmostEqual(independently_hedged['value'],5/5.5-1)
+        current_only=transaction_fx_for_period(snapshot,dict(component,hedge_coverage=1,hedge_rate=4),
+            '2025-01-01','2025-01-31')
+        self.assertAlmostEqual(current_only['value'],-.2)
+        prior_only=transaction_fx_for_period(snapshot,dict(component,hedge_coverage=0,hedge_rate=None,
+            prior_hedge_coverage=1,prior_hedge_rate=4),'2025-01-01','2025-01-31')
+        self.assertAlmostEqual(prior_only['value'],.5)
+        dated=transaction_fx_for_period(snapshot,dict(component,hedge_terms=[
+            dict(start='2024-01-01',end='2024-01-31',hedge_coverage=1,hedge_rate=4),
+            dict(start='2025-01-01',end='2025-01-31',hedge_coverage=1,hedge_rate=5)]),'2025-01-01','2025-01-31')
+        self.assertAlmostEqual(dated['value'],.25)
         local=transaction_fx_for_period(snapshot,dict(component,invoice_currency='BRL'),'2025-01-01','2025-01-31')
         self.assertEqual(local['value'],0)
         with self.assertRaisesRegex(ValueError,'requires a positive'):
@@ -293,6 +317,113 @@ class CurrencyCompanyTests(unittest.TestCase):
                 cell=rows[rid]['cells']['2026-'+q]
                 self.assertIsNone(self.values[rid]['2026-'+q]);self.assertNotIn('expression',cell);self.assertFalse(cell.get('editable'))
         self.assertIsNone(self.values['cash']['2026-H2'])
+
+    def test_reported_sales_without_fx_keeps_transitive_growth_diagnostics_optional_only(self):
+        data=copy.deepcopy(self.data)
+        for rid,amount in [('north_sales',16.),('specialty_sales',12.8),('sales',28.8)]:
+            original=next(o for o in data['observations'] if o['row_id']==rid and o['period_id']=='2025-Q1')
+            data['observations'].append(dict(original,id='current_'+rid,period_id='2026-Q1',fiscal_year=2026,
+                start='2025-07-01',end='2025-09-30',value=amount,source_refs=[dict(source_id='synthetic_current_sales',raw=amount)]))
+        spec=build_periodic_spec(data,2,self.snapshot);values=calculate_periodic(spec);rows={r['id']:r for r in spec['rows']}
+        self.assertEqual(values['north_sales']['2026-Q1'],16.)
+        self.assertIsNone(values['north_fx']['2026-Q1'])
+        self.assertEqual(rows['north_fx']['cells']['2026-Q1']['status'],'not_disclosed')
+        for rid in ('north_fx_weighted_amount','north_fx'):
+            for pid in ('2026-H1','2026-FY'):
+                self.assertIsNone(values[rid][pid])
+                self.assertFalse(rows[rid]['cells'][pid].get('required',True))
+        # A supported denominator in the same period is not made unavailable by
+        # another row's missing FX; only actual dependency edges propagate it.
+        self.assertIsNotNone(values['north_fx_comparable_revenue']['2026-H1'])
+        self.assertIsNotNone(values['sales']['2026-FY'])
+        self.assertIsNotNone(values['cfo']['2026-H1'])
+        self.assertFalse([c for c in validate_periodic(spec,values) if c['status'] in ('FAIL','MISSING')])
+        broken=copy.deepcopy(spec);broken_rows={r['id']:r for r in broken['rows']}
+        broken_rows['cfo']['cells']['2026-H1']=dict(value=None,status='forecast',required=True,reason='Required financial output')
+        failures=validate_periodic(broken,calculate_periodic(broken))
+        self.assertTrue(any(c['name']=='cfo:2026-H1' and c['status']=='MISSING' for c in failures))
+
+    def accounting_case(self,exposures,rate_change='2025-06-30'):
+        data=copy.deepcopy(self.data);data['financial_contracts']['fx_accounting']=dict(exposures=exposures)
+        quotes=[]
+        for day in publication_dates('2023-07-01','2025-12-31'):
+            quotes.extend([quote(day,1.2),quote(day,150 if day>rate_change or day<'2025-01-01' else 180,currency='JPY')])
+        with FXStore(Path(self.temp.name)/('accounting_'+rate_change+'.sqlite')) as store:
+            store.import_quotes(quotes,{'fixture':'independent accounting rates'});snapshot=store.snapshot('2025-12-31')
+        spec=build_periodic_spec(data,2,snapshot)
+        return spec,calculate_periodic(spec)
+
+    def test_nonzero_cash_balance_oci_and_monetary_fx_have_distinct_counterparts(self):
+        exposures=[dict(id='foreign_cash',type='foreign_operation',role='cash',currency='JPY',opening_share=.3),
+            dict(id='monetary_cash',type='monetary',role='cash',currency='JPY',opening_share=.2),
+            dict(id='foreign_inventory',type='foreign_operation',role='inventories',currency='JPY',opening_share=.4),
+            dict(id='foreign_payables',type='foreign_operation',role='trade_payables',currency='JPY',opening_share=.5),
+            dict(id='foreign_debt',type='foreign_operation',role='nonlease_debt',currency='JPY',opening_share=.1),
+            dict(id='monetary_debt',type='monetary',role='nonlease_debt',currency='JPY',opening_share=.25)]
+        spec,value=self.accounting_case(exposures);base_spec,base=self.accounting_case([]);pid='2026-H1'
+        # GBP/JPY increases from 1.2/180 to 1.2/150: exactly +20%.
+        cash_gain=29.5*.2*.2;cash_oci=29.5*.3*.2;inventory_fx=30*.4*.2;debt_loss=58*.25*.2
+        payables_fx=20*.5*.2;debt_translation=58*.1*.2
+        self.assertAlmostEqual(value['cash_fx'][pid],cash_gain+cash_oci)
+        self.assertAlmostEqual(value['cash_translation_oci'][pid],cash_oci)
+        self.assertAlmostEqual(value['cash_fx_remeasurement'][pid],cash_gain)
+        self.assertAlmostEqual(value['financing_fx_remeasurement'][pid],debt_loss)
+        self.assertAlmostEqual(value['cfo_fx_noncash'][pid],debt_loss-cash_gain)
+        self.assertAlmostEqual(value['cfo'][pid],sum(value[r][pid] for r in spec['cashflow_component_contract']['cfo_components']))
+        self.assertAlmostEqual(value['oci_translation'][pid],cash_oci+inventory_fx-payables_fx-debt_translation)
+        self.assertAlmostEqual(value['financial_income'][pid]-base['financial_income'][pid],cash_gain)
+        self.assertAlmostEqual(value['financial_expense'][pid]-base['financial_expense'][pid],-debt_loss)
+        self.assertAlmostEqual(value['inventories'][pid]-base['inventories'][pid],inventory_fx)
+        self.assertAlmostEqual(value['wc_inventory_cf'][pid],base['wc_inventory_cf'][pid])
+        self.assertAlmostEqual(value['wc_payables_cf'][pid],base['wc_payables_cf'][pid])
+        self.assertAlmostEqual(value['nonlease_debt'][pid]-base['nonlease_debt'][pid],debt_loss+debt_translation)
+        self.assertAlmostEqual(value['balance_check'][pid],0)
+        self.assertFalse([c for c in validate_periodic(spec,value) if c['status'] in ('FAIL','MISSING')])
+        rows={r['id']:r for r in spec['rows']}
+        self.assertFalse(rows['cash_translation_oci']['cells'][pid]['editable'])
+        with self.assertRaisesRegex(ValueError,'authoritative editable'):
+            calculate_periodic(spec,{('cash_translation_oci',pid):99})
+        # Source observations and their cells remain identical.
+        base_rows={r['id']:r for r in base_spec['rows']}
+        for rid in ('cash','cash_fx','inventories','nonlease_debt'):
+            self.assertEqual(rows[rid]['cells']['2025-FY'],base_rows[rid]['cells']['2025-FY'])
+
+    def test_fx_accounting_exposure_overlap_rejected_and_live_weights_validated(self):
+        exposures=[dict(id='one',type='foreign_operation',role='cash',currency='JPY',opening_share=.6),
+            dict(id='two',type='monetary',role='cash',currency='JPY',opening_share=.3)]
+        spec,_=self.accounting_case(exposures)
+        changed=calculate_periodic(spec,{('fx_accounting_two_weight','2026-H1'):.5})
+        self.assertTrue(any(c['status']=='FAIL' and 'nonoverlapping_balance_exposures:cash' in c['name'] for c in validate_periodic(spec,changed)))
+        exposures[1]['opening_share']=.5
+        with self.assertRaisesRegex(ValueError,'cannot overlap'):self.accounting_case(exposures)
+        data=copy.deepcopy(self.data)
+        data['financial_contracts'].update(fx_accounting=dict(exposures=[]),balance_sheet_fx=dict(annual_cash_translation_oci=5.))
+        with self.assertRaisesRegex(ValueError,'conflicts with legacy independent FX amounts'):
+            build_periodic_spec(data,1,self.snapshot)
+
+    def test_native_balance_movement_uses_closing_minus_average_not_closing_change(self):
+        exposure=dict(id='cash_flow',type='foreign_operation',role='cash',currency='JPY',opening_share=0.,
+            net_movement_native_by_period={'2026-H1':100.})
+        spec,values=self.accounting_case([exposure],rate_change='2025-09-30');pid='2026-H1'
+        # Independent fixture calendar:66 weekdays in each of Jul-Sep2025
+        #and Oct-Dec2025; this synthetic provider has no holiday exclusions.
+        average=((1.2/180)+(1.2/150))/2
+        expected=100*(.008-average)
+        self.assertAlmostEqual(values['fx_accounting_cash_flow_average_rate'][pid],average)
+        self.assertAlmostEqual(values['cash_fx'][pid],expected)
+        self.assertAlmostEqual(values['oci_translation'][pid],expected)
+        self.assertAlmostEqual(values['balance_check'][pid],0.)
+        self.assertNotAlmostEqual(expected,100*(.008-1.2/180))
+
+    def test_unit_cost_including_fx_disables_second_transaction_adjustment(self):
+        data=copy.deepcopy(self.data);pool=data['financial_contracts']['cost_pools'][0]
+        pool['input_cost_includes_transaction_fx']=True
+        spec=build_periodic_spec(data,2,self.snapshot);rows={r['id']:r for r in spec['rows']}
+        rid='north_pool_'+pool['id']+'_transaction_fx';pid='2026-H1'
+        self.assertFalse(rows[rid]['cells'][pid]['editable'])
+        self.assertEqual(calculate_periodic(spec)[rid][pid],0)
+        pool['fx']['transaction']['components']=[dict(weight=.1,functional_currency='GBP',invoice_currency='JPY')]
+        with self.assertRaisesRegex(ValueError,'already includes transaction FX'):build_periodic_spec(data,2,self.snapshot)
         self.assertIsNotNone(self.values['cash']['2026-FY'])
         self.assertAlmostEqual(self.values['sales']['2026-H1'],self.values['sales']['2026-Q1']+self.values['sales']['2026-Q2'])
         self.assertAlmostEqual(self.values['balance_check']['2026-FY'],0,places=8)
@@ -361,6 +492,9 @@ class CurrencyCompanyTests(unittest.TestCase):
 
     def test_translation_only_preserves_functional_cash_operating_margin(self):
         data=copy.deepcopy(self.data)
+        # A separately fixed reporting-currency SBC budget is not a foreign
+        # cash cost. Exclude it from this deliberately pure translation case.
+        data['financial_contracts']['sbc']=dict(annual_amount=0.)
         single=[dict(currency='JPY',weight=1.,exposure_status='reported',evidence_basis='functional_currency_disclosure'),
             dict(currency='GBP',weight=0.,exposure_status='reported',evidence_basis='functional_currency_disclosure')]
         for exposure in data['model_configuration']['fx_exposures'].values():exposure['revenue']['weights']=copy.deepcopy(single)
@@ -397,9 +531,17 @@ class CurrencyCompanyTests(unittest.TestCase):
             'north_pool_cogs_transaction_1_hedge_rate':{pid:.008}})
         self.assertAlmostEqual(edited['north_pool_cogs_transaction_fx'][pid],0)
         self.assertAlmostEqual(edited['north_pool_cogs'][pid],plain['north_pool_cogs'][pid])
+        independent=calculate_periodic(spec,{'north_pool_cogs_transaction_1_hedge_coverage':{pid:1.},
+            'north_pool_cogs_transaction_1_hedge_rate':{pid:.008},
+            'north_pool_cogs_transaction_1_prior_hedge_coverage':{pid:1.},
+            'north_pool_cogs_transaction_1_prior_hedge_rate':{pid:.010}})
+        self.assertAlmostEqual(independent['north_pool_cogs_transaction_fx'][pid],-.2)
+        self.assertAlmostEqual(independent['north_pool_cogs'][pid],plain['north_pool_cogs'][pid]*.8)
         invalid=calculate_periodic(spec,{'north_pool_cogs_transaction_1_hedge_coverage':{pid:1.}})
         checks=validate_periodic(spec,invalid)
         self.assertTrue(any(c['area']=='fx_contract' and c['status']=='FAIL' for c in checks))
+        invalid_prior=calculate_periodic(spec,{'north_pool_cogs_transaction_1_prior_hedge_coverage':{pid:1.}})
+        self.assertTrue(any(c['area']=='fx_contract' and c['status']=='FAIL' for c in validate_periodic(spec,invalid_prior)))
 
     def test_true_quarterly_statement_company_still_calculates_quarters(self):
         data=copy.deepcopy(self.data);data['model_configuration'].update(full_statement_frequency='quarterly',forecast_frequency='quarterly')

@@ -30,6 +30,31 @@ from research_platform.evidence import SourceStore, inventory_local_sources, par
 from research_platform.initiation import (_object, _array, _enum, TEXT, INTEGER, UNIT_REF,
                                          NUMBER_REF, PERIOD, validate_shape, _initiation_lock)
 
+
+def _current_code_identity():
+    """Snapshot package sources, including modules imported later in a long run."""
+    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(Path(__file__).parent.glob('*.py'))}
+
+
+_LOADED_CODE_IDENTITY = _current_code_identity()
+
+
+def response_output_limit(response):
+    """Recognise a provider-declared output cap, never truncated text heuristics."""
+    return (isinstance(response, dict) and response.get('status') == 'incomplete'
+            and isinstance(response.get('incomplete_details'), dict)
+            and response['incomplete_details'].get('reason') == 'max_output_tokens')
+
+
+def saved_output_limit_matches(entry, maximum):
+    """Legacy journals prove an exhausted cap only through reported token usage."""
+    if not response_output_limit(entry.get('response')):return False
+    recorded=entry.get('max_output_tokens')
+    if recorded is None:recorded=(entry['response'].get('usage') or {}).get('output_tokens')
+    return recorded==maximum
+
+
 VERSION = 1
 REFS = _array(UNIT_REF)
 PERIOD_SCHEMA = _object(**PERIOD["properties"], references=REFS)
@@ -195,7 +220,7 @@ def expression_tree(expression):
             visit(node.left)
             visit(node.right)
             return
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "if_zero"
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("if_zero", "if_positive")
                 and len(node.args) == 3 and not node.keywords):
             for argument in node.args:visit(argument)
             return
@@ -205,7 +230,7 @@ def expression_tree(expression):
                 and isinstance(node.args[1], ast.Constant) and type(node.args[1].value) is int
                 and 1 <= node.args[1].value <= 10):
             return
-        raise ValueError("Unsupported formula: only references, arithmetic, 0/1, if_zero and lag(\"id\", 1..10) are allowed")
+        raise ValueError("Unsupported formula: only references, arithmetic, 0/1, if_zero, if_positive and lag(\"id\", 1..10) are allowed")
     visit(tree)
     return tree
 
@@ -214,7 +239,7 @@ def dependencies(tree):
     if isinstance(tree, ast.Name):
         return [(tree.id, 0)]
     if isinstance(tree, ast.Call):
-        if tree.func.id == 'if_zero':return [dep for argument in tree.args for dep in dependencies(argument)]
+        if tree.func.id in ('if_zero','if_positive'):return [dep for argument in tree.args for dep in dependencies(argument)]
         return [(tree.args[0].value, tree.args[1].value)]
     if isinstance(tree, ast.BinOp):
         return dependencies(tree.left) + dependencies(tree.right)
@@ -227,9 +252,9 @@ def formula_value(tree, resolve):
     if isinstance(tree, ast.Name):
         return resolve(tree.id, 0)
     if isinstance(tree, ast.Call):
-        if tree.func.id == 'if_zero':
+        if tree.func.id in ('if_zero','if_positive'):
             test=formula_value(tree.args[0],resolve)
-            return None if test is None else formula_value(tree.args[1 if test == 0 else 2],resolve)
+            return None if test is None else formula_value(tree.args[1 if (test == 0 if tree.func.id=='if_zero' else test > 0) else 2],resolve)
         return resolve(tree.args[0].value, tree.args[1].value)
     if isinstance(tree, ast.Constant):
         return tree.value
@@ -253,8 +278,8 @@ def formula_excel(tree, resolve):
     if isinstance(tree, ast.Name):
         return resolve(tree.id, 0)
     if isinstance(tree, ast.Call):
-        if tree.func.id == 'if_zero':
-            return 'IF('+formula_excel(tree.args[0],resolve)+'=0,'+formula_excel(tree.args[1],resolve)+','+formula_excel(tree.args[2],resolve)+')'
+        if tree.func.id in ('if_zero','if_positive'):
+            return 'IF('+formula_excel(tree.args[0],resolve)+('=0,' if tree.func.id=='if_zero' else '>0,')+formula_excel(tree.args[1],resolve)+','+formula_excel(tree.args[2],resolve)+')'
         return resolve(tree.args[0].value, tree.args[1].value)
     if isinstance(tree, ast.Constant):
         return str(tree.value)
@@ -269,7 +294,7 @@ def dimension(tree, units):
         unit = units[tree.id]
         return unit_dimension(unit)
     if isinstance(tree, ast.Call):
-        if tree.func.id == 'if_zero':
+        if tree.func.id in ('if_zero','if_positive'):
             dimension(tree.args[0],units)
             a,b=tree.args[1:];left,right=dimension(a,units),dimension(b,units)
             if isinstance(a,ast.Constant) and a.value==0:return right
@@ -703,7 +728,8 @@ class RunJournal:
         self.entries = copy.deepcopy(previous.get("calls", [])) if previous else []
         self.state = {"status": "running", "configuration": configuration, "calls": self.entries,
                       "pending_call": None, "issues": [], "parent_run": previous.get("directory") if previous else None,
-                      "directory": str(directory), "usage": aggregate_usage(self.entries), "artifacts": {}}
+                      "directory": str(directory), "usage": aggregate_usage(self.entries), "artifacts": {},
+                      "loaded_code_identity": dict(_LOADED_CODE_IDENTITY)}
         if previous and previous.get("journal_recovery"):
             self.state["journal_recovery"] = previous["journal_recovery"]
         if previous and previous.get("pending_call") and ledger is None:
@@ -715,6 +741,23 @@ class RunJournal:
                 output.flush()
                 os.fsync(output.fileno())
         self.save()
+        self.assert_runtime_unchanged()
+
+    def assert_runtime_unchanged(self):
+        """Stop mixed-code execution without discarding completed paid work."""
+        current = _current_code_identity()
+        changed = sorted(name for name in set(current) | set(_LOADED_CODE_IDENTITY)
+                         if current.get(name) != _LOADED_CODE_IDENTITY.get(name))
+        if changed:
+            detail = ('Application source changed during this process: ' + ', '.join(changed)
+                      + '. Completed responses and usage are saved; restart the public command '
+                        'under stable code to resume compatible work.')
+            self.state['status'] = 'incomplete'
+            self.state['runtime_code_change'] = dict(changed_files=changed, current_code_identity=current)
+            if detail not in self.state['issues']:
+                self.state['issues'].append(detail)
+            self.save()
+            raise AIError(detail)
 
     def save(self):
         self.state["usage"] = aggregate_usage(self.entries)
@@ -730,6 +773,7 @@ class RunJournal:
         return value
 
     def ask(self, stage, instructions, payload, schema, attempt=0, _retry=0):
+        self.assert_runtime_unchanged()
         role = "extractor" if stage == "construction_map" else "reviewer" if "review" in stage or "blind" in stage or "coverage" in stage else "researcher"
         model, effort = self.provider.route(role, stage) if hasattr(self.provider, "route") else (
             self.provider.metadata()["models"][role], "medium")
@@ -744,6 +788,19 @@ class RunJournal:
                     self.progress(f"Reused {stage}, attempt {attempt}; no paid call.")
                 validate_shape(entry["result"], schema)
                 return copy.deepcopy(entry["result"])
+        for entry in self.entries:
+            # A retained provider context failure is evidence that this exact
+            # request cannot fit. Do not reserve or dispatch it again on resume.
+            # Match the durable request itself, not an unrelated error string.
+            if (entry.get('call_id') and entry.get('signature') == key
+                    and digest(entry.get('request', {})) == key
+                    and entry.get('request') == signature
+                    and ('context_length_exceeded' in str(entry.get('error', ''))
+                         or (entry.get('error') and saved_output_limit_matches(entry,self.provider.max_output_tokens)))):
+                limit = 'max_output_tokens' if response_output_limit(entry.get('response')) else 'context_length_exceeded'
+                raise AIError(limit+': exact saved request will not be redispatched; '
+                    'call_id='+entry['call_id']+'; signature='+key+
+                    '. Preserve its recorded charge/reservation and use an explicitly bounded evidence decomposition.')
         limits = self.configuration["limits"]
         usage = aggregate_usage(self.entries)
         if not usage["cost_is_complete"] and self.ledger is None:
@@ -768,7 +825,8 @@ class RunJournal:
         entry = dict(signature=key, stage=stage, model=model, reasoning_effort=effort,
                      repair_count=attempt, retry_count=_retry, escalation_reason=self.configuration.get("escalations", {}).get(stage, {}).get("reason"),
                      call_id=uuid4().hex, client_request_id=str(uuid4()), started_at=datetime.now(timezone.utc).isoformat(),
-                     request=signature, allowance=allowance)
+                     request=signature, allowance=allowance,max_output_tokens=self.provider.max_output_tokens)
+        self.assert_runtime_unchanged()
         if self.ledger is not None:
             self.ledger.reserve(entry, self.directory)
         self.state["pending_call"] = entry
@@ -782,6 +840,8 @@ class RunJournal:
         try:
             with self.progress.call_timer(stage) if hasattr(self.progress, "call_timer") else nullcontext():
                 result = self.provider.complete(role=role, instructions=instructions, payload=dict(payload, stage=stage), schema=schema)
+            if response_output_limit(self.provider.last_response):
+                raise AIError('Provider declared max_output_tokens; even parseable partial output is incomplete')
             validate_shape(result, schema)
             entry["result"] = copy.deepcopy(result)
         except Exception as exc:
@@ -808,12 +868,19 @@ class RunJournal:
                 self.progress("Whole run: " + format_usage(self.state["usage"]))
                 if self.ledger:
                     self.progress("Cumulative budget: " + json.dumps(self.state["budget"]))
+        # Settle and persist first: a local edit does not make a returned request
+        # unknown or free, and must not trigger another request from stale code.
+        self.assert_runtime_unchanged()
         if (self.ledger and self.state["budget"]["remaining_usd"] <= 0) or (self.ledger is None and (
                 not self.state["usage"]["cost_is_complete"] or self.state["usage"]["estimated_cost_usd"] >= limits["usd"])):
             raise AIError((f"Last request failed: {failure}; " if failure else "") +
                           "Post-response cost guard stopped the run; unknown usage blocks spending and the last request may overshoot")
         if failure:
-            if _retry < limits.get("retries", 0):
+            if response_output_limit(entry.get('response')):
+                raise AIError('max_output_tokens: provider response is incomplete; its original response and usage are saved. '
+                    'Use bounded task decomposition; do not accept partial JSON or retry the unchanged request. '
+                    'call_id='+entry['call_id']+'; signature='+key) from failure
+            if _retry < limits.get("retries", 0) and 'context_length_exceeded' not in str(failure):
                 if self.progress:
                     self.progress(f"Known-charge technical retry {_retry + 1} for {stage}; same model and instructions.")
                 return self.ask(stage, instructions, payload, schema, attempt, _retry + 1)
@@ -863,8 +930,24 @@ class RunJournal:
                 failures.append(dict(kind='financial_interpretation' if not absent and not omitted and refs else 'context_omission',check=item['detail'],evidence=refs))
             return failures
         assess=assess or default_assess
+        def original_evidence_state(context):
+            # Only original unit content can earn the single terminal review;
+            # changed feedback, ordering or selection bookkeeping cannot.
+            units={}
+            for unit in context.get('evidence',[]):
+                if not isinstance(unit,dict) or not unit.get('source_id') or not unit.get('unit_id'):continue
+                numbers=unit.get('numbers',[])
+                if isinstance(numbers,dict) and numbers.get('encoding')=='token_columns_v1':
+                    numbers=[dict(zip(numbers['columns'],row)) for row in numbers['rows']]
+                if not unit.get('text') and not numbers:continue
+                key=(unit['source_id'],unit['unit_id'])
+                units[key]=dict(source_id=key[0],unit_id=key[1],text=unit.get('text',''),numbers=numbers)
+            return {key:digest(unit) for key,unit in units.items()}
         original=copy.deepcopy(payload);current=copy.deepcopy(payload);trials=[];history=[];seen=set()
-        for attempt in range(repairs+1):
+        terminal_review=False;last_attempt=-1
+        for attempt in range(repairs+2):
+            if attempt>repairs and not terminal_review:break
+            last_attempt=attempt
             try:
                 answer=self.ask(stage,prompt,current,schema,attempt)
             except (ValueError,KeyError,TypeError) as exc:
@@ -873,7 +956,7 @@ class RunJournal:
                 if attempt>=repairs or current.get('contract_failure')==feedback:raise
                 history.append(dict(attempt=attempt,failures=[dict(kind='output_contract',check=feedback)],
                     repair='Precise structured-output contract feedback; same evidence and inexpensive model'))
-                current=dict(original,contract_failure=feedback)
+                current=dict(current,contract_failure=feedback)
                 self.artifact(stage+'_routing.json',dict(status='repairing_contract',history=history,escalated=False))
                 continue
             self.artifact(f'{stage}_{digest(original)[:10]}_attempt_{attempt}.json',answer)
@@ -884,20 +967,31 @@ class RunJournal:
             call=self.entries[-1]
             trials.append(dict(run=str(self.directory),model=call['model'],effort=call['reasoning_effort'],result=failures,call_id=call['call_id']))
             item=dict(attempt=attempt,failures=failures,model=call['model'],effort=call['reasoning_effort'])
-            fixed=repair_context(copy.deepcopy(current),failures) if repair_context else None
+            # A final genuine acquisition must receive one bounded review. Its
+            # completion attempt cannot acquire more evidence or extend itself.
+            fixed=repair_context(copy.deepcopy(current),failures) if repair_context and attempt<=repairs else None
+            before_evidence=original_evidence_state(current)
+            after_evidence=original_evidence_state(fixed) if fixed is not None else {}
+            evidence_changed=any(before_evidence.get(key)!=value for key,value in after_evidence.items())
             if fixed is not None and digest(fixed)!=digest(current):
                 current=fixed;item['repair']='Expanded missing evidence before model escalation'
+                if attempt==repairs and evidence_changed:
+                    terminal_review=True;item['terminal_evidence_review_pending']=True
             else:
-                current=dict(original,review_challenge=failures,
+                current=dict(current,review_challenge=failures,
                     instruction='Re-evaluate only these findings against cited definitions and identities. Withdraw unsupported assertions; do not change mappings.')
-                item['repair']='Targeted evidence and identity challenge'
+                item['repair']=('Terminal evidence completion reviewed; no further context acquisition' if attempt>repairs
+                    else 'Targeted evidence and identity challenge')
             history.append(item)
             self.artifact(stage+'_routing.json',dict(status='repairing',history=history,escalated=False))
             signature=digest(dict(answer=answer,payload=current))
             if signature in seen:break
             seen.add(signature)
         if not failures or any(f.get('kind')!='financial_interpretation' for f in failures):
-            raise ValueError(stage+': unresolved evidence/context/contract problem; premium model cannot repair missing originals')
+            kinds=', '.join(sorted({f.get('kind','unknown') for f in failures})) or 'unknown'
+            raise ValueError(stage+': unresolved evidence/context/contract problem ('+kinds+'); '
+                'premium model cannot repair unresolved evidence or waive output requirements. '
+                'Exact findings: '+str(self.directory/(stage+'_routing.json')))
         evidence=dict(failure=failures,input_fixes=[h['repair'] for h in history],luna_trials=trials,
                       reason='Persistent cited financial interpretation disagreement after bounded evidence/context repair',history=history)
         self.configuration.setdefault('escalations',{})[stage]=evidence
@@ -909,7 +1003,7 @@ class RunJournal:
             self.provider.stage_models[stage]=premium;self.provider.stage_efforts[stage]=effort
             self.provider.validate_configuration()
             # ask() estimates and reserves the premium call against the same ledger.
-            answer=self.ask(stage,prompt,dict(current,escalation_history=history),schema,repairs+1)
+            answer=self.ask(stage,prompt,dict(current,escalation_history=history),schema,last_attempt+1)
             self.artifact(stage+'_escalated_review.json',answer)
             remaining=assess(answer)
             self.artifact(stage+'_routing.json',dict(status='unresolved' if remaining else 'passed',history=history,escalated=True,model=premium))
@@ -1199,6 +1293,7 @@ try {
                          ("Assumptions", inspection.get("expected_assumption_cells", {})),
                          ("FX", inspection.get("expected_fx_cells", {})),
                          ("Historics", inspection.get("expected_history_cells", {})),
+                         ("Valuation", inspection.get("expected_valuation_cells", {})),
                          ("Checks", inspection.get("expected_check_cells", {}))):
         for coordinate, expected in cells.items():
             compared += 1
@@ -1290,7 +1385,9 @@ def construct_company(root, company, source_directory, *, years=None, historical
         if previous:
             file = Path(previous["directory"]) / "record.json"
             journal_path = file.parent / "calls.jsonl"
-            saved_calls = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()] if journal_path.exists() else []
+            # JSONL records are LF-delimited. Unicode paragraph/line separators
+            # inside a valid JSON string are evidence text, not record breaks.
+            saved_calls = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").split('\n') if line.strip()] if journal_path.exists() else []
             if digest(saved_calls) != digest(previous["calls"]):
                 # Explicit recovery of the early construction mutable-request bug.
                 # The fsynced per-call journal is authoritative only if its original

@@ -7,7 +7,7 @@ name = "probabilistic-dcf-setup"
 version = "0.1.0"
 description = "Local AI-driven historical company initiation with source checks and Excel models"
 requires-python = ">=3.11"
-dependencies = ["openpyxl==3.1.5", "pypdf[crypto]==6.20.0", "xlrd==2.0.2"]
+dependencies = ["openpyxl==3.1.5", "pypdf[crypto]==6.20.0", "xlrd==2.0.2", "fonttools==4.67.0"]
 
 [project.optional-dependencies]
 ibkr = ["ib_async==2.1.0"]

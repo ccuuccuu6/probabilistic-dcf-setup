@@ -321,6 +321,158 @@ class FixtureProvider(OpenAIProvider):
 
 
 class JournalTests(unittest.TestCase):
+    def test_provider_incomplete_status_cannot_be_accepted_even_when_partial_json_is_parseable(self):
+        provider=FixtureProvider({})
+        def partial(**kwargs):
+            provider.last_response=dict(status='incomplete',incomplete_details=dict(reason='max_output_tokens'),
+                usage=dict(input_tokens=100,output_tokens=32000,total_tokens=32100))
+            return dict(source_ids=[],reasons=['Syntactically valid but incomplete'],gaps=[])
+        with tempfile.TemporaryDirectory() as temporary:
+            journal=RunJournal(Path(temporary),provider,dict(limits=dict(usd=1,repairs=0,retries=2)))
+            with patch.object(provider,'complete',side_effect=partial) as dispatch:
+                with self.assertRaisesRegex(AIError,'max_output_tokens'):
+                    journal.ask('construction_select','Complete original',{},SELECT)
+                self.assertEqual(dispatch.call_count,1)
+            self.assertNotIn('result',journal.entries[0]);self.assertTrue(journal.state['usage']['cost_is_complete'])
+
+    def test_output_cap_identity_preserves_legacy_failures_but_distinguishes_changed_limits(self):
+        from research_platform.construction import saved_output_limit_matches
+        response=dict(status='incomplete',incomplete_details=dict(reason='max_output_tokens'),
+            usage=dict(output_tokens=32000))
+        legacy=dict(response=response)
+        self.assertTrue(saved_output_limit_matches(legacy,32000))
+        self.assertFalse(saved_output_limit_matches(legacy,16000))
+        self.assertTrue(saved_output_limit_matches(dict(legacy,max_output_tokens=30000),30000))
+        self.assertFalse(saved_output_limit_matches(dict(legacy,max_output_tokens=30000),32000))
+        self.assertFalse(saved_output_limit_matches(dict(response=dict(status='completed',usage=dict(output_tokens=32000))),32000))
+
+    def test_output_cap_is_settled_once_and_never_technically_retried_or_redispatched(self):
+        from research_platform.budget import BudgetLedger
+        provider=FixtureProvider({})
+        response=dict(status='incomplete',incomplete_details=dict(reason='max_output_tokens'),
+            usage=dict(input_tokens=260306,output_tokens=32000,total_tokens=292306,
+                output_tokens_details=dict(reasoning_tokens=4690)),
+            output=[dict(type='message',content=[dict(type='output_text',text='{"observations":[{"row_id":"sales","terms":[')])])
+        def capped(**kwargs):
+            provider.last_response=copy.deepcopy(response)
+            raise AIError('AI response was incomplete or failed; it cannot be accepted.')
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);first=root/'first';first.mkdir();second=root/'second';second.mkdir()
+            ledger=BudgetLedger(root/'budget.json','Synthetic output-cap settlement',1)
+            config=dict(limits=dict(usd=1,calls=10,repairs=1,retries=2,generated_tokens=100000))
+            journal=RunJournal(first,provider,config,ledger=ledger)
+            with patch.object(provider,'complete',side_effect=capped) as dispatch:
+                with self.assertRaisesRegex(AIError,'max_output_tokens'):
+                    journal.ask('company_year_mapping','Complete originals',{'periods':['FY','H1']},SELECT)
+                self.assertEqual(dispatch.call_count,1)
+            saved=json.loads((first/'record.json').read_text());before=ledger.summary()
+            self.assertEqual(saved['calls'][0]['response'],response)
+            self.assertNotIn('result',saved['calls'][0]);self.assertIsNone(saved['pending_call'])
+            self.assertEqual(before['settled_requests'],1);self.assertEqual(before['unresolved_reservations_usd'],0)
+            self.assertGreater(before['known_cost_usd'],0)
+            resumed=RunJournal(second,provider,config,previous=saved,ledger=ledger)
+            with patch.object(provider,'complete',side_effect=AssertionError('Must not redispatch capped request')) as dispatch:
+                with self.assertRaisesRegex(AIError,'max_output_tokens: exact saved request'):
+                    resumed.ask('company_year_mapping','Complete originals',{'periods':['FY','H1']},SELECT)
+                dispatch.assert_not_called()
+            self.assertEqual(ledger.summary(),before)
+
+    def test_saved_context_failure_is_not_redispatched_or_reserved_again(self):
+        from research_platform.budget import BudgetLedger
+        provider=FixtureProvider({})
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t);first=root/'first';first.mkdir();second=root/'second';second.mkdir()
+            ledger=BudgetLedger(root/'budget.json','Synthetic oversized review',1)
+            config=dict(limits=dict(usd=1,calls=10,repairs=1,retries=2,generated_tokens=50000))
+            journal=RunJournal(first,provider,config,ledger=ledger)
+            with patch.object(provider,'complete',side_effect=AIError('HTTP 400 context_length_exceeded')) as dispatch:
+                with self.assertRaisesRegex(AIError,'context_length_exceeded'):
+                    journal.ask('construction_select','Original complete evidence',{'original_sections':['complete']},SELECT)
+                self.assertEqual(dispatch.call_count,1)
+            saved=json.loads((first/'record.json').read_text());before=ledger.summary()
+            self.assertGreater(before['unresolved_reservations_usd'],0)
+            resumed=RunJournal(second,provider,config,previous=saved,ledger=ledger)
+            with patch.object(provider,'complete',side_effect=AssertionError('Oversized request must not be sent again')) as dispatch:
+                with self.assertRaisesRegex(AIError,'exact saved request will not be redispatched') as error:
+                    resumed.ask('construction_select','Original complete evidence',{'original_sections':['complete']},SELECT)
+                dispatch.assert_not_called()
+            self.assertIn(saved['calls'][0]['call_id'],str(error.exception))
+            self.assertIn(saved['calls'][0]['signature'],str(error.exception))
+            self.assertEqual(ledger.summary(),before);self.assertEqual(len(resumed.entries),1)
+            # Different payloads are permitted by the ordinary remaining budget.
+            with patch.object(provider,'complete',wraps=provider.complete) as dispatch:
+                resumed.ask('construction_select','Original complete evidence',{'original_sections':['complete relevant topic']},SELECT)
+                self.assertEqual(dispatch.call_count,1)
+            self.assertEqual(ledger.summary()['unresolved_reservations_usd'],before['unresolved_reservations_usd'])
+
+    def test_context_failure_guard_requires_matching_durable_request_identity(self):
+        from research_platform.construction import digest
+        from research_platform.ai import response_usage
+        provider=FixtureProvider({})
+        with tempfile.TemporaryDirectory() as t:
+            journal=RunJournal(Path(t),provider,dict(limits=dict(usd=1,calls=10,repairs=0)))
+            signature=dict(stage='construction_select',instructions='target',payload={},schema=SELECT,
+                model=DEFAULT_MODEL,effort='low',attempt=0)
+            journal.entries.append(dict(signature=digest(signature),call_id='synthetic_original',
+                request=dict(signature,payload={'different':'actual failed request'}),error='context_length_exceeded',
+                usage=response_usage(dict(usage=dict(input_tokens=0,output_tokens=0,total_tokens=0)),DEFAULT_MODEL)))
+            with patch.object(provider,'complete',wraps=provider.complete) as dispatch:
+                journal.ask('construction_select','target',{},SELECT)
+                self.assertEqual(dispatch.call_count,1)
+
+    def test_source_change_blocks_new_dispatch_and_cached_reuse(self):
+        from research_platform.construction import _LOADED_CODE_IDENTITY
+        provider = FixtureProvider({})
+        with tempfile.TemporaryDirectory() as t:
+            journal = RunJournal(Path(t), provider, dict(limits=dict(usd=1, repairs=0)))
+            journal.ask('construction_select', 'test', {}, SELECT)
+            changed = dict(_LOADED_CODE_IDENTITY, integrated_py='changed')
+            with patch('research_platform.construction._current_code_identity', return_value=changed):
+                for prompt in ('test', 'new request'):
+                    with self.assertRaisesRegex(AIError, 'Application source changed'):
+                        journal.ask('construction_select', prompt, {}, SELECT)
+            self.assertEqual(len(provider.requests), 1)
+            self.assertEqual(journal.state['status'], 'incomplete')
+            self.assertIsNone(journal.state['pending_call'])
+
+    def test_source_change_during_response_settles_once_and_allows_exact_resume(self):
+        from research_platform.construction import _LOADED_CODE_IDENTITY
+        from research_platform.budget import BudgetLedger
+        provider = FixtureProvider({})
+        original_complete = provider.complete
+        identity = dict(_LOADED_CODE_IDENTITY)
+        def completed_then_changed(**kwargs):
+            answer = original_complete(**kwargs)
+            identity['integrated.py'] = 'changed'
+            return answer
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            first = root/'first'; first.mkdir()
+            second = root/'second'; second.mkdir()
+            ledger = BudgetLedger(root/'budget.json', 'Synthetic runtime guard', 1)
+            config = dict(limits=dict(usd=1, repairs=0, retries=1))
+            journal = RunJournal(first, provider, config, ledger=ledger)
+            with patch('research_platform.construction._current_code_identity', side_effect=lambda: dict(identity)), \
+                    patch.object(provider, 'complete', side_effect=completed_then_changed):
+                with self.assertRaisesRegex(AIError, 'Application source changed'):
+                    journal.ask('construction_select', 'test', {}, SELECT)
+            state = json.loads((first/'record.json').read_text())
+            calls = [json.loads(line) for line in (first/'calls.jsonl').read_text().splitlines()]
+            self.assertIsNone(state['pending_call'])
+            self.assertEqual(calls, state['calls'])
+            self.assertIn('result', calls[0])
+            self.assertNotIn('error', calls[0])
+            self.assertEqual(state['usage']['total_tokens'], 150)
+            totals = ledger.summary()
+            self.assertEqual(totals['settled_requests'], 1)
+            self.assertEqual(totals['unresolved_reservations_usd'], 0)
+            self.assertGreater(totals['incurred_estimates_usd'], 0)
+            resumed = RunJournal(second, provider, config, previous=state, ledger=ledger)
+            with patch.object(provider, 'complete', side_effect=AssertionError('Must reuse saved response')):
+                answer = resumed.ask('construction_select', 'test', {}, SELECT)
+            self.assertEqual(answer, calls[0]['result'])
+            self.assertEqual(ledger.summary()['known_cost_usd'], totals['known_cost_usd'])
+
     def test_known_charge_retry_is_bounded_and_unknown_charge_never_retries(self):
         p=FixtureProvider({});original=p.complete;count=0
         def once(**kwargs):

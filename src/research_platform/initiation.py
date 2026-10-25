@@ -1797,10 +1797,17 @@ def export_workbook(path, record):
 
 
 @contextmanager
-def _initiation_lock(outputs):
-    """An OS lock releases even after a killed process; the file is not a busy flag."""
+def _initiation_lock(outputs, *, scope=None):
+    """Lock historical initiation globally, or one construction company budget.
+
+    OS locks release after process termination; files are not persistent busy
+    flags. Construction scope is the same stable company key as its ledger.
+    """
+    if scope is not None and (not isinstance(scope,str) or not re.fullmatch(r'[0-9a-f]{24}',scope)):
+        raise ValueError('Construction lock scope must be a stable hexadecimal company key')
     outputs.mkdir(parents=True, exist_ok=True)
-    with (outputs / ".initiation.lock").open("a+b") as handle:
+    filename='.construction_'+scope+'.lock' if scope is not None else '.initiation.lock'
+    with (outputs / filename).open("a+b") as handle:
         if handle.tell() == 0:
             handle.write(b"0")
             handle.flush()
@@ -1813,7 +1820,8 @@ def _initiation_lock(outputs):
                 import fcntl
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            raise AIError("Another initiation is active in this project; no second run was started.") from None
+            message='Another construction for this company is active; no second run was started.' if scope is not None else 'Another initiation is active in this project; no second run was started.'
+            raise AIError(message) from None
         try:
             yield
         finally:
