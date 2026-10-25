@@ -12,13 +12,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from research_platform.ai import AIError, OpenAIProvider, response_usage
-from research_platform.budget import BudgetLedger
-from research_platform.construction import RunJournal, calculate_integrated, validate_integrated, digest
-from research_platform.integrated import (build_integrated_spec, financial_sensitivities,
-    integrated_runtime_fingerprint,integrated_source_cache_key,verified_integrated_record,
-    compatible_integrated_result,cached_integrated_source_checks,select_integrated_previous)
-from research_platform.evidence import parse_number
+from company_initiation.shared_ai import AIError, OpenAIProvider, response_usage
+from company_initiation.shared_budget import BudgetLedger
+from company_initiation.shared_runtime import RunJournal, digest
+from company_initiation.forecast_construction.construction import calculate_integrated, validate_integrated
+from company_initiation.forecast_construction.integrated import build_integrated_spec, financial_sensitivities, integrated_runtime_fingerprint, integrated_source_cache_key, verified_integrated_record, compatible_integrated_result, cached_integrated_source_checks, select_integrated_previous
+from company_initiation.historic_construction.evidence import parse_number
 
 
 def weighted_reference_value(reference):
@@ -124,7 +123,7 @@ class IntegratedCompilerTests(unittest.TestCase):
         self.assertAlmostEqual(self.values["total_assets"]["2026"], self.values["liabilities_equity"]["2026"])
 
     def test_initialization_expressions_reproduce_signed_source_ratios_and_asset_timing(self):
-        from research_platform.construction import expression_tree, formula_value
+        from company_initiation.shared_runtime import expression_tree, formula_value
         found=[]
         for row in self.spec['rows']:
             if 'initialization_expression' not in row:
@@ -312,11 +311,11 @@ class HistoricalReferenceWeightsTests(unittest.TestCase):
     def test_repeated_linear_dependency_is_counted_once_with_its_combined_weight(self):
         # Use an algebraically equivalent expansion to exercise a repeated AST
         # dependency through the actual compiler's private provenance helper.
-        from research_platform.construction import expression_tree as original_tree
+        from company_initiation.shared_runtime import expression_tree as original_tree
         def expanded(expression):
             return original_tree('sales + sales - sales + other_revenue'
                 if expression=='sales + other_revenue' else expression)
-        with patch('research_platform.construction.expression_tree',side_effect=expanded):
+        with patch('company_initiation.shared_runtime.expression_tree',side_effect=expanded):
             spec=build_integrated_spec(self.data,2)
             values=calculate_integrated(spec)
         row=next(r for r in spec['rows'] if r['id']=='total_revenue')
@@ -451,7 +450,7 @@ class IntegratedReuseTests(unittest.TestCase):
         self.assertEqual(recovery['excluded_runs'][0]['calls_sha256'],hashlib.sha256((Path(child['directory'])/'calls.jsonl').read_bytes()).hexdigest())
         continuation=self.outputs/'construct_recovery';continuation.mkdir()
         journal=RunJournal(continuation,provider,self.config,previous=selected,ledger=ledger)
-        with patch('research_platform.ai.urlopen') as network,patch.object(provider,'complete',side_effect=AssertionError('No dispatch on exact reuse')):
+        with patch('company_initiation.shared_ai.urlopen') as network,patch.object(provider,'complete',side_effect=AssertionError('No dispatch on exact reuse')):
             self.assertEqual(journal.ask('integrated_review','fixture',{},schema),{'ok':True});network.assert_not_called()
         for record in [journal.state,child,self.record]:ledger.import_record(record)
         self.assertEqual(ledger.summary(),before)
@@ -471,7 +470,7 @@ class IntegratedReuseTests(unittest.TestCase):
             select_integrated_previous(prior,self.outputs,self.data['company'],self.run)
 
     def test_exact_accepted_result_and_source_checks_can_reuse_without_provider(self):
-        with patch('research_platform.ai.urlopen') as network,patch.object(OpenAIProvider,'from_env',side_effect=AssertionError('No credentials for reuse')):
+        with patch('company_initiation.shared_ai.urlopen') as network,patch.object(OpenAIProvider,'from_env',side_effect=AssertionError('No credentials for reuse')):
             verified=verified_integrated_record(self.run,self.outputs)
             self.assertTrue(compatible_integrated_result(verified,self.config,self.runtime,self.key))
             checks=cached_integrated_source_checks(verified,self.key)
@@ -485,7 +484,7 @@ class IntegratedReuseTests(unittest.TestCase):
         metadata=provider.metadata()
         self.assertEqual(metadata,json.loads(json.dumps(metadata)))
         self.config['provider']=metadata;self.save()
-        with patch('research_platform.ai.urlopen') as network:
+        with patch('company_initiation.shared_ai.urlopen') as network:
             verified=verified_integrated_record(self.run,self.outputs)
             self.assertTrue(compatible_integrated_result(verified,self.config,self.runtime,self.key))
             network.assert_not_called()
@@ -499,7 +498,7 @@ class IntegratedReuseTests(unittest.TestCase):
         variants.append(integrated_source_cache_key(self.data,{'manifest_sha256':'changed'},self.runtime))
         changed=copy.deepcopy(self.runtime);changed['parsers']['pypdf']='different'
         variants.append(integrated_source_cache_key(self.data,self.inventory,changed))
-        changed=copy.deepcopy(self.runtime);changed['code']['evidence.py']='different'
+        changed=copy.deepcopy(self.runtime);changed['code']['company_initiation/historic_construction/evidence.py']='different'
         variants.append(integrated_source_cache_key(self.data,self.inventory,changed))
         self.assertTrue(all(key!=self.key for key in variants))
         verified=verified_integrated_record(self.run,self.outputs)
@@ -537,8 +536,8 @@ class IntegratedReuseTests(unittest.TestCase):
 
 class ConstructionScopeLockTests(unittest.TestCase):
     def test_independent_companies_can_run_but_same_company_cannot_branch(self):
-        from research_platform.budget import company_key
-        from research_platform.initiation import _initiation_lock
+        from company_initiation.shared_budget import company_key
+        from company_initiation.historic_construction.initiation import _initiation_lock
         with tempfile.TemporaryDirectory() as temp:
             outputs=Path(temp)/'outputs'
             first=company_key('Synthetic Alpha plc');second=company_key('Synthetic Beta plc')
@@ -552,8 +551,8 @@ class ConstructionScopeLockTests(unittest.TestCase):
             self.assertTrue((outputs/('.construction_'+first+'.lock')).exists())
 
     def test_invalid_scope_rejected_and_error_releases_real_os_lock(self):
-        from research_platform.budget import company_key
-        from research_platform.initiation import _initiation_lock
+        from company_initiation.shared_budget import company_key
+        from company_initiation.historic_construction.initiation import _initiation_lock
         with tempfile.TemporaryDirectory() as temp:
             outputs=Path(temp)/'outputs';scope=company_key('Synthetic Alpha plc')
             with self.assertRaisesRegex(ValueError,'hexadecimal company key'):
@@ -574,7 +573,7 @@ class JournalReservationContinuationTests(unittest.TestCase):
             root=Path(temp);first=root/"first";first.mkdir();second=root/"second";second.mkdir()
             ledger=BudgetLedger(root/"budget.json",company,20.)
             journal=RunJournal(first,provider,config,ledger=ledger)
-            with patch("research_platform.ai.urlopen") as network, patch.object(provider,"complete",side_effect=AIError("Synthetic timeout")):
+            with patch("company_initiation.shared_ai.urlopen") as network, patch.object(provider,"complete",side_effect=AIError("Synthetic timeout")):
                 with self.assertRaisesRegex(AIError,"Synthetic timeout"):
                     journal.ask("integrated_review","fixture",{"batch":"first"},schema)
                 network.assert_not_called()
@@ -591,7 +590,7 @@ class JournalReservationContinuationTests(unittest.TestCase):
                 provider.last_response=dict(model="gpt-6-luna",status="completed",id="resp_synthetic",
                     usage=dict(input_tokens=100,output_tokens=50,total_tokens=150),output=[])
                 return {"ok":True}
-            with patch("research_platform.ai.urlopen") as network,patch.object(provider,"complete",side_effect=complete) as call:
+            with patch("company_initiation.shared_ai.urlopen") as network,patch.object(provider,"complete",side_effect=complete) as call:
                 self.assertEqual(resumed.ask("integrated_review","fixture",{"batch":"second"},schema),{"ok":True})
                 self.assertEqual(resumed.ask("integrated_review","fixture",{"batch":"second"},schema),{"ok":True})
                 self.assertEqual(call.call_count,1)
@@ -625,7 +624,7 @@ class IntegratedEscalationTests(unittest.TestCase):
             def complete(**kwargs):
                 provider.last_response=dict(model="gpt-6.1-sol",usage=dict(input_tokens=10,output_tokens=5,total_tokens=15),output=[])
                 return {"ok":True}
-            with patch("research_platform.ai.urlopen") as network,patch.object(provider,"complete",side_effect=complete) as call:
+            with patch("company_initiation.shared_ai.urlopen") as network,patch.object(provider,"complete",side_effect=complete) as call:
                 self.assertEqual(journal.ask("integrated_schedules","synthetic review",{},schema),{"ok":True})
                 with self.assertRaisesRegex(AIError,"Non-Luna"):
                     journal.ask("integrated_structure","synthetic review",{},schema)
@@ -658,7 +657,7 @@ class IntegratedEscalationTests(unittest.TestCase):
                     call.assert_not_called();allowance.assert_not_called()
 
     def test_integrated_route_persists_evidence_without_changing_model_settings(self):
-        from research_platform.integrated import construct_integrated
+        from company_initiation.forecast_construction.integrated import construct_integrated
         class ReachedJournal(Exception):pass
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);archive=root/"sources";archive.mkdir()
@@ -667,9 +666,9 @@ class IntegratedEscalationTests(unittest.TestCase):
             evidence.write_text(json.dumps(expected),encoding="utf-8")
             provider=OpenAIProvider(api_key="SYNTHETIC-TEST-KEY",
                 stage_models={"integrated_schedules":"gpt-6.1-sol"},stage_efforts={"integrated_schedules":"medium"})
-            with patch("research_platform.integrated.inventory_local_sources",return_value={"manifest_sha256":"synthetic"}), \
-                    patch("research_platform.integrated.RunJournal",side_effect=ReachedJournal) as journal, \
-                    patch("research_platform.ai.urlopen") as network:
+            with patch("company_initiation.forecast_construction.integrated.inventory_local_sources",return_value={"manifest_sha256":"synthetic"}), \
+                    patch("company_initiation.forecast_construction.integrated.RunJournal",side_effect=ReachedJournal) as journal, \
+                    patch("company_initiation.shared_ai.urlopen") as network:
                 with self.assertRaises(ReachedJournal):
                     construct_integrated(root,"Synthetic Escalation Company",archive,inputs,
                                          provider=provider,escalation_file=evidence)
@@ -680,25 +679,25 @@ class IntegratedEscalationTests(unittest.TestCase):
                 network.assert_not_called()
 
     def test_cli_passes_escalation_file_to_integrated_route(self):
-        from research_platform.__main__ import main
+        from company_initiation.__main__ import main
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)
             argv=["research_platform","construct","Synthetic Company","--sources",str(root),
                   "--model-inputs","synthetic-inputs.json","--escalation-evidence","synthetic-escalation.json"]
-            with patch("sys.argv",argv),patch("research_platform.__main__.find_project_root",return_value=root), \
-                    patch("research_platform.workflow.ensure_company_history_research",return_value=Path('synthetic-inputs.json')), \
-                    patch("research_platform.workflow.ensure_valuation_research",return_value=Path('synthetic-inputs.json')), \
-                    patch("research_platform.integrated.construct_integrated",return_value=root) as construct, \
-                    patch("research_platform.project.read_json",return_value=dict(status="complete_provisional",usage={},issues=[])), \
-                    patch("research_platform.ai.format_usage",return_value="synthetic"), \
-                    patch("research_platform.ai.format_stage_usage",return_value="synthetic"),patch("builtins.print"):
+            with patch("sys.argv",argv),patch("company_initiation.__main__.find_project_root",return_value=root), \
+                    patch("company_initiation.historic_construction.workflow.ensure_company_history_research",return_value=Path('synthetic-inputs.json')), \
+                    patch("company_initiation.dcf_construction.workflow.ensure_valuation_research",return_value=Path('synthetic-inputs.json')), \
+                    patch("company_initiation.forecast_construction.integrated.construct_integrated",return_value=root) as construct, \
+                    patch("company_initiation.shared_project.read_json",return_value=dict(status="complete_provisional",usage={},issues=[])), \
+                    patch("company_initiation.shared_ai.format_usage",return_value="synthetic"), \
+                    patch("company_initiation.shared_ai.format_stage_usage",return_value="synthetic"),patch("builtins.print"):
                 self.assertEqual(main(),0)
                 self.assertEqual(construct.call_args.kwargs["escalation_file"],"synthetic-escalation.json")
 
 
 class AutomaticReviewTests(unittest.TestCase):
     def run_review(self, answers, *, repair=None, limit=20, payload=None, calls=8):
-        from research_platform.integrated import REVIEW_SCHEMA
+        from company_initiation.forecast_construction.integrated import REVIEW_SCHEMA
         provider=OpenAIProvider(api_key='SYNTHETIC-TEST-KEY',max_output_tokens=500)
         routes=[]
         def complete(**kwargs):
@@ -709,7 +708,7 @@ class AutomaticReviewTests(unittest.TestCase):
         temp=tempfile.TemporaryDirectory();self.addCleanup(temp.cleanup)
         journal=RunJournal(Path(temp.name),provider,dict(limits=dict(usd=limit,calls=calls,repairs=1,retries=0,generated_tokens=10000)))
         self.last_review_journal=journal;self.last_review_routes=routes
-        with patch.object(provider,'complete',side_effect=complete),patch('research_platform.ai.urlopen') as network:
+        with patch.object(provider,'complete',side_effect=complete),patch('company_initiation.shared_ai.urlopen') as network:
             result=journal.review_stage('integrated_schedules','Evidence-based fixture review',payload or {},REVIEW_SCHEMA,repair_context=repair)
             network.assert_not_called()
         return result,routes,journal,provider
@@ -824,7 +823,7 @@ class AutomaticReviewTests(unittest.TestCase):
             self.run_review([self.answer(True),self.answer(True)],payload=payload)
 
     def test_owned_only_and_combined_asset_scope_follow_evidence(self):
-        from research_platform.integrated import asset_scope_context
+        from company_initiation.forecast_construction.integrated import asset_scope_context
         data=dict(historical={k:dict(values={'2031':v}) for k,v in [('owned',80),('rou',20),('reported',100)]},
             asset_scope=[dict(reported_role='reported',owned_role='owned',rou_role='rou',reported_scope='owned_and_rou',owned_expression='reported - rou',source_refs=[{'source_id':'synthetic_note'}])])
         self.assertEqual(asset_scope_context(data)[0]['reconciliations'][0]['expected'],100)
@@ -841,7 +840,7 @@ if __name__ == "__main__":
 
 class FrozenOriginalReuseTests(unittest.TestCase):
     def test_absent_original_reuses_exact_verified_parent_and_changed_live_file_rejects(self):
-        from research_platform.integrated import freeze_model_sources
+        from company_initiation.forecast_construction.integrated import freeze_model_sources
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive=root/'archive';archive.mkdir()
             outputs=root/'outputs';old=outputs/'old'/'sources';old.mkdir(parents=True)

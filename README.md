@@ -14,6 +14,44 @@ maintained project documents.
 
 ## Current state - 25 October 2026
 
+**Current task: package separation for auditability.** The application is now
+`company_initiation`. Construction runs historical research and reconstruction,
+then the operating forecast framework, then valuation research and DCF, before
+export. Shared root modules use the `shared_` prefix; FX lives in `src/shared_FX`.
+This is a location/boundary refactor, not a new financial-model revision or a
+claim of unattended company acceptance. No paid calls or company builds ran for
+this change. Verification: the full offline run completed **772 tests in 806.151 seconds**,
+with 771 passes and one stale test reference to the old evidence-file hash key.
+That test path was corrected; **all 60 targeted reuse, package-boundary and DCF
+checks then passed in 1.894 seconds**, including the formerly failing test.
+`doctor` passes. The full suite was not repeated after this test-only correction
+and two package-description docstring updates. The complete result and rerun
+receipt are preserved in `outputs/package_layout_verification_20261025.log`.
+The different-company cases are synthetic fixtures, not real-company validation.
+
+The historical package has no imports of forecast or DCF packages. It saves a
+`historical_model.json` audit projection alongside the cited
+`company_model_inputs.json` passed to forecast construction. Existing accounting
+research still gathers cited policy declarations with historical definitions;
+forecast equations and future values are constructed only in stage 2. Stage 3
+uses the evaluated operating model and the same cumulative journal and ledger.
+Refresh, scenario evaluation and export retain their zero-AI paths.
+
+The six bespoke Nestle preparation/review Python scripts under earlier `outputs`
+configuration folders were deleted at the user's request. Their produced data,
+workbooks, evidence and frozen run records remain. There is no company-name branch
+in the active engine. Company assumptions and mappings remain input data.
+
+Use `python -m company_initiation ...` for all commands. Existing
+`[tool.research-platform]` configuration keys and the distribution name are
+retained for settings compatibility. Source snapshot keys now include package
+paths and cover every stage plus shared FX; strict code compatibility may reject
+an old result for direct reuse. Existing charges, unresolved reservations and
+saved originals are preserved, not reset by the package rename.
+
+**Preserved pre-refactor run history follows.** References below to then-current
+runs and suites describe earlier executions; this refactor has not resumed them.
+
 **New revision in progress:** the latest request authorizes backend DCF plus actual
 CLI construction of Nestle, L'Oreal and Danone using each company's raw sources.
 The earlier stop on the latter two and shared $20 budget are superseded: each now
@@ -374,17 +412,17 @@ remain zero-AI.
 After an editable install, the normal commands are:
 
 ```powershell
-python -m research_platform construct "Company name, ticker, exchange" --sources local_store/company
-python -m research_platform update RUN
-python -m research_platform refresh-fx RUN
-python -m research_platform export RUN
+python -m company_initiation construct "Company name, ticker, exchange" --sources local_store/company
+python -m company_initiation update RUN
+python -m company_initiation refresh-fx RUN
+python -m company_initiation export RUN
 ```
 
 To evaluate a backend scenario without opening Excel or calling an AI provider:
 
 ```powershell
-python -m research_platform evaluate RUN --assumptions path/to/assumptions.json
-python -m research_platform export EVALUATION_RUN
+python -m company_initiation evaluate RUN --assumptions path/to/assumptions.json
+python -m company_initiation export EVALUATION_RUN
 ```
 
 Build the `financial_assumptions_v1` payload from the saved `input_contract.json`:
@@ -411,13 +449,13 @@ update the database independently of any company:
 
 ```powershell
 python -m pip install -e ".[ibkr]"
-python -m research_platform fx-import
-python -m research_platform fx-update --diagnostic --pairs EUR/USD USD/CHF USD/MXN
-python -m research_platform fx-update
-python -m research_platform fx-update-ecb
-python -m research_platform fx-status
-python -m research_platform refresh-fx RUN
-python -m research_platform export RUN
+python -m company_initiation fx-import
+python -m company_initiation fx-update --diagnostic --pairs EUR/USD USD/CHF USD/MXN
+python -m company_initiation fx-update
+python -m company_initiation fx-update-ecb
+python -m company_initiation fx-status
+python -m company_initiation refresh-fx RUN
+python -m company_initiation export RUN
 ```
 
 `fx-update` requests only recent missing dates plus the configured seven-day overlap
@@ -438,7 +476,7 @@ uses the database. Export uses saved inputs without refreshing either source.
 
 For Windows Task Scheduler, create a daily task under the logged-in local user.
 Program: the absolute project `.venv\Scripts\python.exe` path. Arguments:
-`-m research_platform fx-update`. Start in: the project root. Schedule after the
+`-m company_initiation fx-update`. Start in: the project root. Schedule after the
 chosen market close, keep TWS/IB Gateway running and authenticated, and inspect the
 saved `outputs/fx_update_*/result.json` and task exit status. Do not create an
 unattended-login claim: periodic broker reauthentication remains necessary. No task
@@ -457,7 +495,7 @@ reported above; an unavailable contract is not treated as a request to buy data.
 For the current acceptance date:
 
 ```powershell
-python -m research_platform construct "Nestlé S.A., NESN, SIX, Switzerland" --sources local_store/nestle --as-of 2026-10-23
+python -m company_initiation construct "Nestlé S.A., NESN, SIX, Switzerland" --sources local_store/nestle --as-of 2026-10-23
 ```
 
 The default is ten completed fiscal years and five forecast years. `--years` selects
@@ -685,7 +723,7 @@ file; missing archive evidence is not proof of company non-disclosure.
 From the project root after installation and private API configuration:
 
 ```powershell
-.\.venv\Scripts\python.exe -m research_platform initiate "Nestlé S.A., NESN, SIX, Switzerland" --sources local_store/nestle
+.\.venv\Scripts\python.exe -m company_initiation initiate "Nestlé S.A., NESN, SIX, Switzerland" --sources local_store/nestle
 ```
 
 The default requests ten fully reported fiscal years evidenced in the archive,
@@ -693,7 +731,7 @@ including their reported interims. It cannot silently accept fewer years.
 For the smaller initial validation slice:
 
 ```powershell
-.\.venv\Scripts\python.exe -m research_platform initiate "Nestlé S.A., NESN, SIX, Switzerland" --sources local_store/nestle --years 2024 2025
+.\.venv\Scripts\python.exe -m company_initiation initiate "Nestlé S.A., NESN, SIX, Switzerland" --sources local_store/nestle --years 2024 2025
 ```
 
 Use `--history-years N` instead of `--years` for a different count.
@@ -879,7 +917,7 @@ enter prompts or run/code snapshots. Credential values were not printed or chang
 only the three private model-selection lines were migrated to Luna.
 
 ```powershell
-.\.venv\Scripts\python.exe -m research_platform doctor
+.\.venv\Scripts\python.exe -m company_initiation doctor
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
@@ -916,19 +954,17 @@ structures can still prevent completion. These limits cannot justify omissions.
 
 | Location | Purpose |
 |---|---|
-| `src/research_platform/initiation.py` | Reporting map, model/history ledger, checks, reviews, Excel and resume |
-| `src/research_platform/construction.py` | Original construction workflow, shared financial expressions, source contracts and desktop Excel verification |
-| `src/research_platform/integrated.py` | Company specification compiler, integrated statements, period schedules and successor research context |
-| `src/research_platform/periods.py` | Fiscal calendars, typed observation derivations, compatible bases and the shared period calculation graph |
-| `src/research_platform/fx.py` | Source-format adapter, daily cross rates, spot-held projections and configured company baskets |
-| `src/research_platform/fx_store.py`, `src/research_platform/ibkr.py` | Shared SQLite evidence/snapshots and optional read-only TWS ingestion |
-| `src/research_platform/model_excel.py` | Assumptions-led workbook renderer, live Excel sensitivities and temporary-copy visual exports |
-| `src/research_platform/workflow.py` | Dated official discovery, fresh-company research inputs, disclosure reconciliation and zero-AI refresh/export |
-| `src/research_platform/budget.py` | One cumulative cost ledger, durable requests and unresolved reservations |
-| `src/research_platform/evidence.py` | Local inventory, unchanged originals, parsing, search/read and numeric references |
-| `src/research_platform/ai.py` | Private settings, provider, reasoning, stable context, tokens/prices and allowance |
-| `src/research_platform/__main__.py` | CLI commands and live timer |
-| `src/research_platform/project.py`, `__init__.py` | Project discovery, saved JSON and package identity |
+| `src/company_initiation/__main__.py` | Public CLI and ordered stage handoffs |
+| `src/company_initiation/historic_construction/` | `evidence.py`: originals and parsing; `initiation.py`: strict historical workflow; `workflow.py`: discovery, historical reconstruction and review; `model_contract.py`: historical definitions and handoff; `periods.py`: calendars and compatible historical derivations |
+| `src/company_initiation/forecast_construction/` | `integrated.py`: operating model and schedules; `periods.py`: forecast graph/scenarios; `construction.py`: original generic construction and Excel checks; `workflow.py`: refresh/export; `model_excel.py`: workbook rendering |
+| `src/company_initiation/dcf_construction/` | `valuation.py`: deterministic DCF; `workflow.py`: valuation evidence, assumptions and stage-3 calculation |
+| `src/company_initiation/shared_ai.py` | Shared provider settings, API requests, token accounting and allowances |
+| `src/company_initiation/shared_budget.py` | Shared cumulative company ledgers and unresolved reservations |
+| `src/company_initiation/shared_runtime.py` | Shared schemas, restricted expressions, request journals, JSON persistence and runtime source identity |
+| `src/company_initiation/shared_artifacts.py` | Shared source freezing, saved-run validation and source snapshots |
+| `src/company_initiation/shared_project.py` | Shared checkout discovery and saved JSON loading |
+| `src/shared_FX/` | `fx.py`: source adapter, rates and configured baskets; `fx_store.py`: shared SQLite/snapshots; `ibkr.py`: read-only TWS ingestion |
+| `tests/test_package_layout.py` | Dependency direction, historical-only output and a synthetic different-company structure |
 | `tests/test_setup.py` | Offline synthetic financial/provider/parser/workflow checks |
 | `tests/test_construction.py` | Known-answer construction, economic-error, workbook and cost/resume cases |
 | `tests/test_integrated_model.py`, `tests/test_integrated_graph.py`, `tests/test_model_sources.py` | Financial controls, exact source normalization, graph and saved-result integrity |
@@ -947,6 +983,10 @@ code stays removed; preserved synthetic outputs and the first Nestlé annual
 reference are historical artifacts, not current inputs.
 
 ## Next milestone
+
+Package separation is verified to the extent recorded above. The following
+real-company milestone remains pending; the relocation does not resume it or
+establish successful company builds.
 
 Complete the newly authorized public-CLI builds for Nestlé, L'Oréal and Danone,
 including the remaining financial corrections and deterministic backend DCF.
@@ -967,6 +1007,7 @@ three requested real-company trials.
 
 | Date | Status | Decision |
 |---|---|---|
+| 25 October 2026 | Confirmed package-layout change | Rename `research_platform` to `company_initiation`; run history, forecast framework and DCF in order. Historical construction cannot import downstream stages. Shared functions remain at package root with `shared_` names; FX moves to `src/shared_FX`. Preserve calculation behavior, company-neutral inputs, budgets and prior run evidence. Delete bespoke Nestle preparation scripts rather than retaining text copies. No paid calls or company builds for this refactor. |
 | 25 October 2026 | New scope authorized; implementation and real trials in progress | Add deterministic backend DCF and complete public-CLI Nestlé, L'Oréal and Danone builds. Each company has its own cumulative $20 cap, including attributable old charges and unresolved reservations; the old shared ledger remains preserved. New-company inputs must be application-generated from raw sources. This supersedes the earlier pause on L'Oréal/Danone and DCF exclusion. No forecasting agent or probabilistic engine is authorized. |
 | 25 October 2026 | Coverage and scope corrections verified locally; live continuation running | An annual-only source selection can omit available interim statements despite passing token checks. Relevant primary candidates now require examination or cited exclusion, and positive cadence survives compatible continuations as pending revalidation. Cited basis adjudication preserves accounting distinctions without exact prose matching; substantive negative findings stop outside output-repair retries. Scope repairs retain their own prior answer and freeze unaffected records; full validation remains mandatory. The combined focused check passes 141 tests. |
 | 25 October 2026 | Numeric repair and exact continuation verified locally; real trials running | Whole-answer numeric repairs lacked their previous answer and could lose valid rows. Preserve the own-task response, bind corrections to exact entry identities, freeze unaffected rows and validate the complete merged answer. Blind reconstruction sees only its own previous response. A validated but unconsumed historical version-repair route should resume from exact saved evidence and response identity, with the full gate still required afterward. |

@@ -12,9 +12,9 @@ from openpyxl import Workbook, load_workbook
 
 from tests.test_integrated_model import second_company
 from tests.test_fx import source_workbook
-from research_platform.fx import load_fx_source
-from research_platform.integrated import build_periodic_spec,segment_research_context
-from research_platform.periods import build_periods,calculate_periodic,validate_periodic
+from shared_FX.fx import load_fx_source
+from company_initiation.forecast_construction.integrated import build_periodic_spec, segment_research_context
+from company_initiation.forecast_construction.periods import build_periods, calculate_periodic, validate_periodic
 
 
 def different_period_company():
@@ -382,8 +382,8 @@ class DifferentCompanyPeriodModelTests(unittest.TestCase):
         compilers, reconciliation, sensitivities and XLSX export run normally.
         This proves workflow reuse; it does not validate AI research or Excel COM.
         """
-        from research_platform.ai import OpenAIProvider
-        from research_platform.integrated import construct_integrated
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.forecast_construction.integrated import construct_integrated
         data=different_period_company()
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);archive=root/'originals'
@@ -393,11 +393,11 @@ class DifferentCompanyPeriodModelTests(unittest.TestCase):
             def review(**kwargs):
                 provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=20,output_tokens=10,total_tokens=30),output=[])
                 return dict(findings=[],summary='SYNTHETIC mock verdict; no external research performed.')
-            with patch('research_platform.ai.urlopen') as network, \
+            with patch('company_initiation.shared_ai.urlopen') as network, \
                     patch.object(provider,'complete',side_effect=review) as calls, \
-                    patch('research_platform.integrated.recalculate_workbook',return_value={
+                    patch('company_initiation.forecast_construction.integrated.recalculate_workbook',return_value={
                         'status':'passed','boundary':'MOCK: desktop Excel is not exercised'}) as recalc, \
-                    patch('research_platform.model_excel.verify_excel_sensitivities',return_value={
+                    patch('company_initiation.forecast_construction.model_excel.verify_excel_sensitivities',return_value={
                         'status':'passed','boundary':'MOCK: desktop Excel sensitivities are not exercised'}) as excel_sensitivity:
                 directory=construct_integrated(root,data['company'],archive,inputs,provider=provider,forecast_years=2)
                 self.assertEqual(calls.call_count,5)

@@ -8,20 +8,20 @@ import unittest
 import json
 from unittest.mock import patch, Mock
 
-from research_platform.workflow import freshness_checks
-from research_platform.valuation import VALUATION_RESEARCH_VERSION
-from research_platform.integrated import build_periodic_spec, periodic_sensitivities
-from research_platform.periods import calculate_periodic
+from company_initiation.historic_construction.workflow import freshness_checks
+from company_initiation.dcf_construction.valuation import VALUATION_RESEARCH_VERSION
+from company_initiation.forecast_construction.integrated import build_periodic_spec, periodic_sensitivities
+from company_initiation.forecast_construction.periods import calculate_periodic
 from tests.test_periodic_model import different_period_company
 
 
 class DiscoveryCheckpointTests(unittest.TestCase):
     def prepare(self, root, *, unknown=False):
         from datetime import datetime,timezone
-        from research_platform.ai import OpenAIProvider
-        from research_platform.construction import RunJournal
-        from research_platform.evidence import inventory_local_sources
-        from research_platform.workflow import discover_releases
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.evidence import inventory_local_sources
+        from company_initiation.historic_construction.workflow import discover_releases
         archive=root/'archive';(archive/'financial_reports').mkdir(parents=True)
         (archive/'financial_reports'/'seed.pdf').write_bytes(b'%PDF synthetic unchanged initial original')
         outputs=root/'outputs';first=outputs/'construct_research_first';first.mkdir(parents=True)
@@ -44,38 +44,38 @@ class DiscoveryCheckpointTests(unittest.TestCase):
         class ObservedEarlier(datetime):
             @classmethod
             def now(cls,tz=None):return cls(2026,10,24,12,tzinfo=timezone.utc)
-        with patch.object(provider,'complete',side_effect=complete),patch('research_platform.workflow.datetime',ObservedEarlier), \
-                patch('research_platform.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF synthetic selected original',pdf,'application/pdf')):
+        with patch.object(provider,'complete',side_effect=complete),patch('company_initiation.historic_construction.workflow.datetime',ObservedEarlier), \
+                patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF synthetic selected original',pdf,'application/pdf')):
             fresh,sources=discover_releases(journal,archive,[index],'2026-10-25',latest_completed_year=2025,
                 historical_years=[2025],fiscal_calendar={'fiscal_year_end':'12-31'})
         record=json.loads((first/'record.json').read_text(encoding='utf-8'))
         return archive,outputs,record,provider,config,index,fresh,sources
 
     def restore(self, archive, record, index, **changes):
-        from research_platform.workflow import restore_discovery_checkpoint
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.historic_construction.workflow import restore_discovery_checkpoint
+        from company_initiation.historic_construction.evidence import inventory_local_sources
         kwargs=dict(company='SYNTHETIC checkpoint',historical_years=[2025],latest_completed_year=2025,fiscal_calendar={'fiscal_year_end':'12-31'})
         kwargs.update(changes)
         return restore_discovery_checkpoint(record,[record],archive,inventory_local_sources(archive),[index],
             kwargs.pop('as_of','2026-10-25'),**kwargs)
 
     def replay(self, archive, outputs, records, provider, config, index, name):
-        from research_platform.construction import RunJournal
-        from research_platform.evidence import inventory_local_sources
-        from research_platform.workflow import restore_discovery_checkpoint,discover_releases
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.evidence import inventory_local_sources
+        from company_initiation.historic_construction.workflow import restore_discovery_checkpoint, discover_releases
         parent=records[-1];checkpoint=restore_discovery_checkpoint(parent,records,archive,inventory_local_sources(archive),
             [index],'2026-10-25',company=config['company'],historical_years=[2025],latest_completed_year=2025,
             fiscal_calendar={'fiscal_year_end':'12-31'})
         directory=outputs/name;directory.mkdir();journal=RunJournal(directory,provider,config,previous=parent)
         journal.state['parent_run']=parent['directory'];journal.artifact('inventory.json',inventory_local_sources(archive))
-        with patch('research_platform.evidence.download',side_effect=AssertionError('No transitive network fallback')), \
+        with patch('company_initiation.historic_construction.evidence.download',side_effect=AssertionError('No transitive network fallback')), \
                 patch.object(provider,'complete',side_effect=AssertionError('No transitive AI fallback')):
             fresh,sources=discover_releases(journal,archive,[index],'2026-10-25',latest_completed_year=2025,
                 historical_years=[2025],fiscal_calendar={'fiscal_year_end':'12-31'},checkpoint=checkpoint)
         return json.loads((directory/'record.json').read_text(encoding='utf-8')),checkpoint,fresh,sources
 
     def test_repeated_continuation_follows_exact_proof_while_retaining_latest_state(self):
-        from research_platform.workflow import _validate_discovery_coverage
+        from company_initiation.historic_construction.workflow import _validate_discovery_coverage
         with tempfile.TemporaryDirectory() as temporary:
             archive,outputs,first,provider,config,index,prior,_=self.prepare(Path(temporary),unknown=True)
             before={p:p.read_bytes() for p in archive.rglob('*.pdf')};records=[first]
@@ -94,8 +94,8 @@ class DiscoveryCheckpointTests(unittest.TestCase):
             self.assertEqual({p:p.read_bytes() for p in before},before)
 
     def test_continuation_proof_rejects_tampering_forged_calls_and_nonancestor_targets(self):
-        from research_platform.evidence import inventory_local_sources
-        from research_platform.workflow import restore_discovery_checkpoint
+        from company_initiation.historic_construction.evidence import inventory_local_sources
+        from company_initiation.historic_construction.workflow import restore_discovery_checkpoint
         for change in ('bytes','target_hash','calls','target','cycle','scope'):
             with self.subTest(change=change),tempfile.TemporaryDirectory() as temporary:
                 archive,outputs,first,provider,config,index,_,_=self.prepare(Path(temporary))
@@ -117,8 +117,8 @@ class DiscoveryCheckpointTests(unittest.TestCase):
 
     def test_completed_replay_uses_no_network_or_ai_and_preserves_unknown_observation_date_and_obligations(self):
         from datetime import datetime,timezone
-        from research_platform.construction import RunJournal
-        from research_platform.workflow import discover_releases,_validate_discovery_coverage
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.workflow import discover_releases, _validate_discovery_coverage
         with tempfile.TemporaryDirectory() as temporary:
             archive,outputs,record,provider,config,index,prior,prior_sources=self.prepare(Path(temporary),unknown=True)
             checkpoint=self.restore(archive,record,index)
@@ -127,9 +127,9 @@ class DiscoveryCheckpointTests(unittest.TestCase):
                 @classmethod
                 def now(cls,tz=None):return cls(2026,10,27,12,tzinfo=timezone.utc)
             before={p:p.read_bytes() for p in archive.rglob('*.pdf')}
-            with patch('research_platform.evidence.download',side_effect=AssertionError('No network replay')), \
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=AssertionError('No network replay')), \
                     patch.object(provider,'complete',side_effect=AssertionError('No AI selection replay')), \
-                    patch('research_platform.workflow.datetime',ReplayedLater):
+                    patch('company_initiation.historic_construction.workflow.datetime',ReplayedLater):
                 fresh,sources=discover_releases(journal,archive,[index],'2026-10-25',latest_completed_year=2025,
                     historical_years=[2025],fiscal_calendar={'fiscal_year_end':'12-31'},checkpoint=checkpoint)
             self.assertEqual(fresh['status'],'discovered_pending_numeric_validation')
@@ -145,7 +145,7 @@ class DiscoveryCheckpointTests(unittest.TestCase):
             self.assertEqual(prior['discovery_contract_fingerprint'],fresh['discovery_contract_fingerprint'])
 
     def test_scope_changes_are_not_reusable_and_source_metadata_or_bytes_changes_fail_explicitly(self):
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.historic_construction.evidence import inventory_local_sources
         with tempfile.TemporaryDirectory() as temporary:
             archive,outputs,record,provider,config,index,_,_=self.prepare(Path(temporary))
             for changes in (dict(as_of='2026-10-26'),dict(company='Different Company'),dict(historical_years=[2024,2025]),
@@ -168,8 +168,8 @@ class DiscoveryCheckpointTests(unittest.TestCase):
                     self.restore(archive,record,index)
 
     def test_legacy_replay_revalidates_dates_and_selector_settings_instead_of_trusting_hashes(self):
-        from research_platform.construction import RunJournal
-        from research_platform.workflow import discover_releases
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.workflow import discover_releases
         for change in ('date','prompt','provider','contract'):
             with self.subTest(change=change),tempfile.TemporaryDirectory() as temporary:
                 archive,outputs,record,provider,config,index,_,_=self.prepare(Path(temporary));checkpoint=self.restore(archive,record,index)
@@ -179,16 +179,16 @@ class DiscoveryCheckpointTests(unittest.TestCase):
                 elif change=='provider':checkpoint['provider']['max_output_tokens']=16000
                 else:checkpoint['freshness']['discovery_contract_fingerprint']='changed'
                 second=outputs/'construct_research_second';second.mkdir();journal=RunJournal(second,provider,config,previous=record)
-                with patch('research_platform.evidence.download',side_effect=AssertionError('No network fallback')), \
+                with patch('company_initiation.historic_construction.evidence.download',side_effect=AssertionError('No network fallback')), \
                         patch.object(provider,'complete',side_effect=AssertionError('No paid fallback')), \
                         self.assertRaisesRegex(ValueError,'publication|incompatible|contract changed'):
                     discover_releases(journal,archive,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2025],
                         fiscal_calendar={'fiscal_year_end':'12-31'},checkpoint=checkpoint)
 
     def test_newer_navigation_failure_uses_prior_navigation_complete_checkpoint_without_erasing_new_claims(self):
-        from research_platform.construction import RunJournal
-        from research_platform.workflow import restore_discovery_checkpoint,discover_releases
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.workflow import restore_discovery_checkpoint, discover_releases
+        from company_initiation.historic_construction.evidence import inventory_local_sources
         with tempfile.TemporaryDirectory() as temporary:
             archive,outputs,record,provider,config,index,_,_=self.prepare(Path(temporary))
             failed=outputs/'construct_research_failed';failed.mkdir();later=RunJournal(failed,provider,config,previous=record)
@@ -200,15 +200,15 @@ class DiscoveryCheckpointTests(unittest.TestCase):
             self.assertEqual(checkpoint['run'],record['directory'])
             restored=dict(obligations=[dict(detail='Unscoped required release remains unresolved',fiscal_year=None,period_kind='unknown',
                 period_end=None,evidence=[],period_scope_verified=False)],audit=[])
-            with patch('research_platform.evidence.download',side_effect=AssertionError('No network fallback')), \
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=AssertionError('No network fallback')), \
                     patch.object(provider,'complete',side_effect=AssertionError('No paid fallback')), \
                     self.assertRaisesRegex(ValueError,'Unscoped|unscoped|scope'):
                 discover_releases(later,archive,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2025],
                     fiscal_calendar={'fiscal_year_end':'12-31'},restored_coverage=restored,checkpoint=checkpoint)
 
     def test_legacy_navigation_complete_partial_resumes_download_phase_without_accepting_history(self):
-        from research_platform.construction import RunJournal
-        from research_platform.workflow import discover_releases
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.workflow import discover_releases
         with tempfile.TemporaryDirectory() as temporary:
             archive,outputs,record,provider,config,index,prior,sources=self.prepare(Path(temporary))
             directory=Path(record['directory']);downloads=json.loads((directory/'official_downloaded_originals.json').read_text())
@@ -221,7 +221,7 @@ class DiscoveryCheckpointTests(unittest.TestCase):
             checkpoint=self.restore(archive,record,index)
             self.assertEqual(checkpoint['mode'],'resume_after_navigation')
             second=outputs/'construct_research_second';second.mkdir();journal=RunJournal(second,provider,config,previous=record)
-            with patch('research_platform.evidence.download',side_effect=AssertionError('Saved downloads must be reused')), \
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=AssertionError('Saved downloads must be reused')), \
                     patch.object(provider,'complete',side_effect=AssertionError('Completed navigation must be reused')):
                 fresh,reused=discover_releases(journal,archive,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2025],
                     fiscal_calendar={'fiscal_year_end':'12-31'},checkpoint=checkpoint)
@@ -232,11 +232,11 @@ class DiscoveryCheckpointTests(unittest.TestCase):
 
 class NumericEntryRepairTests(unittest.TestCase):
     def fixture(self,root,*,repairs=2):
-        from research_platform.ai import OpenAIProvider
-        from research_platform.construction import RunJournal
-        from research_platform.evidence import SourceStore
-        from research_platform.integrated import integrated_role_contract
-        from research_platform.workflow import _financial_mapping_schema,_materialize_financial_observations
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.evidence import SourceStore
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
+        from company_initiation.historic_construction.workflow import _financial_mapping_schema, _materialize_financial_observations
         data,answer,_,_,catalog,units=HistoricalVersionRevisionTests().fixture()
         units.append(dict(source_id='old',unit_id='page:2',text='Supplementary original 2020 cash-flow statement: 100.0.',
             numbers=[dict(raw='100.0',index=0)]))
@@ -267,8 +267,8 @@ class NumericEntryRepairTests(unittest.TestCase):
         journal.provider.last_response=dict(status='completed',usage=dict(input_tokens=1000,output_tokens=100,total_tokens=1100))
 
     def test_exact_failed_entry_patches_freeze_valid_versions_and_resume_without_calls(self):
-        from research_platform.workflow import _period_bounded_mapping_stage
-        from research_platform.construction import RunJournal,digest
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
+        from company_initiation.shared_runtime import RunJournal, digest
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);first=root/'first';first.mkdir();second=root/'second';second.mkdir()
             journal,context,schema,initial,expected,validate=self.fixture(first);requests=[]
@@ -292,7 +292,7 @@ class NumericEntryRepairTests(unittest.TestCase):
             self.assertEqual(resumed.state['usage'],saved['usage'])
 
     def test_patch_contract_rejects_frozen_mutation_erasure_or_unscoped_addition(self):
-        from research_platform.workflow import _period_bounded_mapping_stage
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
         for case in ('digest','valid_entry','basis','erase','omit','addition'):
             with self.subTest(case=case),tempfile.TemporaryDirectory() as temporary:
                 journal,context,schema,initial,expected,validate=self.fixture(Path(temporary));calls=[]
@@ -312,7 +312,7 @@ class NumericEntryRepairTests(unittest.TestCase):
                 self.assertEqual(journal.entries[0]['result'],initial);self.assertEqual(len(calls),2)
 
     def test_blind_repair_uses_only_its_own_prior_answer_and_stops_on_no_progress(self):
-        from research_platform.workflow import _period_bounded_mapping_stage
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
         with tempfile.TemporaryDirectory() as temporary:
             journal,context,schema,initial,expected,validate=self.fixture(Path(temporary));requests=[]
             context['concepts']=[{key:entry[key] for key in ('row_id','period_id','unit')} for entry in expected['observations']]
@@ -328,7 +328,7 @@ class NumericEntryRepairTests(unittest.TestCase):
             self.assertEqual(len(requests),2)
 
     def test_second_bounded_patch_freezes_the_entry_fixed_in_the_first_patch(self):
-        from research_platform.workflow import _period_bounded_mapping_stage
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
         with tempfile.TemporaryDirectory() as temporary:
             journal,context,schema,initial,expected,validate=self.fixture(Path(temporary));repairs=[]
             def complete(**kwargs):
@@ -345,7 +345,7 @@ class NumericEntryRepairTests(unittest.TestCase):
             self.assertEqual(result,expected);self.assertEqual(len(repairs),2)
 
     def test_missing_coverage_addition_preserves_existing_entries_and_must_match_scope(self):
-        from research_platform.workflow import _period_bounded_mapping_stage,_validate_disclosure_coverage
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage, _validate_disclosure_coverage
         with tempfile.TemporaryDirectory() as temporary:
             journal,context,schema,_,expected,validate=self.fixture(Path(temporary));initial=copy.deepcopy(expected)
             period=dict(context['periods'][0],id='2020-H1',kind='H1',end='2020-06-30');context['periods'].append(period)
@@ -368,7 +368,7 @@ class NumericEntryRepairTests(unittest.TestCase):
             self.assertEqual(result['observations'][:-1],initial['observations']);self.assertEqual(result['observations'][-1]['period_id'],'2020-H1')
 
     def test_output_cap_splits_patch_targets_without_regenerating_prior_answer(self):
-        from research_platform.workflow import _period_bounded_mapping_stage
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
         with tempfile.TemporaryDirectory() as temporary:
             journal,context,schema,initial,expected,validate=self.fixture(Path(temporary));requests=[]
             context['periods'].append(dict(context['periods'][0],id='2020-H1',kind='H1',end='2020-06-30'))
@@ -388,7 +388,7 @@ class NumericEntryRepairTests(unittest.TestCase):
             self.assertEqual(len(audits),1);self.assertFalse(audits[0]['partial_response_used']);self.assertEqual(audits[0]['status'],'complete')
 
     def test_primary_unit_coverage_can_patch_one_matching_binding_without_changing_value(self):
-        from research_platform.workflow import _period_bounded_mapping_stage,_validate_disclosure_coverage
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage, _validate_disclosure_coverage
         for change_amount in (False,True):
             with self.subTest(change_amount=change_amount),tempfile.TemporaryDirectory() as temporary:
                 journal,context,schema,_,initial,validate=self.fixture(Path(temporary))
@@ -419,8 +419,8 @@ class NumericEntryRepairTests(unittest.TestCase):
                         self.assertEqual(result['observations'][0]['terms'][0]['source_raw'],'100.0')
 
     def test_legacy_full_regeneration_repair_is_not_reused_as_an_entry_patch(self):
-        from research_platform.workflow import _period_bounded_mapping_stage
-        from research_platform.construction import RunJournal
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
+        from company_initiation.shared_runtime import RunJournal
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);first=root/'first';first.mkdir();second=root/'second';second.mkdir()
             journal,context,schema,initial,expected,validate=self.fixture(first)
@@ -439,7 +439,7 @@ class NumericEntryRepairTests(unittest.TestCase):
             self.assertEqual(resumed.entries[:2],saved['calls'])
 
     def test_unscoped_validator_error_never_triggers_full_answer_regeneration(self):
-        from research_platform.workflow import _period_bounded_mapping_stage
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
         with tempfile.TemporaryDirectory() as temporary:
             journal,context,schema,_,expected,_=self.fixture(Path(temporary));requests=[]
             def complete(**kwargs):requests.append(kwargs);self.complete(journal);return copy.deepcopy(expected)
@@ -449,7 +449,7 @@ class NumericEntryRepairTests(unittest.TestCase):
             self.assertEqual(len(requests),1);self.assertEqual(requests[0]['payload'],dict(context,stage='company_year_mapping',validation_errors=[]))
 
     def test_missing_requested_concept_or_version_is_added_without_regenerating_valid_entries(self):
-        from research_platform.workflow import _period_bounded_mapping_stage,_validate_reconstruction_revision
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage, _validate_reconstruction_revision
         for mode in ('blind_concept','candidate_version','wrong_version'):
             with self.subTest(mode=mode),tempfile.TemporaryDirectory() as temporary:
                 journal,context,schema,_,expected,validate=self.fixture(Path(temporary));initial=copy.deepcopy(expected)
@@ -485,9 +485,9 @@ class NumericEntryRepairTests(unittest.TestCase):
 
 class MappingOutputLimitRecoveryTests(unittest.TestCase):
     def setup_case(self, root, *, count=4):
-        from research_platform.ai import OpenAIProvider
-        from research_platform.construction import RunJournal
-        from research_platform.initiation import _object,_array,TEXT
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.initiation import _object, _array, TEXT
         ids=['2025-'+kind for kind in ('Q1','H1','9M','FY')][:count]
         periods=[dict(id=pid,fiscal_year=2025) for pid in ids]
         evidence=[dict(source_id='primary',unit_id='page:1',text='COMPLETE original with all periods and restatements',
@@ -503,7 +503,7 @@ class MappingOutputLimitRecoveryTests(unittest.TestCase):
         return journal,context,schema
 
     def cap(self, provider):
-        from research_platform.ai import AIError
+        from company_initiation.shared_ai import AIError
         # Same provider shape as the real failure, including unusable partial JSON.
         provider.last_response=dict(status='incomplete',incomplete_details=dict(reason='max_output_tokens'),
             usage=dict(input_tokens=1000,output_tokens=provider.max_output_tokens,total_tokens=1000+provider.max_output_tokens),
@@ -519,14 +519,14 @@ class MappingOutputLimitRecoveryTests(unittest.TestCase):
         return dict(observations=facts,gaps=[],reporting_changes=['Preserve original and restated definitions'])
 
     def validate(self, answer, period_ids):
-        from research_platform.workflow import _validate_disclosure_coverage
+        from company_initiation.historic_construction.workflow import _validate_disclosure_coverage
         _validate_disclosure_coverage(answer['observations'],
             [dict(period_id=pid,family='sales') for pid in period_ids],{})
         return answer
 
     def test_capped_year_splits_periods_preserves_complete_evidence_versions_and_exact_resume(self):
-        from research_platform.workflow import _period_bounded_mapping_stage
-        from research_platform.construction import RunJournal
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
+        from company_initiation.shared_runtime import RunJournal
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);first=root/'first';first.mkdir();second=root/'second';second.mkdir()
             journal,context,schema=self.setup_case(first);requests=[]
@@ -553,7 +553,7 @@ class MappingOutputLimitRecoveryTests(unittest.TestCase):
             self.assertEqual(replay,answer);self.assertEqual(resumed.state['usage'],usage)
 
     def test_normal_success_retains_exact_request_and_does_not_decompose(self):
-        from research_platform.workflow import _period_bounded_mapping_stage
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
         with tempfile.TemporaryDirectory() as temporary:
             journal,context,schema=self.setup_case(Path(temporary));requests=[]
             def complete(**kwargs):
@@ -566,7 +566,7 @@ class MappingOutputLimitRecoveryTests(unittest.TestCase):
             self.assertFalse(list(Path(temporary).glob('*_period_decomposition_*.json')))
 
     def test_blind_and_reblind_cohorts_only_receive_originals_and_requested_concepts(self):
-        from research_platform.workflow import _period_bounded_mapping_stage
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
         with tempfile.TemporaryDirectory() as temporary:
             journal,context,schema=self.setup_case(Path(temporary));requests=[]
             context['concepts']=[dict(row_id='sales',label='Sales',period_id=p['id'],unit='GBPm') for p in context['periods']]
@@ -588,7 +588,7 @@ class MappingOutputLimitRecoveryTests(unittest.TestCase):
                 self.assertTrue(all(set(item)=={'period_id','family'} for item in payload['required_disclosure_coverage']))
 
     def test_missing_required_period_or_out_of_cohort_fact_still_blocks(self):
-        from research_platform.workflow import _period_bounded_mapping_stage
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
         for failure in ('missing','extra'):
             with self.subTest(failure=failure),tempfile.TemporaryDirectory() as temporary:
                 journal,context,schema=self.setup_case(Path(temporary));requests=[]
@@ -606,8 +606,8 @@ class MappingOutputLimitRecoveryTests(unittest.TestCase):
                 self.assertFalse(list(Path(temporary).glob('*_period_merged_*.json')))
 
     def test_single_period_failure_stops_finite_decomposition_with_saved_charge(self):
-        from research_platform.ai import AIError
-        from research_platform.workflow import _period_bounded_mapping_stage
+        from company_initiation.shared_ai import AIError
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
         with tempfile.TemporaryDirectory() as temporary:
             journal,context,schema=self.setup_case(Path(temporary));calls=[]
             def complete(**kwargs):
@@ -620,7 +620,7 @@ class MappingOutputLimitRecoveryTests(unittest.TestCase):
             self.assertTrue(journal.state['usage']['cost_is_complete'])
 
     def test_revision_cohorts_project_disputes_and_preserve_every_original_reporting_version(self):
-        from research_platform.workflow import _period_bounded_mapping_stage,_validate_reconstruction_revision
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage, _validate_reconstruction_revision
         for drop_version in (False,True):
             with self.subTest(drop_version=drop_version),tempfile.TemporaryDirectory() as temporary:
                 journal,context,schema=self.setup_case(Path(temporary));requests=[]
@@ -655,8 +655,8 @@ class MappingOutputLimitRecoveryTests(unittest.TestCase):
                         self.assertTrue(all(item['period_id'] in allowed for item in payload[field]))
 
     def test_unproved_output_cap_message_cannot_trigger_decomposition(self):
-        from research_platform.ai import AIError
-        from research_platform.workflow import _period_bounded_mapping_stage
+        from company_initiation.shared_ai import AIError
+        from company_initiation.historic_construction.workflow import _period_bounded_mapping_stage
         with tempfile.TemporaryDirectory() as temporary:
             journal,context,schema=self.setup_case(Path(temporary))
             with patch.object(journal,'stage',side_effect=AIError('max_output_tokens unverified caller text')) as stage:
@@ -678,7 +678,7 @@ class DiscoveryObligationProjectionTests(unittest.TestCase):
                 originals=[dict(run='run_'+str(i),sha256='original-hash')])) for i in range(repeats)])]
 
     def test_repeated_origins_project_identically_without_losing_scope_or_exact_evidence(self):
-        from research_platform.workflow import _discovery_obligations_for_research
+        from company_initiation.historic_construction.workflow import _discovery_obligations_for_research
         earlier=self.obligations(31);later=self.obligations(46);before=copy.deepcopy(later)
         a=_discovery_obligations_for_research(earlier);b=_discovery_obligations_for_research(later)
         self.assertEqual(a,b);self.assertEqual(_discovery_obligations_for_research(b),b)
@@ -688,7 +688,7 @@ class DiscoveryObligationProjectionTests(unittest.TestCase):
         self.assertEqual(later,before);self.assertEqual(len(later[0]['claims']),46)
 
     def test_distinct_conflicting_quotation_hash_or_period_remains_in_request(self):
-        from research_platform.workflow import _discovery_obligations_for_research
+        from company_initiation.historic_construction.workflow import _discovery_obligations_for_research
         for field,value in (('quotation','2025 third-quarter sales'),('sha256','changed-original-hash'),('period_end','2025-06-30')):
             with self.subTest(field=field):
                 obligations=self.obligations(3);conflict=copy.deepcopy(obligations[0]['claims'][0])
@@ -701,7 +701,7 @@ class DiscoveryObligationProjectionTests(unittest.TestCase):
 
     def test_year_selection_payload_stays_exactly_compatible_across_audit_only_continuations(self):
         from types import SimpleNamespace
-        from research_platform.workflow import _company_year_sources
+        from company_initiation.historic_construction.workflow import _company_year_sources
         requests=[];catalog={'annual':dict(id='annual',category='financial_reports',sha256='same-original')}
         def stage(name,prompt,payload,schema,validate):
             requests.append(copy.deepcopy(dict(name=name,prompt=prompt,payload=payload,schema=schema)))
@@ -712,7 +712,7 @@ class DiscoveryObligationProjectionTests(unittest.TestCase):
 
     def test_coverage_requests_and_limitations_are_stable_but_saved_audit_remains_complete(self):
         from types import SimpleNamespace
-        from research_platform.workflow import _year_disclosure_coverage,_disclosure_coverage_for_research,_task_disclosure_coverage
+        from company_initiation.historic_construction.workflow import _year_disclosure_coverage, _disclosure_coverage_for_research, _task_disclosure_coverage
         _,answer,units=DisclosureCoverageTests().retained_fixture();units[0]['text']+=' full table context'*11000
         requests=[];inventories=[];limit_sets=[];raw_obligations=[]
         for count in (31,46):
@@ -754,7 +754,7 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
         return outputs,record,dict(sources=[current]),path
 
     def test_exact_bytes_restore_provenance_without_replacing_current_identity_or_supplied_metadata(self):
-        from research_platform.workflow import restore_discovered_metadata
+        from company_initiation.historic_construction.workflow import restore_discovered_metadata
         with tempfile.TemporaryDirectory() as temporary:
             outputs,record,inventory,path=self.fixture(Path(temporary));before=copy.deepcopy(inventory);raw=path.read_bytes()
             catalog,audit=restore_discovered_metadata(inventory,[record],outputs);source=catalog['local_current']
@@ -771,7 +771,7 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
             self.assertEqual(source['url'],'https://example.test/user.pdf');self.assertNotIn('publication_evidence',source)
 
     def test_changed_bytes_do_not_inherit_metadata_and_changed_artifact_blocks_reuse(self):
-        from research_platform.workflow import restore_discovered_metadata
+        from company_initiation.historic_construction.workflow import restore_discovered_metadata
         with tempfile.TemporaryDirectory() as temporary:
             outputs,record,inventory,path=self.fixture(Path(temporary));inventory['sources'][0]['sha256']='b'*64
             catalog,audit=restore_discovered_metadata(inventory,[record],outputs)
@@ -781,7 +781,7 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
                 restore_discovered_metadata(inventory,[record],outputs)
 
     def test_unknown_or_mismatched_publication_date_never_becomes_verified_availability(self):
-        from research_platform.workflow import restore_discovered_metadata
+        from company_initiation.historic_construction.workflow import restore_discovered_metadata
         with tempfile.TemporaryDirectory() as temporary:
             outputs,record,inventory,_=self.fixture(Path(temporary),date_phrase='15 March 2018')
             catalog,audit=restore_discovered_metadata(inventory,[record],outputs);source=catalog['local_current']
@@ -790,7 +790,7 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
 
 
     def test_structured_date_provenance_survives_restore_and_rejects_mismatch(self):
-        from research_platform.workflow import restore_discovered_metadata
+        from company_initiation.historic_construction.workflow import restore_discovered_metadata
         with tempfile.TemporaryDirectory() as temporary:
             outputs,record,inventory,path=self.fixture(Path(temporary),date_phrase=None)
             source=json.loads(path.read_text(encoding='utf-8'))[0]
@@ -814,7 +814,7 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
 
 
     def test_original_dateline_resolves_prior_metadata_conflict_for_identical_bytes(self):
-        from research_platform.workflow import restore_discovered_metadata
+        from company_initiation.historic_construction.workflow import restore_discovered_metadata
         with tempfile.TemporaryDirectory() as temporary:
             outputs,record,inventory,path=self.fixture(Path(temporary))
             source=json.loads(path.read_text(encoding='utf-8'))[0]
@@ -874,7 +874,7 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
         return outputs,record,inventory,path,source,selection,interrupted
 
     def test_interrupted_replays_retain_completed_metadata_and_identical_request_provenance(self):
-        from research_platform.workflow import restore_discovered_metadata
+        from company_initiation.historic_construction.workflow import restore_discovered_metadata
         for resolved in (True,False):
             with self.subTest(original_dateline=resolved),tempfile.TemporaryDirectory() as temporary:
                 outputs,record,inventory,path,source,selection,interrupted=self.interrupted_metadata_fixture(Path(temporary),resolved=resolved)
@@ -890,7 +890,7 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
                 self.assertEqual(inventory,before);self.assertEqual(path.read_bytes(),original_bytes)
 
     def test_interrupted_replay_new_claim_date_or_bytes_cannot_reuse_an_older_resolution(self):
-        from research_platform.workflow import restore_discovered_metadata
+        from company_initiation.historic_construction.workflow import restore_discovered_metadata
         for change in ('new_claim','new_date','new_quote','new_period_reference','changed_bytes'):
             with self.subTest(change=change),tempfile.TemporaryDirectory() as temporary:
                 outputs,record,inventory,path,source,selection,interrupted=self.interrupted_metadata_fixture(Path(temporary))
@@ -908,7 +908,7 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
                 if change=='new_date':self.assertIn('2017-03-20',[item.get('published_at') for item in restored['publication_claims']])
 
     def test_unresolved_publication_claims_keep_contradictory_status_without_a_date(self):
-        from research_platform.workflow import restore_discovered_metadata
+        from company_initiation.historic_construction.workflow import restore_discovered_metadata
         with tempfile.TemporaryDirectory() as temporary:
             outputs,record,inventory,path=self.fixture(Path(temporary))
             source=json.loads(path.read_text(encoding='utf-8'))[0]
@@ -952,7 +952,7 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
         return outputs,record,inventory,path,values
 
     def test_resolved_future_continuation_keeps_hash_bound_date_and_filters_before_selection(self):
-        from research_platform.workflow import restore_discovered_metadata,research_catalogue_as_of
+        from company_initiation.historic_construction.workflow import restore_discovered_metadata, research_catalogue_as_of
         with tempfile.TemporaryDirectory() as temporary:
             outputs,record,inventory,path,_=self.deferred_fixture(Path(temporary));before=copy.deepcopy(inventory)
             catalog,audit=restore_discovered_metadata(inventory,[record],outputs);source=catalog['local_current']
@@ -971,7 +971,7 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
             self.assertEqual(research_catalogue_as_of(catalog,'2026-10-25')[0],{},'User annotation cannot erase verified future source evidence')
 
     def test_future_conflicts_restore_conservative_policy_without_inventing_publication_date(self):
-        from research_platform.workflow import restore_discovered_metadata,research_catalogue_as_of
+        from company_initiation.historic_construction.workflow import restore_discovered_metadata, research_catalogue_as_of
         with tempfile.TemporaryDirectory() as temporary:
             outputs,record,inventory,path,values=self.deferred_fixture(Path(temporary),resolved=False,partial=True)
             catalog,_=restore_discovered_metadata(inventory,[record],outputs);source=catalog['local_current']
@@ -993,7 +993,7 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
             self.assertIn('local_current',research_catalogue_as_of(catalog,'2026-10-25')[0])
 
     def test_deferred_continuation_rejects_changed_bytes_and_tampered_artifacts_and_ignores_missing_files(self):
-        from research_platform.workflow import restore_discovered_metadata
+        from company_initiation.historic_construction.workflow import restore_discovered_metadata
         for tampered in ('official_downloaded_originals.json','source_freshness.json'):
             with self.subTest(tampered=tampered),tempfile.TemporaryDirectory() as temporary:
                 outputs,record,inventory,path,_=self.deferred_fixture(Path(temporary))
@@ -1009,8 +1009,8 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
 
     def test_research_filters_restored_future_sources_before_first_selection_and_keeps_inventory(self):
         from types import SimpleNamespace
-        from research_platform.evidence import inventory_local_sources
-        from research_platform.workflow import research_company_inputs
+        from company_initiation.historic_construction.evidence import inventory_local_sources
+        from company_initiation.historic_construction.workflow import research_company_inputs
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);(root/'outputs').mkdir();archive=root/'company';reports=archive/'financial_reports';reports.mkdir(parents=True)
             (reports/'past.txt').write_text('Synthetic original annual sales 12.',encoding='utf-8')
@@ -1028,8 +1028,8 @@ class DiscoveryMetadataReuseTests(unittest.TestCase):
                     self.selection=(name,copy.deepcopy(payload))
                     raise ValueError('Synthetic stop before provider dispatch')
             provider=SimpleNamespace(timeout=300,metadata=lambda:{})
-            with patch('research_platform.construction.RunJournal',Journal),patch('research_platform.workflow._capture_research_engine_contract',return_value={}), \
-                 patch('research_platform.workflow.restore_discovered_metadata',return_value=(catalog,dict(recovered=[],conflicts=[]))), \
+            with patch('company_initiation.shared_runtime.RunJournal',Journal),patch('company_initiation.historic_construction.workflow._capture_research_engine_contract',return_value={}), \
+                 patch('company_initiation.historic_construction.workflow.restore_discovered_metadata',return_value=(catalog,dict(recovered=[],conflicts=[]))), \
                  self.assertRaisesRegex(ValueError,'Synthetic stop before provider'):
                 research_company_inputs(root,'Synthetic catalogue fixture',archive,as_of='2026-10-25',provider=provider)
             journal=captured[0];self.assertEqual(journal.selection[0],'company_identity_sources')
@@ -1049,7 +1049,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
         result.update(changes);return result
 
     def test_source_precision_handles_scaled_signed_compositions_and_primary_rounding(self):
-        from research_platform.workflow import _source_rounding_bound,_reconstruction_comparison
+        from company_initiation.historic_construction.workflow import _source_rounding_bound, _reconstruction_comparison
         refs=[dict(raw='1.234,5',number_format='comma_decimal',multiplier=.001,contribution_weight=1),
               dict(raw='12.3%',number_format='dot_decimal',multiplier=1,contribution_weight=-2)]
         self.assertAlmostEqual(_source_rounding_bound(refs),.00005+.001)
@@ -1059,7 +1059,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
         self.assertEqual(_reconstruction_comparison([left],[right])[0]['status'],'unresolved')
 
     def test_numeric_agreement_does_not_merge_basis_entity_scope_or_rounded_zero(self):
-        from research_platform.workflow import _reconstruction_comparison
+        from company_initiation.historic_construction.workflow import _reconstruction_comparison
         left=self.fact('mapped',100,'100.0')
         for field,value in [('basis','restated'),('entity_id','different_division'),('scope','continuing_only'),('definition_id','adjusted_sales'),('restatement','restated'),('restatement_vintage','2026-revision')]:
             right=self.fact('blind',100,'100.0',**{field:value})
@@ -1071,7 +1071,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
         self.assertEqual(_reconstruction_comparison([self.fact('dash',0,'-')],[self.fact('zero',0,'0')])[0]['status'],'semantic_review')
 
     def test_missing_primary_and_incompatible_units_cannot_be_rounded_away(self):
-        from research_platform.workflow import _reconstruction_comparison
+        from company_initiation.historic_construction.workflow import _reconstruction_comparison
         left=self.fact('mapped',100,'100')
         self.assertEqual(_reconstruction_comparison([left],[])[0]['status'],'unresolved')
         self.assertEqual(_reconstruction_comparison([left],[self.fact('blind',100,'100',unit='EURbn')])[0]['status'],'unresolved')
@@ -1079,7 +1079,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
         self.assertEqual(_reconstruction_comparison([left],[self.fact('blind',101,'101')])[0]['status'],'unresolved')
 
     def test_reporting_versions_keep_separate_compatibility_and_source_vintage(self):
-        from research_platform.workflow import _observation_classification
+        from company_initiation.historic_construction.workflow import _observation_classification
         ref=dict(source_id='original',unit_id='page:1')
         entry=dict(basis='group_reporting',entity_id='group',restatement='original',restatement_vintage=None,
             classification_basis='Synthetic original table heading and period definition.',classification_source_refs=[ref])
@@ -1098,7 +1098,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
         self.assertEqual(unknown['source_vintage'][0]['publication_status'],'unknown')
 
     def test_structured_publication_vintage_requires_matching_cited_date_metadata(self):
-        from research_platform.workflow import _observation_classification
+        from company_initiation.historic_construction.workflow import _observation_classification
         ref=dict(source_id='original',unit_id='page:1')
         entry=dict(basis='reported',entity_id='group',restatement='original',restatement_vintage=None,
             classification_basis='Original supplied financial table.',classification_source_refs=[ref])
@@ -1117,7 +1117,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
                 self.assertEqual(unverified['source_vintage'][0]['publication_status'],'metadata_unverified')
 
     def test_ineligible_history_stays_audit_only_and_cannot_override_active_basis(self):
-        from research_platform.workflow import _bind_mapped_history
+        from company_initiation.historic_construction.workflow import _bind_mapped_history
         eligible=self.fact('reported',100,'100',kind='FY',fiscal_year=2025,restatement='original',eligible=True)
         excluded=[self.fact(kind,900,'900',kind='FY',fiscal_year=2025,basis=kind,restatement=kind,eligible=False)
                   for kind in ('unknown','vendor_normalized')]
@@ -1134,7 +1134,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
         self.assertNotIn('active_basis_by_period',empty)
 
     def test_legacy_annual_and_segment_anchors_cannot_bypass_excluded_observations(self):
-        from research_platform.integrated import historical_eligibility_inputs
+        from company_initiation.forecast_construction.integrated import historical_eligibility_inputs
         for role in ('sales','north_sales'):
             for kind in ('unknown','vendor_normalized'):
                 with self.subTest(role=role,kind=kind):
@@ -1154,7 +1154,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
                     self.assertTrue(next(o for o in validated['observations'] if o['id']==primary['id'])['eligible'])
 
     def test_combined_history_gate_keeps_missing_primary_evidence_out_of_financial_escalation(self):
-        from research_platform.workflow import _combined_history_challenge
+        from company_initiation.historic_construction.workflow import _combined_history_challenge
         unit=dict(source_id='synthetic',unit_id='page:1',text='Original interim reporting cadence and segment definitions.',numbers=[])
         data=dict(company='Synthetic',history_years=[2024,2025],model_configuration={},observations=[],sources={'synthetic':dict(id='synthetic')},
             reporting_changes=[],entity_versions=[],reporting_bridges=[])
@@ -1180,7 +1180,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
                 self.assertNotIn('combined_history_review',data)
 
     def test_combined_history_gate_fingerprint_invalidates_changed_history_but_not_forecast_scenarios(self):
-        from research_platform.workflow import ensure_combined_history_review,combined_history_review_current,combined_history_fingerprint
+        from company_initiation.historic_construction.workflow import ensure_combined_history_review, combined_history_review_current, combined_history_fingerprint
         unit=dict(source_id='synthetic',unit_id='page:1',text='Synthetic original reporting definitions.',numbers=[])
         data=dict(company='Synthetic',history_years=[2024,2025],model_configuration={},observations=[],
             sources={'synthetic':dict(id='synthetic',sha256='originalhash',category='financial_reports')},
@@ -1234,9 +1234,9 @@ class ReconstructionComparisonTests(unittest.TestCase):
     def test_history_source_parse_failure_names_original_and_page_without_paid_call(self):
         from pypdf import PdfWriter
         from pypdf.generic import NameObject,NumberObject
-        from research_platform.ai import OpenAIProvider
-        from research_platform.evidence import inventory_local_sources
-        from research_platform.workflow import ensure_company_history_research
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.historic_construction.evidence import inventory_local_sources
+        from company_initiation.historic_construction.workflow import ensure_company_history_research
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive=root/'archive';reports=archive/'financial_reports';reports.mkdir(parents=True)
             writer=PdfWriter();page=writer.add_blank_page(600,800);page[NameObject('/Contents')]=NumberObject(42)
@@ -1255,7 +1255,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
             self.assertIn(source['id'],record['issues'][-1])
 
     def test_history_matrix_round_trip_keeps_versions_periods_values_and_source_identities(self):
-        from research_platform.workflow import _history_review_matrix
+        from company_initiation.historic_construction.workflow import _history_review_matrix
         observations=[]
         for index,(kind,vintage,value) in enumerate([('original',None,100),('restated','2027-policy',100),('unknown',None,None)]):
             observations.append(self.fact('observation_'+str(index),value,'100',restatement=kind,restatement_vintage=vintage,
@@ -1275,7 +1275,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
             for field in ('id','period_id','start','end','fiscal_year','kind','value'):self.assertEqual(actual[field],observation.get(field))
 
     def test_history_context_compaction_preserves_every_token_and_bridge_reference(self):
-        from research_platform.workflow import _history_compact_evidence,_history_compact_bridges
+        from company_initiation.historic_construction.workflow import _history_compact_evidence, _history_compact_bridges
         units=[dict(source_id='original',unit_id='page:1',text='Complete table 100 and 20 with surrounding notes.',
             numbers=[dict(index=0,raw='100',start=15,end=18),dict(index=1,raw='20',start=23,end=25)],warnings=['Original parser note']),
             dict(source_id='original',unit_id='page:2',text='Additional complete original.',numbers=[],warnings=[])]
@@ -1295,7 +1295,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
         self.assertEqual(len(packed['source_references']),1);self.assertEqual(restore(packed['records']),bridges)
 
     def test_history_cohorts_cover_all_interims_long_bridges_and_bounded_synthesis(self):
-        from research_platform.workflow import _combined_history_challenge,_HISTORY_GATE_TOPICS
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, _HISTORY_GATE_TOPICS
         years=list(range(2020,2025));units=[];observations=[];coverage=[]
         for year in years:
             sid='original_'+str(year)
@@ -1349,7 +1349,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
         self.assertEqual(review['status'],'passed');self.assertEqual(len(review['cohort_reviews']),5)
 
     def test_history_repair_combines_new_originals_with_omitted_existing_cited_sections(self):
-        from research_platform.workflow import _combined_history_challenge
+        from company_initiation.historic_construction.workflow import _combined_history_challenge
         originals=[dict(source_id='annual',unit_id='page:'+str(page),text=('Complete original annual table '+str(page)+' '+('x'*180001 if page==1 else 'surrounding original note')),numbers=[])
             for page in (1,2,3)]
         additional=[dict(source_id='restatement',unit_id='page:'+str(page),text='Complete later-published comparative and notes '+str(page),numbers=[]) for page in (1,2)]
@@ -1389,7 +1389,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
         self.assertEqual(data['observations'],before)
 
     def test_failed_history_cohort_cannot_be_hidden_by_final_synthesis(self):
-        from research_platform.workflow import _combined_history_challenge
+        from company_initiation.historic_construction.workflow import _combined_history_challenge
         unit=dict(source_id='original',unit_id='page:1',text='Complete supplied original.',numbers=[])
         data=dict(company='SYNTHETIC incomplete cohorts',history_years=[2020,2021,2022],model_configuration={},observations=[],
             sources={'original':dict(id='original')},reporting_changes=[],reporting_bridges=[],entity_versions=[])
@@ -1406,8 +1406,8 @@ class ReconstructionComparisonTests(unittest.TestCase):
         self.assertEqual(journal.calls,['company_combined_history_cohort_1']);self.assertNotIn('combined_history_review',data)
 
     def test_history_source_selection_precedes_parsing_and_expands_only_on_demand(self):
-        from research_platform.workflow import prepare_history_review_context
-        from research_platform.evidence import _units
+        from company_initiation.historic_construction.workflow import prepare_history_review_context
+        from company_initiation.historic_construction.evidence import _units
         with tempfile.TemporaryDirectory() as temporary:
             folder=Path(temporary);sources=[]
             for i in range(4):
@@ -1437,7 +1437,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
                     self_test.assertEqual(name,'company_history_source_expansion')
                     return validate(dict(source_ids=['source_2'],reasons=['Missing restatement note'],coverage=[],gaps=[]))
             self_test=self;journal=Journal(folder/'first')
-            with patch('research_platform.evidence._units',wraps=_units) as parser:
+            with patch('company_initiation.historic_construction.evidence._units',wraps=_units) as parser:
                 context=prepare_history_review_context(journal,data,sources)
                 self.assertEqual(parser.call_count,2)
                 self.assertEqual({u['source_id'] for u in context['original_units']},{'source_0','source_1'})
@@ -1448,25 +1448,25 @@ class ReconstructionComparisonTests(unittest.TestCase):
             self.assertEqual(journal.values['history_source_selection.json']['omitted_source_ids'],['source_2','source_3'])
             previous=dict(_reuse_verified=True,directory=str(journal.directory),artifacts=journal.artifacts)
             resumed=Journal(folder/'second')
-            with patch('research_platform.evidence._units',side_effect=AssertionError('Verified parsed originals should be reused')) as parser:
+            with patch('company_initiation.historic_construction.evidence._units',side_effect=AssertionError('Verified parsed originals should be reused')) as parser:
                 again=prepare_history_review_context(resumed,data,sources,previous=previous)
             self.assertEqual(again['original_units'],context['original_units'])
             self.assertTrue(all(item['status']=='reused_verified_parsed_original' for item in resumed.values['history_original_index.json']['sources'].values()))
             invalid=Journal(folder/'invalid');invalid.unknown=True
-            with patch('research_platform.evidence._units',side_effect=AssertionError('Unknown source IDs must fail before parsing')) as parser:
+            with patch('company_initiation.historic_construction.evidence._units',side_effect=AssertionError('Unknown source IDs must fail before parsing')) as parser:
                 with self.assertRaisesRegex(ValueError,'unknown primary source IDs: invented_source'):
                     prepare_history_review_context(invalid,data,sources)
                 parser.assert_not_called()
             coverage_request=Journal(folder/'coverage_request');coverage_request.coverage_extra=True
-            with patch('research_platform.evidence._units',wraps=_units) as parser:
+            with patch('company_initiation.historic_construction.evidence._units',wraps=_units) as parser:
                 included=prepare_history_review_context(coverage_request,data,sources)
             self.assertEqual({u['source_id'] for u in included['original_units']},{'source_0','source_1','source_2'})
             self.assertEqual(parser.call_count,3)
             self.assertEqual(coverage_request.values['history_source_selection.json']['omitted_source_ids'],['source_3'])
 
     def test_history_expansion_returns_requested_parsed_original_without_losing_other_sections(self):
-        from research_platform.workflow import prepare_history_review_context,_combined_history_challenge
-        from research_platform.evidence import _units
+        from company_initiation.historic_construction.workflow import prepare_history_review_context, _combined_history_challenge
+        from company_initiation.historic_construction.evidence import _units
         outer=self
         with tempfile.TemporaryDirectory() as temporary:
             folder=Path(temporary);sources=[]
@@ -1508,7 +1508,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
                 outer.assertEqual(set(kwargs['required_source_ids']),{'source_0','source_1'})
                 outer.assertEqual({unit['source_id'] for unit in documents},{'source_0','source_1'})
                 return documents
-            with patch('research_platform.evidence._units',wraps=_units) as parser,patch('research_platform.workflow.construction_evidence',side_effect=sections):
+            with patch('company_initiation.historic_construction.evidence._units',wraps=_units) as parser,patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=sections):
                 prepared=prepare_history_review_context(journal,data,sources)
                 original_units=copy.deepcopy(prepared['original_units'])
                 self.assertEqual(parser.call_count,3)
@@ -1522,7 +1522,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
             self.assertEqual(len(selection_calls),2);self.assertEqual(len(journal.repairs),1)
 
     def test_sheet_navigation_selects_every_row_without_repeating_row_previews(self):
-        from research_platform.workflow import construction_evidence
+        from company_initiation.historic_construction.workflow import construction_evidence
         documents=[dict(source_id='original',unit_id='Statement!R'+str(i),text='Full row '+str(i)+' '+('x'*1000),numbers=[dict(index=0,raw=str(i))]) for i in range(1,301)]
         class Journal:
             def stage(self,name,prompt,payload,schema,validate):
@@ -1534,7 +1534,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
         self.assertEqual(selected,documents)
 
     def test_section_source_mismatch_and_sparse_boundaries_have_exact_repair_feedback(self):
-        from research_platform.workflow import construction_evidence
+        from company_initiation.historic_construction.workflow import construction_evidence
         worksheet=[dict(source_id='actual_workbook',unit_id='Operating segments!R'+str(i),text='Complete original row '+str(i)+' '+'x'*1000,numbers=[]) for i in range(4,304)]
         pdf=[dict(source_id='annual_pdf',unit_id='page:'+str(i),text='Original financial report '+str(i),numbers=[]) for i in range(1,3)]
         owner=self
@@ -1555,7 +1555,7 @@ class ReconstructionComparisonTests(unittest.TestCase):
 
 class PositiveDisclosureContinuationTests(unittest.TestCase):
     def test_two_continuations_merge_one_obligation_with_all_families_claims_and_origins(self):
-        from research_platform.workflow import _merge_coverage_obligations,_discovery_obligations_for_research
+        from company_initiation.historic_construction.workflow import _merge_coverage_obligations, _discovery_obligations_for_research
         original=dict(id='prior_coverage_one',kind='prior_primary_coverage',fiscal_year=2025,period_kind='H1',period_end='2025-06-30',
             source_sha256='same-original',required_families=['sales','cash_flow'],claims=[dict(definition='Original H1 statements',unit_ids=['page:2'])],restored_from=[dict(run='first')])
         first=_merge_coverage_obligations([original],[dict(original,restored_from=[dict(run='second')])])
@@ -1589,7 +1589,7 @@ class PositiveDisclosureContinuationTests(unittest.TestCase):
         return archive,catalog,[old,latest],latest
 
     def test_resume_retains_positive_half_and_nine_month_claims_but_needs_revalidation(self):
-        from research_platform.workflow import restore_positive_disclosure_coverage,_year_primary_candidates
+        from company_initiation.historic_construction.workflow import restore_positive_disclosure_coverage, _year_primary_candidates
         with tempfile.TemporaryDirectory() as folder:
             archive,catalog,records,parent=self.fixture(Path(folder))
             result=restore_positive_disclosure_coverage(parent,records,archive,catalog,'2026-10-25',[2025],{'fiscal_year_end':'12-31'})
@@ -1605,7 +1605,7 @@ class PositiveDisclosureContinuationTests(unittest.TestCase):
             self.assertNotIn('value',json.dumps(result))
 
     def test_changed_original_and_tampered_coverage_cannot_inherit_positive_claims(self):
-        from research_platform.workflow import restore_positive_disclosure_coverage
+        from company_initiation.historic_construction.workflow import restore_positive_disclosure_coverage
         with tempfile.TemporaryDirectory() as folder:
             archive,catalog,records,parent=self.fixture(Path(folder));args=(parent,records,archive,catalog,'2026-10-25',[2025],{'fiscal_year_end':'12-31'})
             original=(archive/'half.pdf').read_bytes();(archive/'half.pdf').write_bytes(b'changed financial source')
@@ -1617,7 +1617,7 @@ class PositiveDisclosureContinuationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'artifact hash changed'):restore_positive_disclosure_coverage(*args)
 
     def test_first_selection_inspects_relevant_hints_and_deduplicates_bytes_without_loading_other_years(self):
-        from research_platform.workflow import _company_year_sources
+        from company_initiation.historic_construction.workflow import _company_year_sources
         from types import SimpleNamespace
         catalog={sid:dict(id=sid,category='financial_reports',sha256=sid,reporting_year=year,title=title)
             for sid,year,title in [('annual',2025,'Annual'),('half',2025,'Interim'),('nine',2025,'Nine-month sales'),
@@ -1632,7 +1632,7 @@ class PositiveDisclosureContinuationTests(unittest.TestCase):
         self.assertTrue(all(item['status']=='requires_original_inspection_or_cited_exclusion' for item in result['primary_candidate_accounting']))
 
     def test_false_metadata_hint_requires_cited_exclusion_and_cannot_create_fake_interim(self):
-        from research_platform.workflow import _year_disclosure_coverage
+        from company_initiation.historic_construction.workflow import _year_disclosure_coverage
         from types import SimpleNamespace
         units=[dict(source_id=sid,unit_id='page:1',text=text,numbers=[]) for sid,text in
             [('annual','Year ended 2025 financial statements'),('false','Year ended 2023 financial statements; no 2025 comparative')]]
@@ -1650,7 +1650,7 @@ class PositiveDisclosureContinuationTests(unittest.TestCase):
         self.assertEqual(result['sources'][1]['disclosures'],[])
 
     def test_positive_statement_families_cannot_be_downgraded_to_sales_only(self):
-        from research_platform.workflow import _year_disclosure_coverage
+        from company_initiation.historic_construction.workflow import _year_disclosure_coverage
         from types import SimpleNamespace
         ref=[dict(source_id='half',unit_id='page:1')]
         obligation=dict(id='prior',fiscal_year=2025,period_kind='H1',required_families=['sales','cash_flow'],claims=[])
@@ -1664,7 +1664,7 @@ class PositiveDisclosureContinuationTests(unittest.TestCase):
 
 class DisclosureBasisAdjudicationTests(unittest.TestCase):
     def fixture(self):
-        from research_platform.integrated import integrated_role_contract
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
         fact=dict(id='sales-original',row_id='sales',period_id='2025-FY',metric_type='flow',unit='EURm',value=100,
             eligible=True,basis='Original annual net sales',restatement='original',entity_id='group',
             source_refs=[dict(source_id='primary',unit_id='page:51')])
@@ -1678,7 +1678,7 @@ class DisclosureBasisAdjudicationTests(unittest.TestCase):
         return fact,requirement,units,integrated_role_contract()
 
     def test_cited_compatible_prose_and_different_numeric_page_bind_exact_fact_and_scope(self):
-        from research_platform.workflow import _adjudicate_disclosure_bases,_validate_disclosure_coverage
+        from company_initiation.historic_construction.workflow import _adjudicate_disclosure_bases, _validate_disclosure_coverage
         from types import SimpleNamespace
         fact,requirement,units,roles=self.fixture();before=copy.deepcopy((fact,requirement,units));requests=[]
         def stage(name,prompt,payload,schema,validate):
@@ -1710,7 +1710,7 @@ class DisclosureBasisAdjudicationTests(unittest.TestCase):
         self.assertNotEqual(requests[0],requests[1]);self.assertEqual((fact,requirement,units),before)
 
     def test_cited_incompatible_basis_is_saved_then_blocks_without_stage_retry(self):
-        from research_platform.workflow import _adjudicate_disclosure_bases
+        from company_initiation.historic_construction.workflow import _adjudicate_disclosure_bases
         from types import SimpleNamespace
         fact,requirement,units,roles=self.fixture();saved={};attempts=[]
         def stage(name,prompt,payload,schema,validate):
@@ -1730,7 +1730,7 @@ class DisclosureBasisAdjudicationTests(unittest.TestCase):
         self.assertEqual(attempts,[0]);self.assertFalse(next(iter(saved.values()))[0]['decision']['compatible'])
 
     def test_cited_negative_reconstruction_equivalence_is_saved_without_regenerating_disagreement(self):
-        from research_platform.workflow import _validate_reconstruction_equivalence,_save_reconstruction_equivalence
+        from company_initiation.historic_construction.workflow import _validate_reconstruction_equivalence, _save_reconstruction_equivalence
         from types import SimpleNamespace
         _,_,units,_=self.fixture();attempts=[];saved={}
         semantic=[dict(candidate_id='candidate',comparisons=[dict(independent_id='independent',numeric_compatible=True)])]
@@ -1764,7 +1764,7 @@ class DisclosureCoverageTests(unittest.TestCase):
         return obligation,inventory,units
 
     def retained_inventory(self,answer):
-        from research_platform.workflow import _year_disclosure_coverage
+        from company_initiation.historic_construction.workflow import _year_disclosure_coverage
         from types import SimpleNamespace
         obligation,_,units=self.retained_fixture();saved={}
         journal=SimpleNamespace(artifact=lambda name,value:saved.update({name:copy.deepcopy(value)}))
@@ -1780,8 +1780,8 @@ class DisclosureCoverageTests(unittest.TestCase):
         return result
 
     def test_later_primary_report_resolves_exact_nine_month_sales_without_inventing_statements(self):
-        from research_platform.workflow import _task_disclosure_coverage,_validate_disclosure_coverage,_validate_discovery_coverage
-        from research_platform.integrated import integrated_role_contract
+        from company_initiation.historic_construction.workflow import _task_disclosure_coverage, _validate_disclosure_coverage, _validate_discovery_coverage
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
         obligation,answer,_=self.retained_fixture();inventory=self.retained_inventory(answer)
         self.assertEqual(inventory['discovery_obligations'],[obligation])
         self.assertEqual(_task_disclosure_coverage(inventory,['cash_flow','balance_sheet','income_statement']),[])
@@ -1817,7 +1817,7 @@ class DisclosureCoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'must not claim numeric coverage'):self.retained_inventory(answer)
 
     def test_blind_period_obligations_exclude_cited_disposition_and_basis_conclusions(self):
-        from research_platform.workflow import _task_disclosure_coverage,_blind_disclosure_requirements
+        from company_initiation.historic_construction.workflow import _task_disclosure_coverage, _blind_disclosure_requirements
         _,answer,_=self.retained_fixture();requirements=_task_disclosure_coverage(answer,['sales'])
         blind=_blind_disclosure_requirements(requirements)
         self.assertEqual(blind,[dict(period_id='2025-9M',family='sales')])
@@ -1825,7 +1825,7 @@ class DisclosureCoverageTests(unittest.TestCase):
         self.assertNotIn('source_refs',blind[0]);self.assertNotIn('outcome',blind[0]);self.assertNotIn('definition',blind[0])
 
     def test_unassigned_retained_gap_cannot_disappear_before_combined_history(self):
-        from research_platform.workflow import _validate_discovery_coverage
+        from company_initiation.historic_construction.workflow import _validate_discovery_coverage
         obligation,answer,_=self.retained_fixture()
         with self.assertRaisesRegex(ValueError,'never reached primary coverage adjudication'):
             _validate_discovery_coverage({'coverage_obligations':[obligation]},[])
@@ -1846,7 +1846,7 @@ class DisclosureCoverageTests(unittest.TestCase):
         return dict(sources=sources,gaps=[]),units
 
     def test_required_section_sources_cannot_silently_drop_half_year(self):
-        from research_platform.workflow import construction_evidence
+        from company_initiation.historic_construction.workflow import construction_evidence
         inventory,units=self.fixture();units[0]['text']+='x'*180001;owner=self
         class Journal:
             def stage(self,name,prompt,payload,schema,validate):
@@ -1859,7 +1859,7 @@ class DisclosureCoverageTests(unittest.TestCase):
         self.assertEqual(construction_evidence(Journal(),units,'Original cadence',required_source_ids=['annual','half','quarter']),units)
 
     def test_evidence_first_inventory_requires_each_source_and_its_original_citations(self):
-        from research_platform.workflow import _year_disclosure_coverage
+        from company_initiation.historic_construction.workflow import _year_disclosure_coverage
         inventory,units=self.fixture();owner=self
         class Journal:
             def artifact(self,name,value):self.saved=(name,value)
@@ -1876,8 +1876,8 @@ class DisclosureCoverageTests(unittest.TestCase):
         self.assertEqual(answer,inventory);self.assertEqual(journal.saved[0],'disclosure_coverage_2025.json')
 
     def test_reported_half_year_is_required_but_sales_only_quarter_does_not_create_statements(self):
-        from research_platform.workflow import _task_disclosure_coverage,_validate_disclosure_coverage
-        from research_platform.integrated import integrated_role_contract
+        from company_initiation.historic_construction.workflow import _task_disclosure_coverage, _validate_disclosure_coverage
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
         inventory,_=self.fixture();roles=integrated_role_contract()
         requirements=_task_disclosure_coverage(inventory,['sales','income_statement','balance_sheet','cash_flow'])
         facts=[]
@@ -1893,8 +1893,8 @@ class DisclosureCoverageTests(unittest.TestCase):
         self.assertNotIn('2025-Q1',{item['period_id'] for item in cash_requirements})
 
     def test_missing_or_ineligible_fact_cannot_satisfy_source_coverage(self):
-        from research_platform.workflow import _validate_disclosure_coverage
-        from research_platform.integrated import integrated_role_contract
+        from company_initiation.historic_construction.workflow import _validate_disclosure_coverage
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
         requirement=[dict(period_id='2025-H1',family='sales',source_id='half')]
         for value,eligible in [(None,True),(40,False)]:
             with self.subTest(value=value,eligible=eligible),self.assertRaisesRegex(ValueError,'2025-H1'):
@@ -1903,7 +1903,7 @@ class DisclosureCoverageTests(unittest.TestCase):
 
 class OfficialUrlRecoveryTests(unittest.TestCase):
     def test_unselected_original_page_supplies_cited_recovery_index(self):
-        from research_platform.workflow import construction_evidence,official_url_catalog,recover_official_indexes
+        from company_initiation.historic_construction.workflow import construction_evidence, official_url_catalog, recover_official_indexes
         url='https://synthetic.invalid/financial-results'
         units=[dict(source_id='original',unit_id='page:'+str(i),text='Financial statement\n'+'x'*65000,numbers=[])
             for i in range(1,5)]
@@ -1930,7 +1930,7 @@ class OfficialUrlRecoveryTests(unittest.TestCase):
     def test_annotation_only_url_and_document_origin_preserve_provenance(self):
         from pypdf import PdfWriter
         from pypdf.annotations import Link
-        from research_platform.workflow import official_url_catalog,recover_official_indexes
+        from company_initiation.historic_construction.workflow import official_url_catalog, recover_official_indexes
         with tempfile.TemporaryDirectory() as temp:
             path=Path(temp)/'original.pdf';writer=PdfWriter();writer.add_blank_page(width=400,height=400)
             writer.add_annotation(page_number=0,annotation=Link(rect=(10,10,100,50),url='https://synthetic.invalid/publications'))
@@ -1952,7 +1952,7 @@ class OfficialUrlRecoveryTests(unittest.TestCase):
             {'official_indexes':['https://synthetic.invalid/publications']},catalog),['https://synthetic.invalid/publications'])
 
     def test_recovery_rejects_guessed_paths_and_wrong_original_citations(self):
-        from research_platform.workflow import official_url_catalog,recover_official_indexes
+        from company_initiation.historic_construction.workflow import official_url_catalog, recover_official_indexes
         catalog=official_url_catalog([dict(source_id='original',unit_id='page:9',text='Official company https://synthetic.invalid/',numbers=[])],[])
         class Journal:
             def artifact(self,*args):pass
@@ -1963,7 +1963,7 @@ class OfficialUrlRecoveryTests(unittest.TestCase):
                 recover_official_indexes(journal,'SYNTHETIC issuer','2026-10-25',{'official_indexes':[]},catalog)
 
     def test_no_candidates_retains_recovery_gap_without_paid_retry(self):
-        from research_platform.workflow import official_url_catalog,recover_official_indexes
+        from company_initiation.historic_construction.workflow import official_url_catalog, recover_official_indexes
         class Journal:
             def artifact(self,name,value):self.result=value
             def stage(self,*args):raise AssertionError('No evidence cannot justify a research request')
@@ -1974,7 +1974,7 @@ class OfficialUrlRecoveryTests(unittest.TestCase):
         self.assertEqual(journal.result['rejected_unobserved_urls'],['https://synthetic.invalid/guessed'])
 
     def test_direct_pdf_index_gets_recovery_and_cannot_be_reselected(self):
-        from research_platform.workflow import official_url_catalog,recover_official_indexes
+        from company_initiation.historic_construction.workflow import official_url_catalog, recover_official_indexes
         pdf='https://synthetic.invalid/original.pdf';origin='https://synthetic.invalid/'
         catalog=official_url_catalog([], [dict(id='original',url=pdf,title='Synthetic original')])
         class Journal:
@@ -2022,10 +2022,10 @@ class FreshResearchEntryTests(unittest.TestCase):
         from types import SimpleNamespace
         from tests.test_periodic_model import _write_synthetic_originals
         from tests.test_valuation import fixture
-        from research_platform.construction import validate_shape
-        from research_platform.evidence import SourceStore,inventory_local_sources
-        from research_platform.workflow import research_valuation_configuration
-        from research_platform.valuation import generate_valuation_inputs,value_company
+        from company_initiation.forecast_construction.construction import validate_shape
+        from company_initiation.historic_construction.evidence import SourceStore, inventory_local_sources
+        from company_initiation.dcf_construction.workflow import research_valuation_configuration
+        from company_initiation.dcf_construction.valuation import generate_valuation_inputs, value_company
         data=different_period_company()
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive=root/'company';archive.mkdir()
@@ -2054,9 +2054,9 @@ class FreshResearchEntryTests(unittest.TestCase):
             self.assertEqual(inputs['market']['price']['status'],'missing')
 
     def test_scope_section_selection_requests_evidence_for_every_required_driver_category(self):
-        from research_platform.workflow import research_company_inputs
-        from research_platform.ai import OpenAIProvider
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.historic_construction.workflow import research_company_inputs
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.historic_construction.evidence import inventory_local_sources
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);archive=root/'company';reports=archive/'financial_reports';reports.mkdir(parents=True)
             original='SYNTHETIC annual reporting and driver evidence. Fiscal year ends 31 December.'
@@ -2070,7 +2070,7 @@ class FreshResearchEntryTests(unittest.TestCase):
             def capture(journal,documents,purpose,**kwargs):
                 captured.update(documents=documents,purpose=purpose)
                 raise ValueError('Synthetic stop after scope retrieval context')
-            with patch.object(provider,'complete',side_effect=select) as calls,patch('research_platform.workflow.construction_evidence',side_effect=capture), \
+            with patch.object(provider,'complete',side_effect=select) as calls,patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=capture), \
                  self.assertRaisesRegex(ValueError,'Synthetic stop after scope retrieval context'):
                 research_company_inputs(root,'SYNTHETIC driver evidence',archive,as_of='2026-10-25',years=[2025],provider=provider)
             self.assertEqual(calls.call_count,1)
@@ -2081,8 +2081,8 @@ class FreshResearchEntryTests(unittest.TestCase):
             self.assertIn(original,captured['documents'][0]['text'])
 
     def test_saved_research_journal_preserves_unicode_original_line_separators(self):
-        from research_platform.construction import digest
-        from research_platform.integrated import verified_integrated_record
+        from company_initiation.shared_runtime import digest
+        from company_initiation.forecast_construction.integrated import verified_integrated_record
         with tempfile.TemporaryDirectory() as temp:
             outputs=Path(temp);run=outputs/'construct_research_fixture';run.mkdir()
             request=dict(model='gpt-6-luna',evidence='Original paragraph\u2028and next page\u0085still one JSON record')
@@ -2093,7 +2093,7 @@ class FreshResearchEntryTests(unittest.TestCase):
             self.assertEqual(verified_integrated_record(run,outputs)['calls'],calls)
 
     def test_large_original_retrieval_keeps_complete_selected_units_and_numeric_ids(self):
-        from research_platform.workflow import construction_evidence
+        from company_initiation.historic_construction.workflow import construction_evidence
         units=[dict(source_id='synthetic_original',unit_id='page:'+str(i),
             text=('Complete synthetic section '+str(i)+'\n')+'x'*65000,
             numbers=[dict(index=17,raw='123.4')]) for i in range(1,5)]
@@ -2112,7 +2112,7 @@ class FreshResearchEntryTests(unittest.TestCase):
         self.assertIn(limitation,build_periodic_spec(data,2)['gaps'])
 
     def test_company_driver_definitions_require_resolvable_original_citations(self):
-        from research_platform.workflow import _validate_driver_references
+        from company_initiation.historic_construction.workflow import _validate_driver_references
         ref=dict(source_id='original',unit_id='page:1')
         scope=dict(driver_map=[dict(id='activity',source_refs=[ref])],
             revenue_models=[dict(entity_id='north',source_refs=[ref])])
@@ -2126,7 +2126,7 @@ class FreshResearchEntryTests(unittest.TestCase):
             _validate_driver_references(scope,{'original':{'page:2':{}}})
 
     def test_research_anchor_binding_supports_organic_and_estimated_segment_da(self):
-        from research_platform.workflow import _bind_research_anchors
+        from company_initiation.historic_construction.workflow import _bind_research_anchors
         data=different_period_company();base=str(data['history_years'][-1])
         for observation in data['observations']:
             if observation['kind']!='FY':continue
@@ -2164,7 +2164,7 @@ class FreshResearchEntryTests(unittest.TestCase):
         self.assertIn('north_organic',rows)
 
     def test_missing_scope_accounting_is_distinct_from_arithmetic_status(self):
-        from research_platform.workflow import model_financial_completeness
+        from company_initiation.forecast_construction.workflow import model_financial_completeness
         data=different_period_company()
         data['model_configuration']['financial_contracts']={'scope_events':[dict(
             id='synthetic_pending_acquisition',entity_id='north',enabled=False,
@@ -2183,16 +2183,16 @@ class FreshResearchEntryTests(unittest.TestCase):
 
     def _fresh_archive(self,with_fx):
         from tests.test_periodic_model import _write_synthetic_originals
-        from research_platform.evidence import inventory_local_sources
-        from research_platform.ai import OpenAIProvider
-        from research_platform.__main__ import main
+        from company_initiation.historic_construction.evidence import inventory_local_sources
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.__main__ import main
         data=different_period_company()
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);archive=root/'company';archive.mkdir()
             (root/'pyproject.toml').write_text('[tool.research-platform]\ncheap-review-repairs = 1\n',encoding='utf-8')
             if with_fx:
-                from research_platform.fx_store import FXStore
-                from research_platform.fx import publication_dates
+                from shared_FX.fx_store import FXStore
+                from shared_FX.fx import publication_dates
                 from tests.test_shared_fx import quote
                 database=root/'shared.sqlite'
                 with FXStore(database) as store:
@@ -2344,18 +2344,22 @@ class FreshResearchEntryTests(unittest.TestCase):
                         detail='Synthetic source review warning retained across deterministic FX refreshes.',
                         source_references=[])],summary='Synthetic provider fixture; not a real-company review')
                 return dict(findings=[],summary='Synthetic provider fixture; not a real-company review')
-            with patch.object(provider,'complete',side_effect=answer) as calls,patch('research_platform.ai.urlopen') as network,patch('research_platform.workflow.discover_releases',return_value=(data['source_freshness'],[])):
-                with patch('research_platform.ai.OpenAIProvider.from_env',return_value=provider),patch('research_platform.__main__.find_project_root',return_value=root), \
-                        patch('sys.argv',['research_platform','construct',data['company'],'--sources',str(archive),'--as-of','2026-10-23','--history-years','2','--forecast-years','2']), \
-                        patch('research_platform.integrated.recalculate_workbook',return_value={'status':'passed'}), \
-                        patch('research_platform.model_excel.verify_excel_sensitivities',return_value={'status':'passed'}),patch('builtins.print') as printed:
+            with patch.object(provider,'complete',side_effect=answer) as calls,patch('company_initiation.shared_ai.urlopen') as network,patch('company_initiation.historic_construction.workflow.discover_releases',return_value=(data['source_freshness'],[])):
+                with patch('company_initiation.shared_ai.OpenAIProvider.from_env',return_value=provider),patch('company_initiation.__main__.find_project_root',return_value=root), \
+                        patch('sys.argv',['company_initiation','construct',data['company'],'--sources',str(archive),'--as-of','2026-10-23','--history-years','2','--forecast-years','2']), \
+                        patch('company_initiation.forecast_construction.integrated.recalculate_workbook',return_value={'status':'passed'}), \
+                        patch('company_initiation.forecast_construction.model_excel.verify_excel_sensitivities',return_value={'status':'passed'}),patch('builtins.print') as printed:
                     result=main()
                     self.assertEqual(result,0,str(printed.call_args_list[-3:]))
                 inputs=next((root/'outputs').glob('construct_research_*/company_model_inputs.json'))
                 generated=json.loads(inputs.read_text(encoding='utf-8'))
                 self.assertEqual(generated['currency'],'GBP')
-                self.assertEqual(generated['model_configuration']['valuation']['research']['schema'],VALUATION_RESEARCH_VERSION)
-                self.assertTrue((inputs.parent/'valuation_research.json').is_file())
+                self.assertNotIn('valuation',generated['model_configuration'])
+                self.assertFalse((inputs.parent/'valuation_research.json').exists())
+                historical=json.loads((inputs.parent/'historical_model.json').read_text(encoding='utf-8'))
+                self.assertNotIn('forecast_years',historical)
+                self.assertLessEqual(max(period['end'] for period in historical['periods']),historical['latest_reporting_date'])
+                self.assertFalse(any(cell.get('status')=='forecast' for row in historical['rows'] for cell in row.get('cells',{}).values()))
                 self.assertEqual(generated['fiscal_calendar']['fiscal_year_end'],'06-30')
                 self.assertEqual(len(generated['segments']),2)
                 self.assertEqual(generated['consolidation_hierarchy']['primary'],'SYNTHETIC operating components')
@@ -2369,6 +2373,11 @@ class FreshResearchEntryTests(unittest.TestCase):
                 self.assertIsNone(generated['model_configuration']['financial_contracts']['financing']['repurchase_price'])
                 self.assertEqual(generated['model_configuration']['financial_contracts']['dividends']['parent']['payment_weights'],{'Q4':1})
                 run=next((root/'outputs').glob('construct_integrated_*'))
+                valued_inputs=json.loads((run/'company_model_inputs.json').read_text(encoding='utf-8'))
+                self.assertEqual(valued_inputs['model_configuration']['valuation']['research']['schema'],VALUATION_RESEARCH_VERSION)
+                self.assertTrue((run/'valuation_research.json').is_file())
+                recorded_stages=[call['stage'] for call in json.loads((run/'record.json').read_text(encoding='utf-8'))['calls']]
+                self.assertLess(recorded_stages.index('integrated_schedules'),recorded_stages.index('company_valuation_sources'))
                 self.assertEqual(set(review_payloads),{'integrated_segments','integrated_income_review',
                     'integrated_cashflow_review','integrated_balance_review','integrated_schedules'})
                 reviewed_income={r['id']:r for r in review_payloads['integrated_income_review']['rows']}
@@ -2393,11 +2402,11 @@ class FreshResearchEntryTests(unittest.TestCase):
                 self.assertEqual(json.loads((run/'record.json').read_text(encoding='utf-8'))['status'],'complete_provisional')
                 for filename in ('record.json','model_specification.json','validation.json'):
                     self.assertEqual(json.loads((run/filename).read_text(encoding='utf-8'))['financial_completeness'],'provisional')
-                from research_platform.workflow import offline_export
+                from company_initiation.forecast_construction.workflow import offline_export
                 before=calls.call_count
-                with patch('research_platform.ai.OpenAIProvider.from_env',side_effect=AssertionError('Offline export must not load an AI provider')), \
-                        patch('research_platform.construction.recalculate_workbook',return_value={'status':'passed'}), \
-                        patch('research_platform.model_excel.verify_excel_sensitivities',return_value={'status':'passed'}):
+                with patch('company_initiation.shared_ai.OpenAIProvider.from_env',side_effect=AssertionError('Offline export must not load an AI provider')), \
+                        patch('company_initiation.forecast_construction.construction.recalculate_workbook',return_value={'status':'passed'}), \
+                        patch('company_initiation.forecast_construction.model_excel.verify_excel_sensitivities',return_value={'status':'passed'}):
                     exported=offline_export(root,run,**dict(fx_database=database,fx_as_of='2026-10-23T23:59:59+00:00') if with_fx else {})
                 prior_checks=json.loads((run/'validation.json').read_text(encoding='utf-8'))['checks']
                 exported_checks=json.loads((exported/'validation.json').read_text(encoding='utf-8'))['checks']
@@ -2429,9 +2438,9 @@ class FreshResearchEntryTests(unittest.TestCase):
                     proof=json.loads((exported/'workbook_validation.json').read_text(encoding='utf-8'))
                     bad=[c for c in exported_checks if c['status'] in ('FAIL','MISSING')]
                     self.assertEqual(json.loads((exported/'record.json').read_text(encoding='utf-8'))['status'],'complete_provisional',str(dict(checks=bad,layout=proof.get('layout'))))
-                    with patch('research_platform.ai.OpenAIProvider.from_env',side_effect=AssertionError('Repeated refresh must not load an AI provider')), \
-                            patch('research_platform.construction.recalculate_workbook',return_value={'status':'passed'}), \
-                            patch('research_platform.model_excel.verify_excel_sensitivities',return_value={'status':'passed'}):
+                    with patch('company_initiation.shared_ai.OpenAIProvider.from_env',side_effect=AssertionError('Repeated refresh must not load an AI provider')), \
+                            patch('company_initiation.forecast_construction.construction.recalculate_workbook',return_value={'status':'passed'}), \
+                            patch('company_initiation.forecast_construction.model_excel.verify_excel_sensitivities',return_value={'status':'passed'}):
                         repeated=offline_export(root,exported,fx_database=database,fx_as_of='2026-10-23T23:59:59+00:00')
                     repeated_checks=json.loads((repeated/'validation.json').read_text(encoding='utf-8'))['checks']
                     repeated_record=json.loads((repeated/'record.json').read_text(encoding='utf-8'))
@@ -2472,9 +2481,9 @@ class FreshnessTests(unittest.TestCase):
                     self.assertTrue(any(item['status']=='FAIL' for item in freshness_checks(revised,root)))
 
     def test_disclosure_update_reuses_withdrawn_original_but_rejects_changed_live_bytes(self):
-        from research_platform.ai import OpenAIProvider
-        from research_platform.evidence import inventory_local_sources
-        from research_platform.workflow import update_company_inputs
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.historic_construction.evidence import inventory_local_sources
+        from company_initiation.historic_construction.workflow import update_company_inputs
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive=root/'company';reports=archive/'financial_reports';reports.mkdir(parents=True)
             original=reports/'original.txt';original.write_text('Synthetic original annual revenue 30.',encoding='utf-8')
@@ -2494,9 +2503,9 @@ class FreshnessTests(unittest.TestCase):
             freshness=dict(checked_as_of='2026-10-25',official_indexes=['https://synthetic.invalid/results'],
                 releases=[dict(id='original_release',source_id=source['id'],published_at='2026-01-01',requires_observations=False)])
             provider=OpenAIProvider(api_key='SYNTHETIC-NOT-A-CREDENTIAL')
-            with patch('research_platform.workflow.discover_releases',return_value=(freshness,[])), \
-                 patch('research_platform.workflow.combined_history_review_current',return_value=False), \
-                 patch('research_platform.workflow.ensure_combined_history_review') as review:
+            with patch('company_initiation.historic_construction.workflow.discover_releases',return_value=(freshness,[])), \
+                 patch('company_initiation.historic_construction.workflow.combined_history_review_current',return_value=False), \
+                 patch('company_initiation.historic_construction.workflow.ensure_combined_history_review') as review:
                 result=update_company_inputs(root,parent,as_of='2026-10-25',provider=provider)
                 review.assert_called_once()
                 self.assertIn('Synthetic original annual revenue 30.',review.call_args.kwargs['original_units'][0]['text'])
@@ -2512,7 +2521,7 @@ class FreshnessTests(unittest.TestCase):
 
     def test_official_discovery_reads_event_and_checks_date_quote_and_url(self):
         from types import SimpleNamespace
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';event=index+'/event';pdf=index+'/release.pdf'
         index_html=b'<p>Results calendar</p><a href="/results/event">2031 nine months</a>'
         event_html=b'<p>22 October 2031</p><a href="/results/release.pdf">Original release</a>'
@@ -2520,7 +2529,7 @@ class FreshnessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);saved={};answers=[dict(releases=[],event_pages=[event],gaps=[]),dict(releases=[release],event_pages=[],gaps=[])]
             def stage(*args):
-                from research_platform.ai import _input_messages
+                from company_initiation.shared_ai import _input_messages
                 messages=_input_messages(args[2])
                 self.assertGreater(len(messages),1)
                 if args[0]=='official_release_documents':
@@ -2528,13 +2537,13 @@ class FreshnessTests(unittest.TestCase):
                 return answers.pop(0)
             journal=SimpleNamespace(directory=root,state={'artifacts':{}},stage=stage,artifact=lambda name,data:saved.update({name:data}))
             def fetch(url):return {index:(index_html,index,'text/html'),event:(event_html,event,'text/html'),pdf:(b'%PDF SYNTHETIC fixture',pdf,'application/pdf')}[url]
-            with patch('research_platform.evidence.download',side_effect=fetch) as calls:
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=fetch) as calls:
                 fresh,sources=discover_releases(journal,root,['http://synthetic.invalid/results'],'2031-10-23',latest_completed_year=2030)
             self.assertEqual(calls.call_count,3);self.assertEqual(fresh['releases'][0]['published_at'],'2031-10-22')
             self.assertTrue((root/sources[0]['local_path']).is_file())
             self.assertEqual(fresh['official_indexes'][0]['requested_url'],'http://synthetic.invalid/results')
             answers.extend([dict(releases=[],event_pages=[event],gaps=[]),dict(releases=[dict(release,publication_evidence='invented date quote')],event_pages=[],gaps=[])])
-            with patch('research_platform.evidence.download',side_effect=fetch),self.assertRaisesRegex(ValueError,'quotation'):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=fetch),self.assertRaisesRegex(ValueError,'quotation'):
                 discover_releases(journal,root,[index],'2031-10-23')
 
     def test_release_published_by_asof_requires_original_and_bindings(self):
@@ -2596,9 +2605,9 @@ class DisclosurePrecedenceTests(unittest.TestCase):
 
 class SavedScenarioArtifactTests(unittest.TestCase):
     def test_plain_export_then_input_refresh_retains_snapshot_and_typed_scenario_artifacts(self):
-        from research_platform.workflow import offline_export
-        from research_platform.periods import assumption_contract,apply_assumption_payload,model_logic_digest
-        from research_platform.integrated import verified_integrated_record
+        from company_initiation.forecast_construction.workflow import offline_export
+        from company_initiation.forecast_construction.periods import assumption_contract, apply_assumption_payload, model_logic_digest
+        from company_initiation.forecast_construction.integrated import verified_integrated_record
         from tests.test_periods import financial_spec
         spec=financial_spec();spec.update(company='SYNTHETIC saved scenario',currency='GBP',forecast_years=[2026],
             historical_years=[2025],model_configuration={'as_of':'2026-01-01'},gaps=[],policies={})
@@ -2625,14 +2634,14 @@ class SavedScenarioArtifactTests(unittest.TestCase):
             # This test isolates saved-artifact lineage and actual Python scenario
             # arithmetic. Renderer/desktop checks have their separate test suite.
             def fake_export(path,*args,**kwargs):path.write_bytes(b'synthetic renderer placeholder');return {}
-            with patch('research_platform.ai.OpenAIProvider.from_env',side_effect=AssertionError('No AI during saved export')), \
-                 patch('research_platform.model_excel.export_integrated',side_effect=fake_export), \
-                 patch('research_platform.model_excel.validate_workbook_layout',return_value={'status':'passed'}), \
-                 patch('research_platform.construction.recalculate_workbook',side_effect=AssertionError('No desktop Excel in artifact test')), \
-                 patch('research_platform.integrated.periodic_sensitivities',return_value=([],[])), \
-                 patch('research_platform.integrated.integrated_runtime_fingerprint',return_value={'code':[]}), \
-                 patch('research_platform.evidence.source_selection_audit',return_value={}), \
-                 patch('research_platform.integrated.build_periodic_spec',side_effect=lambda *args:copy.deepcopy(default_spec)) as compile_model:
+            with patch('company_initiation.shared_ai.OpenAIProvider.from_env',side_effect=AssertionError('No AI during saved export')), \
+                 patch('company_initiation.forecast_construction.model_excel.export_integrated',side_effect=fake_export), \
+                 patch('company_initiation.forecast_construction.model_excel.validate_workbook_layout',return_value={'status':'passed'}), \
+                 patch('company_initiation.forecast_construction.construction.recalculate_workbook',side_effect=AssertionError('No desktop Excel in artifact test')), \
+                 patch('company_initiation.forecast_construction.integrated.periodic_sensitivities',return_value=([],[])), \
+                 patch('company_initiation.shared_artifacts.integrated_runtime_fingerprint',return_value={'code':[]}), \
+                 patch('company_initiation.historic_construction.evidence.source_selection_audit',return_value={}), \
+                 patch('company_initiation.forecast_construction.integrated.build_periodic_spec',side_effect=lambda *args:copy.deepcopy(default_spec)) as compile_model:
                 exported=offline_export(root,parent,recalculate=False)
                 compile_model.assert_not_called()
                 refreshed=offline_export(root,exported,inputs_file=inputs,recalculate=False)
@@ -2654,7 +2663,7 @@ class SavedScenarioArtifactTests(unittest.TestCase):
 
 class DiscoveryObligationReuseTests(unittest.TestCase):
     def test_modern_unscoped_claim_still_blocks_after_continuation(self):
-        from research_platform.workflow import restore_discovery_obligations,discover_releases
+        from company_initiation.historic_construction.workflow import restore_discovery_obligations, discover_releases
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive,previous,write=self.fixture(root)
             metadata=json.loads((Path(previous['directory'])/'source_freshness_partial.json').read_text())
@@ -2664,12 +2673,12 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
             restored=restore_discovery_obligations(previous,[previous],archive,'2026-10-25',[2016],{'fiscal_year_end':'12-31'})
             self.assertEqual(len(restored['obligations']),1);self.assertFalse(restored['obligations'][0]['period_scope_verified'])
             harness=OfficialDiscoveryNavigationTests();journal=harness.journal(root,[harness.answer()]);url='https://synthetic.invalid/current'
-            with patch('research_platform.evidence.download',return_value=(b'<p>Current index</p>',url,'text/html')),self.assertRaisesRegex(ValueError,'Original scope remains unknown'):
+            with patch('company_initiation.historic_construction.evidence.download',return_value=(b'<p>Current index</p>',url,'text/html')),self.assertRaisesRegex(ValueError,'Original scope remains unknown'):
                 discover_releases(journal,archive,[url],'2026-10-25',historical_years=[2016],latest_completed_year=2025,
                     fiscal_calendar={'fiscal_year_end':'12-31'},restored_coverage=restored)
 
     def test_modern_unverified_claims_survive_continuation_without_becoming_verified(self):
-        from research_platform.workflow import restore_discovery_obligations
+        from company_initiation.historic_construction.workflow import restore_discovery_obligations
         for quote in ('','FY Results','Invented quotation'):
             with self.subTest(quote=quote),tempfile.TemporaryDirectory() as temporary:
                 root=Path(temporary);archive,previous,write=self.fixture(root)
@@ -2710,7 +2719,7 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
         return archive,record,write
 
     def test_legacy_eight_period_gaps_restore_with_exact_artifact_and_html_provenance(self):
-        from research_platform.workflow import restore_discovery_obligations,discover_releases,_validate_discovery_coverage
+        from company_initiation.historic_construction.workflow import restore_discovery_obligations, discover_releases, _validate_discovery_coverage
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive,previous,write=self.fixture(root)
             restored=restore_discovery_obligations(previous,[previous],archive,'2026-10-25',list(range(2016,2026)),{'fiscal_year_end':'12-31'})
@@ -2721,7 +2730,7 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
             self.assertEqual(first['restored_from']['answer']['artifact'],'official_release_documents_first_attempt_0.json')
             self.assertEqual(first['restored_from']['originals'][0]['sha256'],first['evidence'][0]['sha256'])
             harness=OfficialDiscoveryNavigationTests();index='https://synthetic.invalid/current';journal=harness.journal(root,[harness.answer()])
-            with patch('research_platform.evidence.download',return_value=(b'<p>Current financial navigation</p>',index,'text/html')):
+            with patch('company_initiation.historic_construction.evidence.download',return_value=(b'<p>Current financial navigation</p>',index,'text/html')):
                 result,_=discover_releases(journal,archive,[index],'2026-10-25',historical_years=list(range(2016,2026)),
                     latest_completed_year=2025,fiscal_calendar={'fiscal_year_end':'12-31'},restored_coverage=restored)
             self.assertEqual(len(journal.contexts[0]['retained_coverage_obligations']),8)
@@ -2729,7 +2738,7 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'never reached primary coverage adjudication'):_validate_discovery_coverage(result,[])
 
     def test_restoration_checks_hashes_exact_quotation_scope_and_calendar(self):
-        from research_platform.workflow import restore_discovery_obligations
+        from company_initiation.historic_construction.workflow import restore_discovery_obligations
         for failure in ('hash','quotation','calendar'):
             with self.subTest(failure=failure),tempfile.TemporaryDirectory() as temporary:
                 root=Path(temporary);archive,previous,write=self.fixture(root)
@@ -2742,7 +2751,7 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
                         {'fiscal_year_end':'06-30' if failure=='calendar' else '12-31'})
 
     def test_current_requested_scope_filters_old_claims_without_deleting_their_audit(self):
-        from research_platform.workflow import restore_discovery_obligations
+        from company_initiation.historic_construction.workflow import restore_discovery_obligations
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive,previous,write=self.fixture(root)
             restored=restore_discovery_obligations(previous,[previous],archive,'2026-10-25',[2019,2020],{'fiscal_year_end':'12-31'})
@@ -2756,7 +2765,7 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
                 restore_discovery_obligations(previous,[previous],archive,'2026-10-25',[2019],{'fiscal_year_end':'12-31'})
 
     def test_saved_dispositions_do_not_waive_current_primary_review(self):
-        from research_platform.workflow import restore_discovery_obligations
+        from company_initiation.historic_construction.workflow import restore_discovery_obligations
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive,previous,write=self.fixture(root)
             restored=restore_discovery_obligations(previous,[previous],archive,'2026-10-25',[2019],{'fiscal_year_end':'12-31'})
@@ -2769,7 +2778,7 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
             self.assertTrue(all(item['status']=='pending_primary_coverage' for item in repeated['obligations']))
 
     def test_earlier_requested_cutoff_defers_later_announced_current_period_publication(self):
-        from research_platform.workflow import restore_discovery_obligations
+        from company_initiation.historic_construction.workflow import restore_discovery_obligations
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive,previous,write=self.fixture(root)
             name='official_release_documents_first_attempt_0.json'
@@ -2787,7 +2796,7 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
             self.assertEqual(restored['audit'][0]['status'],'future_at_requested_or_recorded_cutoff')
 
     def test_legacy_generic_fy_quote_is_audited_without_inventing_its_year(self):
-        from research_platform.workflow import restore_discovery_obligations
+        from company_initiation.historic_construction.workflow import restore_discovery_obligations
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive,previous,write=self.fixture(root)
             html=b'<p>FY Results</p>';sha=hashlib.sha256(html).hexdigest()
@@ -2805,7 +2814,7 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
             self.assertEqual(restored['audit'][0]['evidence'][0]['quotation'],'FY Results')
 
     def test_unverified_future_publication_cannot_erase_a_cited_completed_period(self):
-        from research_platform.workflow import restore_discovery_obligations
+        from company_initiation.historic_construction.workflow import restore_discovery_obligations
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive,previous,write=self.fixture(root)
             quote='2026 third quarter sales';html=('<p>'+quote+'</p>').encode();sha=hashlib.sha256(html).hexdigest()
@@ -2822,7 +2831,7 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
             self.assertEqual(restored['audit'][0]['status'],'unsupported_expected_publication_claim')
 
     def test_missing_legacy_year_list_cannot_waive_current_required_annual_history(self):
-        from research_platform.workflow import restore_discovery_obligations
+        from company_initiation.historic_construction.workflow import restore_discovery_obligations
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive,previous,write=self.fixture(root)
             metadata=json.loads((Path(previous['directory'])/'source_freshness_partial.json').read_text())
@@ -2835,7 +2844,7 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
             self.assertEqual(restored['obligations'][0]['period_kind'],'FY')
 
     def test_legacy_missing_date_id_uses_only_unique_quoted_event_not_wrong_supplied_id(self):
-        from research_platform.workflow import restore_discovery_obligations
+        from company_initiation.historic_construction.workflow import restore_discovery_obligations
         for identifier in (None,'date_wrong'):
             with self.subTest(identifier=identifier),tempfile.TemporaryDirectory() as temporary:
                 root=Path(temporary);archive,previous,write=self.fixture(root)
@@ -2864,8 +2873,8 @@ class DiscoveryObligationReuseTests(unittest.TestCase):
 class CompanyYearSourceSelectionTests(unittest.TestCase):
     def test_exact_ids_are_constrained_and_bounded_repair_preserves_distinct_sources(self):
         from types import SimpleNamespace
-        from research_platform.construction import RunJournal
-        from research_platform.workflow import _company_year_sources
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.workflow import _company_year_sources
         sha='d23fac0a1216fa7197aa78b1'+'a'*40
         catalog={key:dict(id=key,title='Synthetic FY original',sha256=sha,local_path='reports/original.pdf')
             for key in ('local_current','official_d23fac0a1216fa7197aa78b1')}
@@ -2896,7 +2905,7 @@ class CompanyYearSourceSelectionTests(unittest.TestCase):
 class OfficialDiscoveryNavigationTests(unittest.TestCase):
     """Synthetic official pages test the real navigation and evidence boundaries."""
     def test_selected_original_labels_correct_retained_scope_without_resolving_financial_coverage(self):
-        from research_platform.workflow import discover_releases,_validate_discovery_coverage
+        from company_initiation.historic_construction.workflow import discover_releases, _validate_discovery_coverage
         for labels,quote in (({'FY':'2016 Registration Document'},'FY Results'),
                              ({'FY':'Document de référence 2016','H1':'Rapport financier semestriel 2016'},'')):
             with self.subTest(labels=labels),tempfile.TemporaryDirectory() as temporary:
@@ -2910,7 +2919,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                         evidence=[dict(page_id=context['inspected_pages'][0]['page_id'],quotation=quote)] if quote else []) for kind in labels])
                 second=self.answer(releases=[self.release('https://synthetic.invalid/'+kind+'.pdf',2017) for kind in labels])
                 journal=self.journal(root,[first,second])
-                with patch('research_platform.evidence.download',side_effect=lambda url:pages[url]):
+                with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:pages[url]):
                     result,_=discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2016],fiscal_calendar={'fiscal_year_end':'12-31'})
                 self.assertEqual(journal.errors,[])
                 self.assertEqual(len(result['coverage_obligations']),len(labels))
@@ -2926,7 +2935,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'never reached primary coverage adjudication'):_validate_discovery_coverage(result,[])
 
     def test_current_cited_scope_correction_participates_in_bounded_validation_immediately(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';detail='https://synthetic.invalid/archive'
         pages={index:(b'<a href="/archive">Archive</a>',index,'text/html'),detail:(b'<p>2016 H1 financial results</p>',detail,'text/html')}
         gap=dict(detail='Half-year original not yet identified',fiscal_year=2016,period_kind='H1',period_end='2016-06-30',expected_publication_date=None,evidence=[])
@@ -2935,7 +2944,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             def corrected(context,schema):
                 return self.answer(gaps=[dict(gap,evidence=[dict(page_id=context['inspected_pages'][-1]['page_id'],quotation='2016 H1 financial results')])])
             journal=self.journal(root,[self.answer(pages=[detail],gaps=[gap]),[self.answer(),corrected]])
-            with patch('research_platform.evidence.download',side_effect=lambda url:pages[url]):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:pages[url]):
                 result,_=discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2016],fiscal_calendar={'fiscal_year_end':'12-31'})
             self.assertEqual(len(journal.errors),1)
             self.assertIn('Retained scope 2016 H1',journal.errors[0]);self.assertIn('restate this same fiscal_year/period_kind',journal.errors[0])
@@ -2943,7 +2952,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertFalse(claims[0]['period_scope_verified']);self.assertTrue(claims[1]['period_scope_verified'])
 
     def test_wrong_year_or_kind_selected_original_cannot_correct_retained_scope(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         for kind,label in (('FY','2015 Registration Document - 1 March 2016'),('H1','Annual results 2016'),
                            ('H1','Second half-year financial report 2016'),('9M','Q3 2016 sales')):
             with self.subTest(kind=kind,label=label),tempfile.TemporaryDirectory() as temporary:
@@ -2952,11 +2961,11 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                     detail:(('<p>1 March 2017</p><a href="/original.pdf">'+label+'</a>').encode(),detail,'text/html')}
                 gap=dict(detail='Unverified period scope',fiscal_year=2016,period_kind=kind,period_end='2016-'+{'FY':'12-31','H1':'06-30','9M':'09-30'}[kind],expected_publication_date=None,evidence=[])
                 journal=self.journal(root,[self.answer(pages=[detail],gaps=[gap]),self.answer(releases=[self.release(pdf,2017)])])
-                with patch('research_platform.evidence.download',side_effect=lambda url:pages[url]),self.assertRaisesRegex(ValueError,'Retained scope 2016 '+kind):
+                with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:pages[url]),self.assertRaisesRegex(ValueError,'Retained scope 2016 '+kind):
                     discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2016],fiscal_calendar={'fiscal_year_end':'12-31'})
 
     def test_cited_wrong_period_correction_cannot_change_a_cumulative_obligation(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';detail='https://synthetic.invalid/archive'
         pages={index:(b'<a href="/archive">Archive</a>',index,'text/html'),detail:(b'<p>2016 Q3 sales</p>',detail,'text/html')}
         gap=dict(detail='Nine-month source missing',fiscal_year=2016,period_kind='9M',period_end='2016-09-30',expected_publication_date=None,evidence=[])
@@ -2965,11 +2974,11 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             def wrong(context,schema):
                 return self.answer(gaps=[dict(gap,evidence=[dict(page_id=context['inspected_pages'][-1]['page_id'],quotation='2016 Q3 sales')])])
             journal=self.journal(root,[self.answer(pages=[detail],gaps=[gap]),wrong])
-            with patch('research_platform.evidence.download',side_effect=lambda url:pages[url]),self.assertRaisesRegex(ValueError,'different fiscal scope'):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:pages[url]),self.assertRaisesRegex(ValueError,'different fiscal scope'):
                 discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2016],fiscal_calendar={'fiscal_year_end':'12-31'})
 
     def test_prior_period_gaps_survive_empty_later_answer_and_require_primary_adjudication(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';detail='https://synthetic.invalid/archive';pdf='https://synthetic.invalid/annual.pdf'
         pages={index:(b'<p>2025 nine-month sales</p><p>1 March 2026</p><a href="/annual.pdf">Annual original</a><a href="/archive">Archive</a>',index,'text/html'),
             detail:(b'<p>Previously published annual originals and archive information</p>',detail,'text/html'),
@@ -2989,7 +2998,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                 def download(url):
                     if failed and url==detail:raise OSError('Synthetic access failure')
                     return pages[url]
-                with patch('research_platform.evidence.download',side_effect=download):
+                with patch('company_initiation.historic_construction.evidence.download',side_effect=download):
                     if failed:
                         with self.assertRaisesRegex(OSError,'Synthetic access failure'):
                             discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2025],fiscal_calendar={'fiscal_year_end':'12-31'})
@@ -3005,12 +3014,12 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                 self.assertNotIn('coverage_dispositions',result)
 
     def test_unscoped_prior_gap_cannot_be_cleared_by_empty_later_answer(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';detail='https://synthetic.invalid/archive'
         pages={index:(b'<a href="/archive">Archive</a>',index,'text/html'),detail:(b'<p>Archive details</p>',detail,'text/html')}
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[self.answer(pages=[detail],gaps=['Unscoped original coverage missing']),self.answer()])
-            with patch('research_platform.evidence.download',side_effect=lambda url:pages[url]),self.assertRaisesRegex(ValueError,'Unscoped original coverage missing'):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:pages[url]),self.assertRaisesRegex(ValueError,'Unscoped original coverage missing'):
                 discover_releases(journal,root,[index],'2026-10-25')
             self.assertEqual(len(journal.saved['source_freshness_partial.json']['coverage_obligations']),1)
 
@@ -3047,7 +3056,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
         from io import BytesIO
         from pypdf import PdfWriter
         from pypdf.generic import NameObject,DictionaryObject,DecodedStreamObject
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         writer=PdfWriter();page=writer.add_blank_page(600,800)
         font=DictionaryObject({NameObject('/Type'):NameObject('/Font'),NameObject('/Subtype'):NameObject('/Type1'),NameObject('/BaseFont'):NameObject('/Helvetica')})
         page[NameObject('/Resources')]=DictionaryObject({NameObject('/Font'):DictionaryObject({NameObject('/F1'):writer._add_object(font)})})
@@ -3070,7 +3079,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                     return dict(published_at='2017-07-27' if resolved else None,unit_id='page:1' if resolved else None,
                         quotation='Issued 27 July 2017' if resolved else '',reason='Explicit original issuer dateline' if resolved else 'No unambiguous publication dateline established')
                 journal=self.journal(root,[self.answer(releases=[first],pages=[detail]),self.answer(releases=[second]),resolve])
-                with patch('research_platform.evidence.download',side_effect=lambda url:pages[url]) as downloads:
+                with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:pages[url]) as downloads:
                     if current:
                         with self.assertRaisesRegex(ValueError,'current or uncited historical'):
                             discover_releases(journal,root,[index],'2017-10-25',latest_completed_year=2016,historical_years=[2016])
@@ -3087,8 +3096,8 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                 else:self.assertTrue(any('contradictory' in text for text in fresh['limitations']))
 
     def test_conflict_dateline_repair_rejects_wrong_unit_and_conflicting_date_quote(self):
-        from research_platform.workflow import discover_releases
-        from research_platform.evidence import _units as real_units
+        from company_initiation.historic_construction.workflow import discover_releases
+        from company_initiation.historic_construction.evidence import _units as real_units
         index='https://synthetic.invalid/results';detail='https://synthetic.invalid/detail';pdf='https://synthetic.invalid/report.pdf'
         pages={index:(b'<p>1 March 2026</p><a href="/report.pdf">2025 report</a><a href="/detail">Details</a>',index,'text/html'),
             detail:(b'<p>2 March 2026</p><a href="/report.pdf">2025 report</a>',detail,'text/html'),pdf:(b'%PDF preserved',pdf,'application/pdf')}
@@ -3100,14 +3109,14 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                 [dict(good,unit_id='page:9'),dict(good,published_at='2026-03-01'),good]])
             def units(payload,kind):
                 return [dict(unit_id='page:1',text='Published 2 March 2026',numbers=[])] if kind=='pdf' else real_units(payload,kind)
-            with patch('research_platform.evidence.download',side_effect=lambda url:pages[url]),patch('research_platform.evidence._units',side_effect=units):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:pages[url]),patch('company_initiation.historic_construction.evidence._units',side_effect=units):
                 fresh,_=discover_releases(journal,root,[index],'2026-10-25')
             self.assertEqual(len(journal.errors),2);self.assertIn('exact selected original unit',journal.errors[0])
             self.assertIn('does not establish',journal.errors[1]);self.assertEqual(fresh['releases'][0]['published_at'],'2026-03-02')
 
     def test_identical_pdf_aliases_merge_claims_by_hash_and_resolve_once(self):
-        from research_platform.workflow import discover_releases
-        from research_platform.evidence import _units as real_units
+        from company_initiation.historic_construction.workflow import discover_releases
+        from company_initiation.historic_construction.evidence import _units as real_units
         index='https://synthetic.invalid/results';first='https://synthetic.invalid/first.pdf';second='https://synthetic.invalid/second.pdf'
         original=b'%PDF exact same original bytes'
         for resolved,current_alias in ((True,False),(False,False),(False,True)):
@@ -3127,7 +3136,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                 journal=self.journal(root,[self.answer(releases=[one,two]),resolve])
                 def units(payload,kind):
                     return [dict(unit_id='page:1',text='Published 2 March 2026',numbers=[])] if kind=='pdf' else real_units(payload,kind)
-                with patch('research_platform.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (original,url,'application/pdf')) as fetches,patch('research_platform.evidence._units',side_effect=units):
+                with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (original,url,'application/pdf')) as fetches,patch('company_initiation.historic_construction.evidence._units',side_effect=units):
                     if current_alias:
                         with self.assertRaisesRegex(ValueError,'current or uncited historical'):
                             discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2025])
@@ -3143,8 +3152,8 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                 self.assertEqual({item['url'] for item in fresh['releases']},{first,second})
 
     def test_later_unknown_selection_cannot_erase_recorded_publication_conflict(self):
-        from research_platform.workflow import discover_releases
-        from research_platform.evidence import _units as real_units
+        from company_initiation.historic_construction.workflow import discover_releases
+        from company_initiation.historic_construction.evidence import _units as real_units
         base='https://synthetic.invalid';index=base+'/results';detail=base+'/details';archive=base+'/archive';pdf=base+'/report.pdf'
         pages={index:(b'<p>1 March 2026</p><a href="/report.pdf">2025 annual original</a><a href="/details">Details</a>',index,'text/html'),
             detail:(b'<p>2 March 2026</p><a href="/report.pdf">2025 annual original</a><a href="/archive">Archive</a>',detail,'text/html'),
@@ -3161,14 +3170,14 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                 self.answer(releases=[unknown]),resolve])
             def units(payload,kind):
                 return [dict(unit_id='page:1',text='Published 2 March 2026',numbers=[])] if kind=='pdf' else real_units(payload,kind)
-            with patch('research_platform.evidence.download',side_effect=lambda url:pages[url]),patch('research_platform.evidence._units',side_effect=units):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:pages[url]),patch('company_initiation.historic_construction.evidence._units',side_effect=units):
                 fresh,sources=discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2025])
             self.assertEqual(len(journal.contexts),4);self.assertEqual(sources[0]['publication_availability'],'verified_original_dateline')
             self.assertEqual(len(sources[0]['publication_claims']),2);self.assertEqual(fresh['releases'][0]['published_at'],'2026-03-02')
 
     def test_identical_originals_on_opposite_cutoff_sides_resolve_before_emission(self):
-        from research_platform.workflow import discover_releases
-        from research_platform.evidence import _units as real_units
+        from company_initiation.historic_construction.workflow import discover_releases
+        from company_initiation.historic_construction.evidence import _units as real_units
         index='https://synthetic.invalid/results';past='https://synthetic.invalid/past.pdf';future='https://synthetic.invalid/future.pdf'
         html=b'<p>24 October 2026; 28 October 2026</p><a href="/past.pdf">2026 interim</a><a href="/future.pdf">2026 interim</a>'
         before=dict(self.release(past,2026),published_at='2026-10-24',publication_evidence='24 October 2026',reporting_year=2026)
@@ -3181,7 +3190,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                     return dict(published_at=resolved,unit_id='page:1',quotation=quote,reason='Original issue dateline')
                 journal=self.journal(root,[self.answer(releases=[before,after]),resolve])
                 def units(payload,kind):return [dict(unit_id='page:1',text=quote,numbers=[])] if kind=='pdf' else real_units(payload,kind)
-                with patch('research_platform.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF same bytes',url,'application/pdf')) as fetched,patch('research_platform.evidence._units',side_effect=units):
+                with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF same bytes',url,'application/pdf')) as fetched,patch('company_initiation.historic_construction.evidence._units',side_effect=units):
                     fresh,sources=discover_releases(journal,root,[index],'2026-10-25')
                 self.assertEqual(fetched.call_count,3);self.assertEqual(len(journal.contexts),2)
                 if resolved.endswith('24'):
@@ -3193,8 +3202,8 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                     self.assertEqual(set(fresh['deferred_releases'][0]['observed_urls']),{past,future})
 
     def test_same_url_future_first_then_past_claim_is_not_lost_at_cutoff(self):
-        from research_platform.workflow import discover_releases
-        from research_platform.evidence import _units as real_units
+        from company_initiation.historic_construction.workflow import discover_releases
+        from company_initiation.historic_construction.evidence import _units as real_units
         index='https://synthetic.invalid/results';detail='https://synthetic.invalid/details';pdf='https://synthetic.invalid/report.pdf'
         pages={index:(b'<p>28 October 2026</p><a href="/report.pdf">2026 interim</a><a href="/details">Details</a>',index,'text/html'),
             detail:(b'<p>24 October 2026</p><a href="/report.pdf">2026 interim</a>',detail,'text/html'),pdf:(b'%PDF preserved',pdf,'application/pdf')}
@@ -3207,14 +3216,14 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             journal=self.journal(root,[self.answer(releases=[future],pages=[detail]),
                 self.answer(releases=[dict(future,published_at='2026-10-24',publication_evidence='24 October 2026')]),resolve])
             def units(payload,kind):return [dict(unit_id='page:1',text='Issued 28 October 2026',numbers=[])] if kind=='pdf' else real_units(payload,kind)
-            with patch('research_platform.evidence.download',side_effect=lambda url:pages[url]),patch('research_platform.evidence._units',side_effect=units):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:pages[url]),patch('company_initiation.historic_construction.evidence._units',side_effect=units):
                 fresh,sources=discover_releases(journal,root,[index],'2026-10-25')
             self.assertEqual(journal.contexts[1]['selected_releases'][0]['published_at'],'2026-10-28')
             self.assertEqual(sources,[]);self.assertEqual(fresh['releases'],[]);self.assertEqual(len(journal.contexts),3)
 
     def test_future_only_originals_and_unavailable_optional_aliases_remain_deferred(self):
         from urllib.error import HTTPError
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';past='https://synthetic.invalid/past.pdf';future='https://synthetic.invalid/future.pdf'
         html=b'<p>1 March 2026; 28 October 2026; 1 November 2026</p><a href="/past.pdf">2025 annual</a><a href="/future.pdf">2026 interim</a>'
         pending=dict(self.release(future,2026),published_at='2026-10-28',publication_evidence='28 October 2026',reporting_year=2026)
@@ -3230,7 +3239,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                     if mode=='optional_placeholder':return b'<p>Coming soon</p>',future,'text/html'
                     if mode=='optional_future_conflict':return b'%PDF different future original',future,'application/pdf'
                     raise HTTPError(url,404,'Not published yet',{},None)
-                with patch('research_platform.evidence.download',side_effect=fetch) as downloads:
+                with patch('company_initiation.historic_construction.evidence.download',side_effect=fetch) as downloads:
                     fresh,sources=discover_releases(journal,root,[index],'2026-10-25')
                 self.assertEqual(len(journal.contexts),1,'Future-only date conflict must not trigger paid review')
                 self.assertEqual(len(sources),1 if mode.startswith('optional') else 0)
@@ -3242,7 +3251,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                     if mode=='optional_placeholder':self.assertEqual(audit['sha256'],hashlib.sha256(b'<p>Coming soon</p>').hexdigest())
 
     def test_link_ids_resolve_long_original_urls_and_reject_unknown_or_wrong_kind_ids(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';archive='https://synthetic.invalid/financial/archive'
         pdf='https://synthetic.invalid/content/2018/Annual%20Report/2018_document?download=1&language=en'
         pages={index:(b'<a href="/financial/archive">Annual archive</a>',index,'text/html'),
@@ -3266,7 +3275,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             return dict(releases=[release],event_page_ids=['nav_unknown'],gaps=[])
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[[wrong_kind,navigation],original])
-            with patch('research_platform.evidence.download',side_effect=lambda url:pages[url]) as calls:
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:pages[url]) as calls:
                 fresh,sources=discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2018])
             self.assertEqual(calls.call_count,3);self.assertEqual(len(journal.errors),1)
             self.assertIn('Unknown original PDF link_id',journal.errors[0]);self.assertIn('Unknown navigation link_id',journal.errors[0])
@@ -3274,7 +3283,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertEqual((root/sources[0]['local_path']).read_bytes(),pages[pdf][0])
 
     def test_structured_future_period_gap_uses_company_calendar_and_is_retained(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';pdf='https://synthetic.invalid/annual.pdf'
         for ending,cutoff,finish in [('12-31','2026-10-25','2026-12-31'),('06-30','2026-03-15','2026-06-30')]:
             with self.subTest(ending=ending),tempfile.TemporaryDirectory() as temporary:
@@ -3284,7 +3293,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                         expected_publication_date=None,evidence=[dict(page_id=context['inspected_pages'][0]['page_id'],quotation='2026 annual results calendar')])
                     return self.answer(releases=[self.release(pdf,2026)],gaps=[gap])
                 journal=self.journal(root,[answer]);html=b'<p>1 March 2026. 2026 annual results calendar</p><a href="/annual.pdf">2025 annual original</a>'
-                with patch('research_platform.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF original',pdf,'application/pdf')):
+                with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF original',pdf,'application/pdf')):
                     fresh,_=discover_releases(journal,root,[index],cutoff,latest_completed_year=2025,historical_years=[2025],fiscal_calendar={'fiscal_year_end':ending})
                 self.assertFalse(journal.errors);gap=fresh['deferred_periods'][0]
                 self.assertEqual(gap['classification'],'future_financial_period');self.assertEqual(gap['period_end'],finish)
@@ -3292,7 +3301,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                 self.assertIn('not evidence of a published original',fresh['limitations'][0])
 
     def test_exact_inspected_page_id_is_audited_navigation_noop_but_pdf_id_is_not(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';pdf='https://synthetic.invalid/annual.pdf'
         def answer(context,schema):
             release=self.release(pdf,2026);release.pop('url');release['link_id']=context['catalog'][0]['link_id']
@@ -3303,7 +3312,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[[wrong_kind,answer]])
             html=b'<p>1 March 2026</p><a href="/annual.pdf">Annual original</a>'
-            with patch('research_platform.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF original',pdf,'application/pdf')) as calls:
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF original',pdf,'application/pdf')) as calls:
                 fresh,_=discover_releases(journal,root,[index],'2026-10-25')
             self.assertEqual(len(journal.errors),1);self.assertIn('Unknown navigation link_id',journal.errors[0])
             self.assertEqual(calls.call_count,2);self.assertEqual(fresh['releases'][0]['url'],pdf)
@@ -3313,7 +3322,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
 
     def test_structured_html_dates_preserve_native_timezone_and_reject_conflicting_fields(self):
         from datetime import datetime,timedelta,timezone
-        from research_platform.evidence import official_html_link_metadata
+        from company_initiation.historic_construction.evidence import official_html_link_metadata
         moment=datetime(2026,3,2,0,30,tzinfo=timezone(timedelta(hours=1)));stamp=int(moment.timestamp()*1000)
         raw='java.util.GregorianCalendar[time='+str(stamp)+',zone=sun.util.calendar.ZoneInfo[id="GMT+01:00"],YEAR=2026,MONTH=2,DAY_OF_MONTH=2,HOUR_OF_DAY=0,MINUTE=30,SECOND=0,ZONE_OFFSET=3600000,DST_OFFSET=0]'
         def document(calendar):
@@ -3333,8 +3342,8 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
 
     def test_discovery_cache_context_ignores_retrieval_clock_but_preserves_hash_and_failure(self):
         from datetime import datetime,timezone
-        from research_platform.workflow import discover_releases
-        from research_platform.construction import digest
+        from company_initiation.historic_construction.workflow import discover_releases
+        from company_initiation.shared_runtime import digest
         index='https://synthetic.invalid/results';pdf='https://synthetic.invalid/report.pdf';blocked='https://synthetic.invalid/blocked'
         html=b'<p>1 March 2026</p><a href="/report.pdf">2025 original report</a>'
         with tempfile.TemporaryDirectory() as temporary:
@@ -3345,7 +3354,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                 def fetch(url):
                     if url==blocked:raise OSError('Synthetic access denied')
                     return (content,index,'text/html') if url==index else (b'%PDF original',pdf,'application/pdf')
-                with patch('research_platform.workflow.datetime') as clock,patch('research_platform.evidence.download',side_effect=fetch):
+                with patch('company_initiation.historic_construction.workflow.datetime') as clock,patch('company_initiation.historic_construction.evidence.download',side_effect=fetch):
                     clock.now.return_value=datetime(2026,10,25,number,tzinfo=timezone.utc)
                     if number==3:
                         with self.assertRaisesRegex(ValueError,'access failed'):discover_releases(journal,archive,[index,blocked],'2026-10-25')
@@ -3361,7 +3370,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertNotEqual(digest(first.contexts[0]),digest(failed.contexts[0]))
 
     def test_large_observed_catalogue_constrains_ids_and_repairs_dates_without_repeating_catalogue(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';anchor='Rapport financier semestriel au 30 juin 2026 31 juillet 2026'
         html=(''.join('<a href="/original_'+str(n)+'.pdf">'+anchor+' document '+str(n)+'</a>' for n in range(160))).encode()
         def result(context,schema,mode):
@@ -3375,7 +3384,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[[
                 lambda c,s:result(c,s,'bad_id'),lambda c,s:result(c,s,'both_dates'),lambda c,s:result(c,s,'valid')]])
-            with patch('research_platform.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF original',url,'application/pdf')):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF original',url,'application/pdf')):
                 fresh,_=discover_releases(journal,root,[index],'2026-10-25')
             self.assertEqual(len(journal.errors),2)
             self.assertIn('nearby IDs',journal.errors[0]);self.assertLess(len(journal.errors[0]),2500)
@@ -3385,7 +3394,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertEqual(len(journal.contexts[0]['catalog']),160)
 
     def test_discovery_uses_only_linked_structured_dates_and_same_calendar_event(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';pdf='https://synthetic.invalid/report.pdf'
         html=b'<article title="Q1 2026 results" tagYear="2026"><time datetime="2026-04-22"></time><h3>First quarter results</h3><a href="/report.pdf">Press release</a></article><article title="Q3 2026 sales" startDate="java.util.GregorianCalendar[time=1793169000000,zone=sun.util.calendar.ZoneInfo[id=&quot;GMT&quot;],YEAR=2026,MONTH=9,DAY_OF_MONTH=28,HOUR_OF_DAY=6,MINUTE=30,SECOND=0,ZONE_OFFSET=0,DST_OFFSET=0]"><h3>Q3 2026 sales</h3><p>We will publish Q326 sales on October 28 at 7:30 AM CET.</p></article>'
         def answer(context,schema):
@@ -3406,7 +3415,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             return value
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[[unrelated,wrong_date,answer]])
-            with patch('research_platform.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF current original',pdf,'application/pdf')) as calls:
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF current original',pdf,'application/pdf')) as calls:
                 fresh,sources=discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2025],fiscal_calendar={'fiscal_year_end':'12-31'})
             self.assertEqual(calls.call_count,2);self.assertIn('invalid structured publication date',journal.errors[0])
             self.assertEqual(len(journal.errors),2);self.assertEqual(sources[0]['published_at'],'2026-04-22')
@@ -3418,20 +3427,20 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertEqual(fresh['deferred_periods'][0]['expected_publication_date_refs'][0]['native_timezone'],'GMT')
 
     def test_unknown_historical_period_can_use_exact_linked_card_year_metadata(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';pdf='https://synthetic.invalid/report.pdf'
         html=b'<article title="Quarterly results" tagYear="2025"><h3>Strong quarterly results</h3><a href="/report.pdf">Press release</a></article><article title="Other 2024 results"><h3>Unrelated 2024 statement</h3></article>'
         release=dict(self.release(pdf,2026),published_at=None,publication_evidence='',coverage_kind='historical_original',
             reporting_year=2025,reporting_period_evidence='Strong quarterly results')
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[[self.answer(releases=[dict(release,reporting_period_evidence='Unrelated 2024 statement')]),self.answer(releases=[release])]])
-            with patch('research_platform.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF historic original',pdf,'application/pdf')):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF historic original',pdf,'application/pdf')):
                 fresh,sources=discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2025])
             self.assertEqual(len(journal.errors),1);self.assertFalse(sources[0]['point_in_time_eligible'])
             self.assertEqual(sources[0]['reporting_period_refs'][0]['explicit_year_attributes'],{'tagyear':'2025'})
 
     def test_gap_future_dates_cannot_waive_missing_history_or_completed_current_period(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results'
         cases=[dict(fiscal_year=2025,period_kind='FY',period_end='2025-12-31',expected_publication_date='2027-03-01',quotation='2025 annual results expected 1 March 2027'),
             dict(fiscal_year=2026,period_kind='Q3',period_end='2026-09-30',expected_publication_date=None,quotation='2026 third quarter results'),
@@ -3447,7 +3456,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                     gap.update(detail='Required financial original unavailable',evidence=[dict(page_id=context['inspected_pages'][0]['page_id'],quotation=example['quotation'])])
                     return self.answer(gaps=[gap])
                 journal=self.journal(root,[answer])
-                with patch('research_platform.evidence.download',return_value=(html,index,'text/html')) as calls:
+                with patch('company_initiation.historic_construction.evidence.download',return_value=(html,index,'text/html')) as calls:
                     if example in cases[:2]:
                         result,_=discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2025],fiscal_calendar={'fiscal_year_end':'12-31'})
                         self.assertEqual(result['deferred_periods'],[])
@@ -3459,7 +3468,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                 self.assertEqual(calls.call_count,1)
 
     def test_future_gap_without_calendar_requires_exact_period_end_date_evidence(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results'
         for quote,valid in [('2026 annual results',False),('Fiscal period ends 31 December 2026',True)]:
             with self.subTest(quote=quote),tempfile.TemporaryDirectory() as temporary:
@@ -3468,7 +3477,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                     return self.answer(gaps=[dict(detail='Annual original not due',fiscal_year=2026,period_kind='FY',period_end='2026-12-31',
                         expected_publication_date=None,evidence=[dict(page_id=context['inspected_pages'][0]['page_id'],quotation=quote)])])
                 journal=self.journal(root,[answer]);html=b'<p>2026 annual results. Fiscal period ends 31 December 2026.</p>'
-                with patch('research_platform.evidence.download',return_value=(html,index,'text/html')):
+                with patch('company_initiation.historic_construction.evidence.download',return_value=(html,index,'text/html')):
                     if valid:
                         fresh,_=discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2025])
                         self.assertEqual(fresh['deferred_periods'][0]['period_boundary_basis'],'Explicit calendar date quoted from inspected official page')
@@ -3478,14 +3487,14 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
 
     def test_unknown_historical_publication_retains_original_without_freshness_or_vintage_claim(self):
         from datetime import date,timedelta
-        from research_platform.workflow import discover_releases,freshness_checks
+        from company_initiation.historic_construction.workflow import discover_releases, freshness_checks
         index='https://synthetic.invalid/reports';pdf='https://synthetic.invalid/report.pdf';as_of=date.today().isoformat()
         release=dict(url=pdf,published_at=None,title='Synthetic2025 annual report',publication_evidence='',requires_observations=True,
             coverage_kind='historical_original',reporting_year=2025,reporting_period_evidence='2025 Universal Registration Document')
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[self.answer(releases=[release])])
             html=b'<a href="/report.pdf">2025 Universal Registration Document</a>'
-            with patch('research_platform.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF synthetic',pdf,'application/pdf')):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF synthetic',pdf,'application/pdf')):
                 fresh,sources=discover_releases(journal,root,[index],as_of,latest_completed_year=2025,historical_years=[2025])
             source=sources[0];saved=fresh['releases'][0]
             self.assertIsNone(source['published_at']);self.assertEqual(source['publication_availability'],'unknown')
@@ -3506,7 +3515,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertTrue(any(c['name']=='future_source:'+source['id'] and c['status']=='FAIL' for c in freshness_checks(data,root)))
 
     def test_unknown_publication_exception_rejects_current_year_and_unlinked_period_quote(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/reports';pdf='https://synthetic.invalid/report.pdf'
         base=dict(url=pdf,published_at=None,title='Synthetic original',publication_evidence='',requires_observations=True,
             coverage_kind='historical_original',reporting_year=2025,reporting_period_evidence='2025 annual report')
@@ -3517,22 +3526,22 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             with self.subTest(message=message),tempfile.TemporaryDirectory() as temporary:
                 root=Path(temporary);journal=self.journal(root,[self.answer(releases=[release])])
                 html=b'<a href="/report.pdf">2025 annual report</a><p>Unrelated2025 period quote</p>'
-                with patch('research_platform.evidence.download',return_value=(html,index,'text/html')) as calls,self.assertRaisesRegex(ValueError,message):
+                with patch('company_initiation.historic_construction.evidence.download',return_value=(html,index,'text/html')) as calls,self.assertRaisesRegex(ValueError,message):
                     discover_releases(journal,root,[index],'2026-10-25',latest_completed_year=2025,historical_years=[2025])
                 self.assertEqual(calls.call_count,1)
 
     def test_known_publication_quote_must_match_declared_calendar_date(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';pdf='https://synthetic.invalid/annual.pdf'
         release=dict(self.release(pdf,2026),published_at='2025-03-01')
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[self.answer(releases=[release])])
             html=b'<p>1 March 2026</p><a href="/annual.pdf">Annual original</a>'
-            with patch('research_platform.evidence.download',return_value=(html,index,'text/html')),self.assertRaisesRegex(ValueError,'does not establish declared'):
+            with patch('company_initiation.historic_construction.evidence.download',return_value=(html,index,'text/html')),self.assertRaisesRegex(ValueError,'does not establish declared'):
                 discover_releases(journal,root,[index],'2026-10-25')
 
     def test_four_observed_rounds_retain_annuals_and_current_release_context(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         base='https://synthetic.invalid';pages=[base+'/results',base+'/archive',base+'/archive/years',base+'/archive/2020']
         historic=base+'/annual.pdf';current=base+'/interim.pdf'
         downloads={pages[0]:(b'<a href="http://synthetic.invalid/archive#top">Archive</a>',pages[0],'text/html'),
@@ -3546,7 +3555,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             answers=[self.answer(pages=[page]) for page in pages[1:]]
             answers.append(self.answer(releases=[self.release(historic,2021),self.release(current,2026)]))
             journal=self.journal(root,answers)
-            with patch('research_platform.evidence.download',side_effect=lambda url:downloads[url]) as calls:
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:downloads[url]) as calls:
                 result,sources=discover_releases(journal,root,['http://synthetic.invalid/results'],'2026-10-25',
                                                  latest_completed_year=2025,historical_years=range(2016,2026))
             self.assertEqual(calls.call_count,6)
@@ -3560,7 +3569,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertEqual(journal.saved['official_retrieval.json']['attempts'][0]['requested_url'],'http://synthetic.invalid/results')
 
     def test_invalid_link_and_unrelated_date_quote_are_repaired_inside_stage(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';unrelated=index+'/other';pdf=index+'/annual.pdf'
         release=self.release(pdf,2026)
         downloads={index:(b'<p>1 March 2026</p><a href="/results/annual.pdf">Annual</a>',index,'text/html'),
@@ -3570,7 +3579,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             journal=self.journal(root,[[self.answer(pages=[index+'/guessed']),
                                        self.answer(releases=[dict(release,published_at='2025-03-01',publication_evidence='1 March 2025')]),
                                        self.answer(releases=[release])]])
-            with patch('research_platform.evidence.download',side_effect=lambda url:downloads[url]) as calls:
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:downloads[url]) as calls:
                 result,_=discover_releases(journal,root,[index,unrelated],'2026-10-25')
             self.assertEqual(len(journal.errors),2)
             self.assertIn('absent',journal.errors[0]);self.assertIn('page linking',journal.errors[1])
@@ -3578,7 +3587,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertEqual(result['releases'][0]['published_at'],'2026-03-01')
 
     def test_navigation_url_date_and_quote_failures_are_reported_in_one_repair(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';pdf='https://synthetic.invalid/annual.pdf';bad='https://synthetic.invalid/guessed.pdf'
         release=self.release(pdf,2026)
         downloads={index:(b'<p>1 March 2026</p><a href="/results">Again</a><a href="/annual.pdf">Annual original</a>',index,'text/html'),
@@ -3587,7 +3596,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             dict(release,url=bad,publication_evidence='Unseen date phrase')])
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[[wrong,self.answer(releases=[release])]])
-            with patch('research_platform.evidence.download',side_effect=lambda url:downloads[url]) as calls:
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:downloads[url]) as calls:
                 result,_=discover_releases(journal,root,[index],'2026-10-25')
             self.assertEqual(len(journal.errors),1)
             error=journal.errors[0]
@@ -3599,14 +3608,14 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertEqual(result['releases'][0]['url'],pdf)
 
     def test_blocked_index_survives_other_access_and_prevents_complete_coverage(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         blocked='https://synthetic.invalid/blocked';index='https://synthetic.invalid/results'
         def fetch(url):
             if url==blocked:raise OSError('HTTP 403 original index access denied')
             return b'<p>Official results index</p>',index,'text/html'
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[self.answer()])
-            with patch('research_platform.evidence.download',side_effect=fetch),self.assertRaisesRegex(ValueError,'access failed'):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=fetch),self.assertRaisesRegex(ValueError,'access failed'):
                 discover_releases(journal,root,[blocked,index],'2026-10-25',historical_years=[2025])
             partial=journal.saved['source_freshness_partial.json']
             self.assertEqual(partial['status'],'incomplete_discovery')
@@ -3616,7 +3625,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertNotIn('source_freshness.json',journal.saved)
 
     def test_observed_navigation_progresses_beyond_four_rounds_and_retains_visited_audit(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         base='https://synthetic.invalid';pages=[base+'/'+str(i) for i in range(7)];pdf=base+'/annual.pdf'
         def fetch(url):
             if url==pdf:return b'%PDF original',pdf,'application/pdf'
@@ -3629,30 +3638,30 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             answers.extend(self.answer(pages=[page]) for page in pages[2:])
             answers.append(self.answer(releases=[self.release(pdf,2026)]))
             journal=self.journal(root,answers)
-            with patch('research_platform.evidence.download',side_effect=fetch) as calls:
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=fetch) as calls:
                 fresh,_=discover_releases(journal,root,[pages[0]],'2026-10-25')
             self.assertFalse(journal.errors);self.assertEqual(fresh['navigation_rounds'],7)
             self.assertEqual(journal.saved['official_navigation_audit.json']['ignored_already_visited'][0]['canonical_url'],pages[0])
             self.assertEqual(calls.call_count,8)
 
     def test_new_navigation_url_with_same_original_and_links_stops_without_another_call(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/index';again='https://synthetic.invalid/again'
         html=b'<a href="https://synthetic.invalid/again">Next archive page</a>'
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[self.answer(pages=[again])])
-            with patch('research_platform.evidence.download',side_effect=lambda url:(html,url,'text/html')) as calls,self.assertRaisesRegex(ValueError,'no evidence progress'):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:(html,url,'text/html')) as calls,self.assertRaisesRegex(ValueError,'no evidence progress'):
                 discover_releases(journal,root,[index],'2026-10-25')
             self.assertEqual(calls.call_count,2);self.assertEqual(len(journal.contexts),1)
             self.assertEqual(journal.saved['source_freshness_partial.json']['status'],'incomplete_discovery')
 
     def test_pdf_catalogue_and_complete_text_avoid_numeric_navigation_arrays_and_repeat_calls(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';pdf='https://synthetic.invalid/annual.pdf'
         html=b'<p>1 March 2026. Complete narrative revenue 123.</p><a href="/results#2025">2025</a><a href="/annual.pdf">Annual original 1 March 2026</a><a href="/annual.pdf">Annual original 1 March 2026</a>'
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[self.answer(pages=[index+'#2025'],releases=[self.release(pdf,2026)])])
-            with patch('research_platform.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF synthetic',pdf,'application/pdf')) as calls:
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:(html,index,'text/html') if url==index else (b'%PDF synthetic',pdf,'application/pdf')) as calls:
                 result,_=discover_releases(journal,root,[index],'2026-10-25')
             context=journal.contexts[0]
             self.assertEqual(len(context['catalog']),1)
@@ -3665,38 +3674,38 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertEqual(result['releases'][0]['url'],pdf)
 
     def test_terminal_gap_reports_exact_observed_pdf_candidate_evidence(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';pdf='https://synthetic.invalid/annual.pdf'
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[self.answer(gaps=['Annual original URL unavailable'])])
             html=b'<p>1 March 2026</p><a href="/annual.pdf">Annual original 2025</a>'
-            with patch('research_platform.evidence.download',return_value=(html,index,'text/html')),self.assertRaisesRegex(ValueError,'Exact observed PDF links remain unselected'):
+            with patch('company_initiation.historic_construction.evidence.download',return_value=(html,index,'text/html')),self.assertRaisesRegex(ValueError,'Exact observed PDF links remain unselected'):
                 discover_releases(journal,root,[index],'2026-10-25')
             self.assertIn(pdf,journal.errors[0]);self.assertIn('Annual original 2025',journal.errors[0])
 
     def test_only_repeated_pages_are_incomplete_without_a_paid_repair(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results'
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[self.answer(pages=[index+'#2025'])])
-            with patch('research_platform.evidence.download',return_value=(b'<a href="/results#2025">2025</a>',index,'text/html')) as calls, \
+            with patch('company_initiation.historic_construction.evidence.download',return_value=(b'<a href="/results#2025">2025</a>',index,'text/html')) as calls, \
                  self.assertRaisesRegex(ValueError,'repeated inspected pages were ignored'):
                 discover_releases(journal,root,[index],'2026-10-25')
             self.assertFalse(journal.errors);self.assertEqual(len(journal.contexts),1);self.assertEqual(calls.call_count,1)
             self.assertEqual(journal.saved['source_freshness_partial.json']['status'],'incomplete_discovery')
 
     def test_pdf_index_format_failure_is_retained(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/report.pdf'
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[])
-            with patch('research_platform.evidence.download',return_value=(b'%PDF synthetic',index,'application/pdf')),self.assertRaisesRegex(ValueError,'No evidenced'):
+            with patch('company_initiation.historic_construction.evidence.download',return_value=(b'%PDF synthetic',index,'application/pdf')),self.assertRaisesRegex(ValueError,'No evidenced'):
                 discover_releases(journal,root,[index],'2026-10-25')
             attempt=journal.saved['source_freshness_partial.json']['retrieval_attempts'][0]
             self.assertEqual(attempt['status'],'failed');self.assertIn('navigation page is a PDF',attempt['error'])
 
     def test_missing_quarter_repair_uses_observed_anchor_context_then_pdf(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         home='https://synthetic.invalid';index=home+'/results';event=home+'/first-quarter';pdf=home+'/quarter.pdf'
         downloads={home:(b'<a href="/results" title="All financial results" hreflang="en"><span>Results archive</span></a>',home,'text/html'),
                    index:(b'<a href="/first-quarter">First quarter</a>',index,'text/html'),
@@ -3708,7 +3717,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
                      [self.answer(releases=[self.release(event,2026)],pages=[event]),self.answer(pages=[event])],
                      self.answer(releases=[self.release(pdf,2026)])]
             journal=self.journal(root,answers)
-            with patch('research_platform.evidence.download',side_effect=lambda url:downloads[url]):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:downloads[url]):
                 result,_=discover_releases(journal,root,[home],'2026-10-25',historical_years=[2025])
             self.assertEqual(result['releases'][0]['url'],pdf)
             self.assertIn(index,journal.errors[0]);self.assertIn('Results archive',journal.errors[0]);self.assertIn('All financial results',journal.errors[0])
@@ -3718,8 +3727,8 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
 
     def test_repeated_invalid_url_gets_actionable_feedback_and_stops_without_dispatch(self):
         from types import MethodType,SimpleNamespace
-        from research_platform.workflow import discover_releases
-        from research_platform.construction import RunJournal
+        from company_initiation.historic_construction.workflow import discover_releases
+        from company_initiation.shared_runtime import RunJournal
         from unittest.mock import Mock
         index='https://synthetic.invalid/results';good=index+'/press/first-quarter-2026';bad=index+'/guessed/first-quarter-2026'
         with tempfile.TemporaryDirectory() as temporary:
@@ -3728,7 +3737,7 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             journal.artifact=lambda name,data:journal.saved.update({name:copy.deepcopy(data)})
             journal.stage=MethodType(RunJournal.stage,journal)
             page=b'<a href="/results/press/first-quarter-2026">First-quarter 2026 results</a>'
-            with patch('research_platform.evidence.download',return_value=(page,index,'text/html')) as downloads, \
+            with patch('company_initiation.historic_construction.evidence.download',return_value=(page,index,'text/html')) as downloads, \
                  self.assertRaisesRegex(ValueError,'no progress'):
                 discover_releases(journal,Path(temporary),[index],'2026-10-25')
             self.assertEqual(journal.ask.call_count,2);self.assertEqual(downloads.call_count,1)
@@ -3737,14 +3746,14 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
             self.assertIn('not automatic substitutes',feedback)
 
     def test_safe_url_equivalents_and_outer_quote_marks_preserve_exact_date_evidence(self):
-        from research_platform.workflow import discover_releases
+        from company_initiation.historic_construction.workflow import discover_releases
         index='https://synthetic.invalid/results';pdf='https://synthetic.invalid/report.pdf'
         release=self.release('http://SYNTHETIC.invalid/report.pdf#download',2026)
         release['publication_evidence']='\u201c1 March 2026\u201d'
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);journal=self.journal(root,[self.answer(releases=[release])])
             values={index:(b'<p>1 March 2026</p><a href="/report.pdf">Original annual</a>',index,'text/html'),pdf:(b'%PDF synthetic',pdf,'application/pdf')}
-            with patch('research_platform.evidence.download',side_effect=lambda url:values[url]):
+            with patch('company_initiation.historic_construction.evidence.download',side_effect=lambda url:values[url]):
                 result,_=discover_releases(journal,root,[index],'2026-10-25')
             self.assertEqual(result['releases'][0]['url'],pdf)
             self.assertEqual(result['releases'][0]['publication_evidence'],'1 March 2026')
@@ -3752,12 +3761,13 @@ class OfficialDiscoveryNavigationTests(unittest.TestCase):
 
 class ValuationResearchTests(unittest.TestCase):
     def test_public_saved_construct_enriches_once_without_remapping_or_resetting_budget(self):
-        from research_platform.__main__ import main
-        from research_platform.ai import OpenAIProvider
-        from research_platform.budget import BudgetLedger,ledger_path
-        from research_platform.evidence import inventory_local_sources
-        from research_platform.integrated import verified_integrated_record
-        from research_platform.workflow import ensure_valuation_research,ensure_company_history_research
+        from company_initiation.__main__ import main
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.shared_budget import BudgetLedger, ledger_path
+        from company_initiation.historic_construction.evidence import inventory_local_sources
+        from company_initiation.forecast_construction.integrated import verified_integrated_record
+        from company_initiation.dcf_construction.workflow import ensure_valuation_research
+        from company_initiation.historic_construction.workflow import ensure_company_history_research
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);archive=root/'company';reports=archive/'financial_reports';reports.mkdir(parents=True)
             (reports/'original.txt').write_text('Synthetic restricted cash 30 as of 31 December 2025. '
@@ -3788,7 +3798,7 @@ class ValuationResearchTests(unittest.TestCase):
                 item=self.entry('restricted_cash',0)
                 ref=dict(source_id=source['id'],unit_id=unit['unit_id'])
                 item['source_refs']=[ref];item['terms'][0]['reference']=dict(ref,number_index=index,number_format='dot_decimal')
-                from research_platform.valuation import REQUIRED_CLAIM_ASSUMPTIONS
+                from company_initiation.dcf_construction.valuation import REQUIRED_CLAIM_ASSUMPTIONS
                 zero_index=next(i for i,n in enumerate(unit['numbers']) if n['raw']=='0')
                 claims=[item]
                 for field in sorted(REQUIRED_CLAIM_ASSUMPTIONS-{'restricted_cash'}):
@@ -3800,23 +3810,40 @@ class ValuationResearchTests(unittest.TestCase):
                 return dict(entries=claims,conventions=[],gaps=[])
             compiled=[]
             def compile_model(root_arg,company,archive_arg,path,**kwargs):
-                compiled.append((Path(path),json.loads(Path(path).read_text(encoding='utf-8')),kwargs))
+                from company_initiation.shared_runtime import RunJournal
+                from company_initiation.dcf_construction.workflow import construct_valuation
+                initial=json.loads(Path(path).read_text(encoding='utf-8'))
+                self.assertNotIn('valuation',initial['model_configuration'])
+                self.assertEqual(stages,['company_combined_history'])
+                self.assertIs(kwargs['valuation_stage'],construct_valuation)
                 result=outputs/'compiled_fixture';result.mkdir()
-                completed=json.loads((Path(path).parent/'record.json').read_text(encoding='utf-8'))
-                completed.update(status='complete_provisional',directory=str(result))
-                (result/'record.json').write_text(json.dumps(completed),encoding='utf-8')
+                previous=verified_integrated_record(Path(path).parent,outputs)
+                ledger=BudgetLedger(ledger_path(outputs,company),company,20)
+                ledger.import_record(previous)
+                journal=RunJournal(result,provider,copy.deepcopy(previous['configuration']),previous=previous,ledger=ledger)
+                journal.state['sources']=copy.deepcopy(previous.get('sources',[]))
+                journal.artifact('inventory.json',json.loads((Path(path).parent/'inventory.json').read_text(encoding='utf-8')))
+                with patch('company_initiation.dcf_construction.workflow.valuation_snapshot',
+                        return_value=dict(result={'valuation_date':'2026-10-25'},artifacts={},checks=[])) as calculate_dcf:
+                    valuation=kwargs['valuation_stage'](journal,{'company':company},{},initial,archive_arg)
+                calculate_dcf.assert_called_once()
+                enriched=valuation['company_inputs']
+                self.assertEqual(enriched['observations'],initial['observations'])
+                journal.artifact('company_model_inputs.json',enriched)
+                journal.state['status']='complete_provisional';journal.save()
+                compiled.append((result/'company_model_inputs.json',enriched,kwargs,Path(path)))
                 return result
-            arguments=['research_platform','construct',data['company'],'--sources',str(archive),'--as-of','2026-10-25','--resume',str(parent)]
-            with patch('research_platform.__main__.find_project_root',return_value=root),patch('sys.argv',arguments), \
-                 patch('research_platform.ai.OpenAIProvider.from_env',return_value=provider),patch.object(provider,'complete',side_effect=answer), \
-                 patch('research_platform.workflow.research_company_inputs',side_effect=AssertionError('No historical remapping')), \
-                 patch('research_platform.workflow.update_company_inputs',side_effect=AssertionError('No disclosure update for unchanged archive/date')), \
-                 patch('research_platform.integrated.construct_integrated',side_effect=compile_model),patch('builtins.print') as printed:
+            arguments=['company_initiation','construct',data['company'],'--sources',str(archive),'--as-of','2026-10-25','--resume',str(parent)]
+            with patch('company_initiation.__main__.find_project_root',return_value=root),patch('sys.argv',arguments), \
+                 patch('company_initiation.shared_ai.OpenAIProvider.from_env',return_value=provider),patch.object(provider,'complete',side_effect=answer), \
+                 patch('company_initiation.historic_construction.workflow.research_company_inputs',side_effect=AssertionError('No historical remapping')), \
+                 patch('company_initiation.historic_construction.workflow.update_company_inputs',side_effect=AssertionError('No disclosure update for unchanged archive/date')), \
+                 patch('company_initiation.forecast_construction.integrated.construct_integrated',side_effect=compile_model),patch('builtins.print') as printed:
                 self.assertEqual(main(),0,str(printed.call_args_list[-3:]))
             self.assertEqual(stages,['company_combined_history','company_valuation_sources','company_valuation_research','company_valuation_review'])
-            enriched,saved,kwargs=compiled[0]
+            enriched,saved,kwargs,historical_inputs=compiled[0]
             self.assertEqual(saved['model_configuration']['valuation']['assumptions']['restricted_cash']['value'],30)
-            self.assertTrue(kwargs['include_valuation']);self.assertEqual(kwargs['resume'],str(enriched.parent))
+            self.assertTrue(kwargs['include_valuation']);self.assertEqual(kwargs['resume'],str(historical_inputs.parent))
             self.assertEqual(inputs.read_bytes(),original)
             verified=verified_integrated_record(enriched.parent,outputs)
             saved_inventory=json.loads((enriched.parent/'inventory.json').read_text(encoding='utf-8'))
@@ -3824,7 +3851,7 @@ class ValuationResearchTests(unittest.TestCase):
             ledger=BudgetLedger(ledger_path(outputs,data['company']),data['company'],20)
             before=ledger.summary();self.assertEqual(before['total_requests'],4)
             self.assertGreater(before['known_cost_usd'],0)
-            with patch('research_platform.ai.OpenAIProvider.from_env',side_effect=AssertionError('Completed research must not load provider')):
+            with patch('company_initiation.shared_ai.OpenAIProvider.from_env',side_effect=AssertionError('Completed research must not load provider')):
                 self.assertEqual(ensure_valuation_research(root,data['company'],archive,enriched),enriched)
                 self.assertEqual(ensure_company_history_research(root,data['company'],archive,enriched),enriched)
             self.assertEqual(ledger.summary(),before)
@@ -3832,8 +3859,8 @@ class ValuationResearchTests(unittest.TestCase):
 
     def fixture(self, answers, *, complete_claims=True):
         from types import SimpleNamespace
-        from research_platform.evidence import SourceStore
-        from research_platform.valuation import REQUIRED_CLAIM_ASSUMPTIONS
+        from company_initiation.historic_construction.evidence import SourceStore
+        from company_initiation.dcf_construction.valuation import REQUIRED_CLAIM_ASSUMPTIONS
         answers=[copy.deepcopy(answer) for answer in answers]
         absent=REQUIRED_CLAIM_ASSUMPTIONS-{item['field'] for answer in answers for item in answer['entries']} if complete_claims else set()
         for answer in answers:
@@ -3864,8 +3891,8 @@ class ValuationResearchTests(unittest.TestCase):
         value.update(changes);return value
 
     def test_source_values_proxy_and_stale_price_keep_provenance_and_missing_defaults(self):
-        from research_platform.workflow import research_valuation_configuration
-        from research_platform.valuation import generate_valuation_inputs
+        from company_initiation.dcf_construction.workflow import research_valuation_configuration
+        from company_initiation.dcf_construction.valuation import generate_valuation_inputs
         from tests.test_valuation import fixture
         pension=self.entry('pension_claim',1,status='proxy',method='Coarse employee-benefit liabilities less assets; not pure pension disclosure.')
         pension['terms'].append(dict(reference=dict(source_id='synthetic_note',unit_id='page:1',number_index=2,number_format='dot_decimal'),multiplier=-1.,weight=1.))
@@ -3896,7 +3923,7 @@ class ValuationResearchTests(unittest.TestCase):
         self.assertEqual(actual['assumptions']['risk_free_rate']['status'],'provisional_assumption')
 
     def test_invalid_reported_number_reference_date_and_units_fail_inside_stage(self):
-        from research_platform.workflow import research_valuation_configuration
+        from company_initiation.dcf_construction.workflow import research_valuation_configuration
         examples=[(self.entry('restricted_cash',estimated_value=30),'exact numeric'),
                   (self.entry('restricted_cash',0,source_refs=[]),'citations'),
                   (self.entry('restricted_cash',0,as_of='2027-01-01'),'information cutoff'),
@@ -3913,7 +3940,7 @@ class ValuationResearchTests(unittest.TestCase):
                 self.assertNotIn('valuation_configuration.json',journal.saved)
 
     def test_review_can_remove_unsupported_claim_without_fabricated_zero(self):
-        from research_platform.workflow import research_valuation_configuration
+        from company_initiation.dcf_construction.workflow import research_valuation_configuration
         initial=dict(entries=[self.entry('pension_claim',1)],conventions=[],gaps=[])
         reviewed=dict(entries=[self.entry('pension_claim',status='unresolved',as_of=None,source_refs=[],
             method='Gross employee liabilities are not a supported net pension valuation claim.')],conventions=[],gaps=['Pure pension scope unresolved.'])
@@ -3929,8 +3956,8 @@ class ValuationResearchTests(unittest.TestCase):
         self.assertEqual(data,before)
 
     def test_missing_and_unresolved_required_claims_share_bounded_repair_feedback(self):
-        from research_platform.workflow import research_valuation_configuration
-        from research_platform.valuation import REQUIRED_CLAIM_ASSUMPTIONS
+        from company_initiation.dcf_construction.workflow import research_valuation_configuration
+        from company_initiation.dcf_construction.valuation import REQUIRED_CLAIM_ASSUMPTIONS
         incomplete=dict(entries=[self.entry('pension_claim',status='unresolved',as_of=None,source_refs=[],
             method='Pure pension scope is not quantified in the available employee note.')],conventions=[],gaps=[])
         journal,data,documents,store=self.fixture([incomplete],complete_claims=False)
@@ -3956,8 +3983,8 @@ class ValuationResearchTests(unittest.TestCase):
         self.assertEqual(config['research']['status'],'completed_provisional')
 
     def test_documented_zero_estimate_is_valid_but_incomplete_or_stale_cache_is_not(self):
-        from research_platform.workflow import research_valuation_configuration,_valuation_research_current,ensure_valuation_research
-        from research_platform.valuation import REQUIRED_CLAIM_ASSUMPTIONS
+        from company_initiation.dcf_construction.workflow import research_valuation_configuration, _valuation_research_current, ensure_valuation_research
+        from company_initiation.dcf_construction.valuation import REQUIRED_CLAIM_ASSUMPTIONS
         estimate=self.entry('other_assets',status='estimated',estimated_value=0,
             method='Synthetic complete note classifies the employee assets as operating; zero additional non-operating value is a cited classification estimate, not a missing-data fill.')
         answer=dict(entries=[estimate],conventions=[],gaps=[])
@@ -3985,14 +4012,14 @@ class ValuationResearchTests(unittest.TestCase):
             root=Path(temporary);archive=root/'company';archive.mkdir();inputs=root/'company_inputs.json'
             data['model_configuration']['valuation']=unknown
             inputs.write_text(json.dumps(data),encoding='utf-8');before=inputs.read_bytes()
-            with patch('research_platform.ai.OpenAIProvider.from_env',side_effect=RuntimeError('Fresh bounded research required')):
+            with patch('company_initiation.shared_ai.OpenAIProvider.from_env',side_effect=RuntimeError('Fresh bounded research required')):
                 with self.assertRaisesRegex(RuntimeError,'Fresh bounded research required'):
                     ensure_valuation_research(root,data['company'],archive,inputs)
             self.assertEqual(inputs.read_bytes(),before)
         self.assertEqual(set(config['assumptions']),set(REQUIRED_CLAIM_ASSUMPTIONS))
 
     def test_all_entry_errors_identify_reconstructed_values_bounds_and_conflicts(self):
-        from research_platform.workflow import research_valuation_configuration
+        from company_initiation.dcf_construction.workflow import research_valuation_configuration
         bad=dict(entries=[self.entry('tax_rate',1,unit='ratio'),
             self.entry('pension_claim',1,status='proxy',estimated_value=80),
             self.entry('restricted_cash',0,as_of='2027-01-01'),
@@ -4019,7 +4046,7 @@ class ValuationResearchTests(unittest.TestCase):
         self.assertEqual(requirements['unit'],'ratio');self.assertEqual(tuple(requirements['inclusive_bounds']),(0.,1.))
 
     def test_matching_estimate_does_not_silently_override_reconstruction(self):
-        from research_platform.workflow import research_valuation_configuration
+        from company_initiation.dcf_construction.workflow import research_valuation_configuration
         for estimate in (100,80):
             entry=self.entry('pension_claim',1,status='proxy',estimated_value=estimate)
             journal,data,documents,store=self.fixture([dict(entries=[entry],conventions=[],gaps=[])])
@@ -4028,7 +4055,7 @@ class ValuationResearchTests(unittest.TestCase):
             self.assertNotIn('valuation_configuration.json',journal.saved)
 
     def test_explicit_source_ratio_uses_python_division_and_keeps_both_operands(self):
-        from research_platform.workflow import research_valuation_configuration
+        from company_initiation.dcf_construction.workflow import research_valuation_configuration
         rate=self.entry('tax_rate',2,calculation='ratio',unit='ratio',status='derived_reported',
             denominator_terms=self.entry('cash',1)['terms'],method='Synthetic compatible tax20 over pretax100; Python divides the exact sources.')
         answer=dict(entries=[rate,self.entry('pension_claim',0)],conventions=[],gaps=[])
@@ -4046,7 +4073,7 @@ class ValuationResearchTests(unittest.TestCase):
         self.assertEqual(journal.stages[0][1]['source_metadata'][0]['published_at'],'2026-03-01')
 
     def test_source_ratio_rejects_zero_denominator_and_hidden_reciprocal_weights(self):
-        from research_platform.workflow import research_valuation_configuration
+        from company_initiation.dcf_construction.workflow import research_valuation_configuration
         ratio=self.entry('tax_rate',2,calculation='ratio',unit='ratio',status='proxy',denominator_terms=self.entry('cash',1)['terms'])
         zero=copy.deepcopy(ratio);zero['denominator_terms'].append(copy.deepcopy(zero['denominator_terms'][0]));zero['denominator_terms'][-1]['weight']=-1
         reciprocal=self.entry('tax_rate',2,unit='ratio',status='proxy');reciprocal['terms'][0]['weight']=1/101
@@ -4069,7 +4096,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                 source_refs=[dict(source_id='new',unit_id='page:1')]) for item in payload['scoped_findings']])
 
     def test_scope_requires_every_cited_finding_without_duplicate_basis_targets(self):
-        from research_platform.workflow import _history_scope_findings,_validate_history_revision_scope
+        from company_initiation.historic_construction.workflow import _history_scope_findings, _validate_history_revision_scope
         data,_,facts,targets,catalog,units=self.fixture()
         saved=copy.deepcopy(facts[1]);saved['basis']='alternate_published_label';data['observations'].append(saved)
         findings=_history_scope_findings([dict(kind='missing_model_version',check='An invented basis name was alleged absent.',period_ids=['2020-FY']),
@@ -4093,7 +4120,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         original=copy.deepcopy(data);self.assertEqual(data,original)
 
     def test_exact_existing_source_binding_cannot_be_duplicated_under_invented_basis(self):
-        from research_platform.workflow import _merge_historical_version_revision
+        from company_initiation.historic_construction.workflow import _merge_historical_version_revision
         data,answer,facts,targets,catalog,units=self.fixture()
         existing=copy.deepcopy(facts[1]);data['observations'].append(existing);before=copy.deepcopy(data)
         facts[1]=dict(facts[1],id='invented_duplicate',basis='invented_basis_name')
@@ -4102,7 +4129,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertEqual(data,before)
 
     def test_proposal_only_preserves_allegations_and_stops_unchanged_scope_after_full_reassessment(self):
-        from research_platform.workflow import _combined_history_challenge,combined_history_review_current,combined_history_fingerprint
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, combined_history_review_current, combined_history_fingerprint
         data,_,facts,_,catalog,units=self.fixture();before=copy.deepcopy(data);outer=self
         # This intentionally wrong proposal claims the original amount is the
         # missing published revision. Only a complete subsequent review decides.
@@ -4144,7 +4171,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertNotEqual(combined_history_fingerprint(data),combined_history_fingerprint(before))
 
     def test_targeted_adjudication_correction_keeps_last_request_evidence_and_full_validation(self):
-        from research_platform.workflow import _combined_history_challenge,combined_history_review_current
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, combined_history_review_current
         outer=self
         for outcome in ('version_repair','pass','financial','invalid','duplicate','transport','repeated','missing_primary'):
             data,_,facts,_,catalog,units=self.fixture();base=copy.deepcopy(data['observations'][0])
@@ -4196,8 +4223,8 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
             journal=Journal()
             repair=Mock(side_effect=ValueError('Independent reconstruction reached'))
             def attempt_revision(*args,**kwargs):return repair(*args,**kwargs)
-            with self.subTest(outcome=outcome),patch('research_platform.workflow.construction_evidence',side_effect=lambda j,docs,*a,**k:docs),patch(
-                    'research_platform.workflow._repair_historical_versions',new=attempt_revision):
+            with self.subTest(outcome=outcome),patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=lambda j,docs,*a,**k:docs),patch(
+                    'company_initiation.historic_construction.workflow._repair_historical_versions',new=attempt_revision):
                 if outcome=='pass':
                     _combined_history_challenge(journal,data,units,source_catalog=list(catalog.values()))
                     self.assertTrue(combined_history_review_current(data))
@@ -4224,7 +4251,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
             self.assertEqual(data['observations'],before['observations']);self.assertEqual(data['historical'],before['historical'])
 
     def test_targeted_adjudication_progress_gate_rejects_no_progress_and_other_contracts(self):
-        from research_platform.workflow import _history_adjudication_correction_plan
+        from company_initiation.historic_construction.workflow import _history_adjudication_correction_plan
         ordinary=[dict(kind='output_contract',check='Unsupplied citation one'),dict(kind='output_contract',check='Unsupplied citation two')]
         target=dict(kind='output_contract',check='Missing structured period reference',error_category='adjudication_reference',finding_id='f')
         def snapshot(failures):return dict(failures=copy.deepcopy(failures),answer=dict(financial_adjudications=[dict(finding_id='f')]),context={},request_identity={})
@@ -4236,7 +4263,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertIsNone(_history_adjudication_correction_plan([snapshot([target]),snapshot(ordinary),snapshot([target])]))
 
     def test_complete_version_only_answer_routes_before_whole_context_retry(self):
-        from research_platform.workflow import _combined_history_challenge,_HistoricalVersionGap
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, _HistoricalVersionGap
         outer=self
         for extra in (None,'output_contract','financial_interpretation','missing_primary_evidence'):
             data,answer,facts,targets,catalog,units=self.fixture();before=copy.deepcopy(data);saved={};reviews=[]
@@ -4257,7 +4284,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                     failures=assess(response)
                     outer.assertIn(extra,{f['kind'] for f in failures})
                     raise ValueError('Ordinary review path retained')
-            with self.subTest(extra=extra),patch('research_platform.workflow._repair_historical_versions',side_effect=ValueError('Independent repair reached')) as repair:
+            with self.subTest(extra=extra),patch('company_initiation.historic_construction.workflow._repair_historical_versions',side_effect=ValueError('Independent repair reached')) as repair:
                 with self.assertRaisesRegex(ValueError,'Independent repair reached' if extra is None else 'Ordinary review path retained'):
                     _combined_history_challenge(Journal(),data,units,source_catalog=list(catalog.values()))
                 self.assertEqual(len(reviews),1)
@@ -4274,7 +4301,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
             self.assertNotIn('combined_history_review',data)
 
     def test_shifted_missing_period_plan_requires_actual_prior_coverage_and_no_repeated_pairs(self):
-        from research_platform.workflow import _history_adjudication_correction_plan
+        from company_initiation.historic_construction.workflow import _history_adjudication_correction_plan
         base=self.fixture()[2][0]
         observations=[dict(base,id=period,period_id=period) for period in ('2020-Q1','2020-H1','2020-FY')]
         obligation=dict(id='version',topic='segment_lineage',fiscal_years=[2020],
@@ -4302,7 +4329,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
             with self.subTest(case=variant):self.assertIsNone(_history_adjudication_correction_plan(snapshots,observations=facts))
 
     def test_shifted_reference_correction_is_single_request_with_full_period_set_and_full_reassessment(self):
-        from research_platform.workflow import _combined_history_challenge
+        from company_initiation.historic_construction.workflow import _combined_history_challenge
         outer=self
         for outcome in ('repair','partial','duplicate','transport'):
             data,_,facts,_,catalog,units=self.fixture();base=data['observations'][0]
@@ -4342,7 +4369,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                     return dict(financial_adjudications=[result,copy.deepcopy(result)] if outcome=='duplicate' else [result])
             journal=Journal();repair=Mock(side_effect=ValueError('Independent reconstruction reached'))
             def revised(*args,**kwargs):return repair(*args,**kwargs)
-            with self.subTest(outcome=outcome),patch('research_platform.workflow._repair_historical_versions',new=revised):
+            with self.subTest(outcome=outcome),patch('company_initiation.historic_construction.workflow._repair_historical_versions',new=revised):
                 expected={'repair':'Independent reconstruction reached','partial':'remains incomplete','duplicate':'every flagged finding exactly once','transport':'targeted transport failure'}[outcome]
                 with self.assertRaisesRegex(ValueError,expected):_combined_history_challenge(journal,data,units,source_catalog=list(catalog.values()))
                 self.assertEqual(journal.asks,1)
@@ -4355,8 +4382,8 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
 
     def test_verified_output_capacity_requires_exact_request_cap_and_provider_status(self):
         from types import SimpleNamespace
-        from research_platform.workflow import _history_output_capacity_failure
-        from research_platform.construction import digest
+        from company_initiation.historic_construction.workflow import _history_output_capacity_failure
+        from company_initiation.shared_runtime import digest
         context=dict(evidence=[dict(source_id='s',unit_id='page:1',text='Complete original')],required_topics=['reporting_bases'])
         schema={'type':'object'};request=dict(stage='history',instructions='review',schema=schema,payload=context,attempt=0)
         signature=digest(request)
@@ -4376,7 +4403,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertIsNone(proof(changed,message=ValueError('max_output_tokens call_id=cap_call; signature='+changed['signature'])))
 
     def test_early_version_route_runs_blind_reconstruction_and_rechecks_retained_dispositions(self):
-        from research_platform.workflow import _combined_history_challenge,combined_history_review_current
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, combined_history_review_current
         data,answer,facts,targets,catalog,units=self.fixture();before=copy.deepcopy(data);outer=self
         prior=dict(id='previous_false_claim',topic='segment_lineage',fiscal_years=[2020],
             original_finding=dict(kind='missing_model_version',topic='segment_lineage',period_ids=['2020-FY'],
@@ -4422,8 +4449,8 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
 
     def test_output_capacity_decomposes_once_without_reading_partial_json_or_losing_obligations(self):
         from types import SimpleNamespace
-        from research_platform.workflow import _combined_history_challenge,_HISTORY_GATE_TOPICS,combined_history_review_current
-        from research_platform.construction import digest
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, _HISTORY_GATE_TOPICS, combined_history_review_current
+        from company_initiation.shared_runtime import digest
         outer=self
         for second_failure in (False,True):
             data,answer,facts,targets,catalog,units=self.fixture();before=copy.deepcopy(data['observations'])
@@ -4448,7 +4475,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                         response['financial_adjudications']=[dict(finding_id=o['id'],outcome='resolved',detail='No incompatible active binding; cited original view is labelled.',source_refs=[dict(source_id='new',unit_id='page:1')]) for o in payload['financial_review_obligations']]
                     outer.assertEqual(assess(response),[]);return response
             journal=Journal()
-            with self.subTest(second_failure=second_failure),patch('research_platform.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs):
+            with self.subTest(second_failure=second_failure),patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs):
                 if second_failure:
                     with self.assertRaisesRegex(ValueError,'max_output_tokens'):_combined_history_challenge(journal,data,units,source_catalog=list(catalog.values()))
                     self.assertEqual(len(journal.calls),2);self.assertNotIn('combined_history_review',data)
@@ -4462,7 +4489,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
             self.assertEqual(data['observations'],before)
 
     def test_unseen_incidental_citation_is_feedback_not_evidence_acquisition(self):
-        from research_platform.workflow import _combined_history_challenge
+        from company_initiation.historic_construction.workflow import _combined_history_challenge
         data,answer,facts,targets,catalog,units=self.fixture();outer=self
         units.append(dict(source_id='new',unit_id='page:2',text='Unselected original cover.',numbers=[]))
         loader=Mock(side_effect=AssertionError('An incidental citation is not an acquisition request'))
@@ -4476,13 +4503,13 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                 outer.assertIsNone(repair_context(copy.deepcopy(payload),failures))
                 result['checks'][0]['source_refs']=[dict(source_id='new',unit_id='page:1')]
                 outer.assertEqual(assess(result),[]);return result
-        with patch('research_platform.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:[u for u in docs if u['unit_id']=='page:1']):
+        with patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:[u for u in docs if u['unit_id']=='page:1']):
             _combined_history_challenge(Journal(),data,units,source_catalog=list(catalog.values()),source_loader=loader)
         loader.assert_not_called()
 
     def test_five_lineage_allegations_recover_with_exact_calls_sources_and_persisted_artifact(self):
-        from research_platform.workflow import restore_history_review_obligations,_combined_history_challenge,combined_history_review_current
-        from research_platform.construction import digest
+        from company_initiation.historic_construction.workflow import restore_history_review_obligations, _combined_history_challenge, combined_history_review_current
+        from company_initiation.shared_runtime import digest
         import hashlib
         data,answer,facts,targets,catalog,units=self.fixture();before=copy.deepcopy(data);outer=self
         with tempfile.TemporaryDirectory() as temp:
@@ -4525,7 +4552,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                     outer.assertEqual(assess(response),[]);return response
             # The initial year plan includes only the old original. Mandatory
             # restored support must still enter the complete selected context.
-            with patch('research_platform.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs):
+            with patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs):
                 _combined_history_challenge(Journal(),data,units,source_catalog=list(catalog.values()),coverage=[dict(year=2020,source_ids=['old'])])
             self.assertTrue(combined_history_review_current(data));self.assertEqual(data['observations'],before['observations'])
             altered=copy.deepcopy(previous);altered['calls'][0]['request']['payload']['evidence']=[]
@@ -4536,7 +4563,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'artifact changed'):restore_history_review_obligations(previous,[],before,list(catalog.values()))
 
     def test_version_disposition_requires_real_scoped_observations_and_checked_repair(self):
-        from research_platform.workflow import _history_version_disposition_failure
+        from company_initiation.historic_construction.workflow import _history_version_disposition_failure
         data,answer,facts,targets,catalog,units=self.fixture()
         obligation=dict(fiscal_years=[2020],original_finding=dict(kind='missing_model_version',period_ids=['2020-FY']))
         item=dict(outcome='resolved',resolution='already_preserved',observation_ids=[facts[0]['id']])
@@ -4550,7 +4577,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertIn('every affected period',_history_version_disposition_failure(item,obligation,data))
 
     def test_new_version_and_financial_findings_survive_retry_without_generic_pass(self):
-        from research_platform.workflow import _combined_history_challenge,combined_history_review_current
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, combined_history_review_current
         data,answer,facts,targets,catalog,units=self.fixture();before=copy.deepcopy(data);outer=self
         class Journal:
             def __init__(self):self.saved={}
@@ -4575,7 +4602,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertEqual(data['active_basis_by_period'],before['active_basis_by_period'])
 
     def test_impossible_citations_get_contract_feedback_without_source_expansion(self):
-        from research_platform.workflow import _combined_history_challenge
+        from company_initiation.historic_construction.workflow import _combined_history_challenge
         data,answer,facts,targets,catalog,units=self.fixture();outer=self
         loader=Mock(side_effect=AssertionError('Impossible citation must not acquire originals'))
         class Journal:
@@ -4596,7 +4623,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         loader.assert_not_called()
 
     def test_known_omitted_unit_expands_but_impossible_citation_is_not_sent_to_loader(self):
-        from research_platform.workflow import _combined_history_challenge
+        from company_initiation.historic_construction.workflow import _combined_history_challenge
         data,answer,facts,targets,catalog,units=self.fixture();outer=self
         extra=dict(source_id='new',unit_id='page:2',text='Complete omitted statement note.',numbers=[])
         units=units+[extra];calls=[]
@@ -4620,11 +4647,11 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                 outer.assertEqual(assess(result),[]);return result
         def select(journal,documents,purpose,**kwargs):
             return documents if 'context repair' in purpose else [u for u in documents if u['unit_id']!='page:2']
-        with patch('research_platform.workflow.construction_evidence',side_effect=select):
+        with patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=select):
             _combined_history_challenge(Journal(),data,units,source_catalog=list(catalog.values()),source_loader=loader)
 
     def test_one_topic_recovery_keeps_every_record_version_and_financial_obligation(self):
-        from research_platform.workflow import _combined_history_challenge,_HISTORY_GATE_TOPICS,combined_history_review_current
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, _HISTORY_GATE_TOPICS, combined_history_review_current
         outer=self
         for outcome in ('resolved','unresolved','context_failure'):
             data,answer,facts,targets,catalog,units=self.fixture();before=copy.deepcopy(data)
@@ -4658,7 +4685,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                 topic=next(topic for topic in _HISTORY_GATE_TOPICS if 'Review ONLY '+topic+' ' in purpose)
                 return [unit for unit in documents if unit['text'].startswith(topic+' ')]
             journal=Journal()
-            with self.subTest(outcome=outcome),patch('research_platform.workflow.construction_evidence',side_effect=select):
+            with self.subTest(outcome=outcome),patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=select):
                 if outcome=='resolved':
                     result=_combined_history_challenge(journal,data,units,source_catalog=list(catalog.values()))
                     self.assertTrue(combined_history_review_current(data));self.assertEqual(len(result['checks']),6)
@@ -4677,7 +4704,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
             self.assertEqual(data['active_basis_by_period'],before['active_basis_by_period'])
 
     def test_topic_recovery_cannot_omit_version_gap_and_unresolved_gap_keeps_repair_route(self):
-        from research_platform.workflow import _combined_history_challenge
+        from company_initiation.historic_construction.workflow import _combined_history_challenge
         outer=self
         for disposition in ('omitted','unresolved','evidence_pending'):
             data,answer,facts,targets,catalog,units=self.fixture();before=copy.deepcopy(data)
@@ -4701,8 +4728,8 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                             resolution='unresolved',observation_ids=[],
                             source_refs=[dict(source_id='new',unit_id='page:1')]) for item in obligations]
                     assess(result);return result
-            with self.subTest(disposition=disposition),patch('research_platform.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs),patch(
-                    'research_platform.workflow._repair_historical_versions',side_effect=ValueError('Bounded version repair reached')) as revision:
+            with self.subTest(disposition=disposition),patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs),patch(
+                    'company_initiation.historic_construction.workflow._repair_historical_versions',side_effect=ValueError('Bounded version repair reached')) as revision:
                 expected=('remains incomplete' if disposition=='omitted' else 'must be adjudicated before historical-version repair'
                     if disposition=='evidence_pending' else 'Bounded version repair reached')
                 with self.assertRaisesRegex(ValueError,expected):
@@ -4715,7 +4742,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
             self.assertEqual(data['observations'],before['observations']);self.assertNotIn('combined_history_review',data)
 
     def test_current_topic_resolved_context_allows_remaining_version_repair(self):
-        from research_platform.workflow import _combined_history_challenge
+        from company_initiation.historic_construction.workflow import _combined_history_challenge
         data,answer,facts,targets,catalog,units=self.fixture();before=copy.deepcopy(data['observations'])
         context_finding=dict(id='saved_context_gap',topic='restatement_versions',fiscal_years=[2020],
             original_finding=dict(kind='context_omission',topic='restatement_versions',period_ids=['2020-FY'],
@@ -4745,8 +4772,8 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                     outer.assertTrue(any(item['outcome']=='resolved' for item in result['financial_adjudications']))
                     outer.assertTrue(all(item['kind']=='missing_model_version' for item in failures))
                 return result
-        with patch('research_platform.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs),patch(
-                'research_platform.workflow._repair_historical_versions',side_effect=ValueError('Bounded version repair reached')) as revision:
+        with patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs),patch(
+                'company_initiation.historic_construction.workflow._repair_historical_versions',side_effect=ValueError('Bounded version repair reached')) as revision:
             with self.assertRaisesRegex(ValueError,'Bounded version repair reached'):
                 _combined_history_challenge(Journal(),data,units,source_catalog=list(catalog.values()))
             revision.assert_called_once()
@@ -4756,9 +4783,9 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
     """Synthetic primary disclosures, with independently specified restatements."""
 
     def fixture(self, *, signed=True):
-        from research_platform.evidence import SourceStore
-        from research_platform.integrated import integrated_role_contract
-        from research_platform.workflow import _materialize_financial_observations
+        from company_initiation.historic_construction.evidence import SourceStore
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
+        from company_initiation.historic_construction.workflow import _materialize_financial_observations
         period=dict(id='2020-FY',fiscal_year=2020,kind='FY',start='2020-01-01',end='2020-12-31')
         original=dict(id='old',category='financial_reports',published_at='2021-02-15',publication_evidence='15 February 2021',sha256='oldhash')
         revised=dict(id='new',category='financial_reports',published_at='2022-02-15',publication_evidence='15 February 2022',sha256='newhash')
@@ -4790,7 +4817,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         return data,answer,facts,targets,catalog,units
 
     def merge(self,fixture):
-        from research_platform.workflow import _merge_historical_version_revision
+        from company_initiation.historic_construction.workflow import _merge_historical_version_revision
         data,answer,facts,targets,catalog,units=fixture
         return _merge_historical_version_revision(data,answer,facts,targets=targets,catalog=catalog,evidence=units,revision=1)
 
@@ -4805,7 +4832,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertTrue(audit['active_basis_unchanged']);self.assertTrue(audit['annual_model_inputs_unchanged'])
 
     def test_complete_inventory_retains_110_restated_facts_outside_original_selected_view(self):
-        from research_platform.workflow import _history_version_inventory
+        from company_initiation.historic_construction.workflow import _history_version_inventory
         data,answer,facts,targets,catalog,units=self.fixture();before=copy.deepcopy(data)
         restated=[]
         for entity,count in [('division_a',16),('division_b',16),('division_c',16),('division_d',16),('division_e',16),('group',16),('corporate',14)]:
@@ -4822,7 +4849,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertEqual(data['historical']['cfo']['2020'],100)
 
     def test_complete_repair_matrix_round_trip_preserves_all_fields_and_numeric_bindings(self):
-        from research_platform.workflow import _history_review_matrix
+        from company_initiation.historic_construction.workflow import _history_review_matrix
         data,answer,facts,targets,catalog,units=self.fixture()
         observations=copy.deepcopy(facts)
         observations[0]['explicitly_unknown']=None
@@ -4840,7 +4867,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertNotIn('explicitly_unknown',decoded[observations[1]['id']])
 
     def test_synthesis_retains_disjoint_adjudication_section_and_surrounding_context(self):
-        from research_platform.workflow import _combined_history_challenge,combined_history_review_current
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, combined_history_review_current
         data,answer,facts,targets,catalog,units=self.fixture();data['history_years']=[2019,2020,2021]
         units=[dict(source_id='old',unit_id='page:'+str(page),text='Verbatim primary context '+str(page),numbers=[]) for page in range(1,5)]
         selected=[unit for unit in units if unit['unit_id']!='page:2']
@@ -4864,14 +4891,14 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                         detail='Separate primary definition resolves the saved binding concern.',source_refs=[dict(source_id='old',unit_id='page:3')])]
                 outer.assertEqual(assess(result),[]);return result
         journal=Journal()
-        with patch('research_platform.workflow.construction_evidence',return_value=selected):
+        with patch('company_initiation.historic_construction.workflow.construction_evidence',return_value=selected):
             result=_combined_history_challenge(journal,data,units)
         self.assertTrue(combined_history_review_current(data))
         self.assertEqual(result['financial_adjudications'][0]['finding_id'],'financial_binding')
         self.assertEqual(len([stage for stage in journal.calls if '_synthesis_' in stage]),6)
 
     def test_mixed_findings_repair_only_missing_version_and_require_financial_adjudication(self):
-        from research_platform.workflow import _combined_history_challenge,combined_history_review_current
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, combined_history_review_current
         outer=self
         for outcome in ('resolved','unresolved','omitted'):
             data,answer,facts,targets,catalog,units=self.fixture();original=copy.deepcopy(data)
@@ -4931,7 +4958,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                 self.assertEqual(journal.calls,['company_history_revision_scope','company_history_revision_mapping','company_history_revision_independent'])
 
     def test_blanket_different_basis_claim_is_output_contract_not_financial_proof(self):
-        from research_platform.workflow import _combined_history_challenge
+        from company_initiation.historic_construction.workflow import _combined_history_challenge
         data,answer,facts,targets,catalog,units=self.fixture();outer=self
         class Journal:
             def artifact(self,*args):pass
@@ -4946,7 +4973,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'remains incomplete'):_combined_history_challenge(Journal(),data,units)
 
     def test_publication_rubric_distinguishes_limitations_without_overriding_verdicts(self):
-        from research_platform.workflow import _combined_history_challenge
+        from company_initiation.historic_construction.workflow import _combined_history_challenge
         outer=self
         for issue in ('none','context_omission'):
             data,answer,facts,targets,catalog,units=self.fixture();data['sources']['old']['published_at']=None
@@ -4996,7 +5023,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'conflicts with a preserved reporting version'):self.merge(fixture)
 
     def test_blind_numeric_disagreement_and_no_progress_remain_incomplete(self):
-        from research_platform.workflow import _history_revision_equivalence
+        from company_initiation.historic_construction.workflow import _history_revision_equivalence
         data,answer,facts,targets,catalog,units=self.fixture();independent=copy.deepcopy(facts)
         independent[1]['value']=109
         class Journal:
@@ -5009,7 +5036,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
             self.merge((updated,answer,facts,targets,catalog,units))
 
     def test_semantic_revision_compaction_preserves_independent_records_and_original_units(self):
-        from research_platform.workflow import _history_revision_equivalence
+        from company_initiation.historic_construction.workflow import _history_revision_equivalence
         data,answer,facts,targets,catalog,units=self.fixture()
         candidates=[copy.deepcopy(facts[0])];independent=[dict(copy.deepcopy(facts[0]),id='blind_original',definition_id='independent_cash_definition')]
         before=copy.deepcopy((candidates,independent,units));outer=self
@@ -5040,8 +5067,8 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertEqual(audit['metadata_amendments'][0]['before'],old)
 
     def test_blind_revision_has_no_candidate_metadata_and_saved_before_comparison(self):
-        from research_platform.workflow import _repair_historical_versions,_HistoricalVersionGap
-        from research_platform.construction import digest
+        from company_initiation.historic_construction.workflow import _repair_historical_versions, _HistoricalVersionGap
+        from company_initiation.shared_runtime import digest
         data,answer,facts,targets,catalog,units=self.fixture()
         data.pop('periods')  # Preserved real inputs store dates on observations.
         original_data=copy.deepcopy(data);original_units=copy.deepcopy(units)
@@ -5085,7 +5112,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertEqual(journal.calls,['company_history_revision_scope','company_history_revision_mapping','company_history_revision_independent'])
 
     def test_primary_absent_never_dispatches_version_reconstruction(self):
-        from research_platform.workflow import _repair_historical_versions,_HistoricalVersionGap
+        from company_initiation.historic_construction.workflow import _repair_historical_versions, _HistoricalVersionGap
         data,answer,facts,targets,catalog,units=self.fixture()
         class Journal:
             def stage(self,*args,**kwargs):raise AssertionError('No repair request permitted')
@@ -5115,7 +5142,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
 
     def test_fingerprint_covers_delegated_gate_and_merge_implementation(self):
         import inspect
-        from research_platform import workflow
+        from company_initiation.historic_construction import workflow
         data=self.fixture()[0];before=workflow.combined_history_fingerprint(data);source=inspect.getsource
         for name in ('ask','review_stage','_combined_history_challenge_once','_merge_historical_version_revision','_history_revision_equivalence',
                      '_history_citation_failure','_history_topic_contexts','_history_adjudication_reference_failure','_history_adjudication_correction_plan',
@@ -5125,7 +5152,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                 self.assertNotEqual(workflow.combined_history_fingerprint(data),before)
 
     def test_actual_multi_cohort_gate_runs_again_after_source_revision(self):
-        from research_platform.workflow import _combined_history_challenge,combined_history_review_current,combined_history_fingerprint
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, combined_history_review_current, combined_history_fingerprint
         data,answer,facts,targets,catalog,units=self.fixture();data['history_years']=[2019,2020,2021]
         updated,audit=self.merge((data,answer,facts,targets,catalog,units));audit.update(affected_years=[2020],source_ids=['old','new'])
         class Journal:
@@ -5140,9 +5167,9 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
                 result=dict(checks=checks,summary='Synthetic review');assess(result)
                 return result
         journal=Journal();expected_fingerprint=combined_history_fingerprint(updated)
-        with patch('research_platform.workflow.construction_evidence',side_effect=lambda journal,documents,*args,**kwargs:documents),patch(
-                'research_platform.workflow._repair_historical_versions',return_value=(updated,audit)) as repair,patch(
-                'research_platform.workflow.combined_history_fingerprint',return_value=expected_fingerprint):
+        with patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=lambda journal,documents,*args,**kwargs:documents),patch(
+                'company_initiation.historic_construction.workflow._repair_historical_versions',return_value=(updated,audit)) as repair,patch(
+                'company_initiation.historic_construction.workflow.combined_history_fingerprint',return_value=expected_fingerprint):
             result=_combined_history_challenge(journal,data,units,source_catalog=list(catalog.values()))
         self.assertTrue(combined_history_review_current(data));self.assertEqual(result['status'],'passed')
         self.assertEqual(journal.calls,['company_combined_history_cohort_1','company_combined_history_cohort_1',
@@ -5152,7 +5179,7 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
         self.assertIn('model_selection_eligible',matrix['metadata_fields']);self.assertEqual(matrix['observation_count'],4)
 
     def test_revision_reruns_gate_and_bound_does_not_accept_unresolved_history(self):
-        from research_platform.workflow import _combined_history_challenge,_HistoricalVersionGap
+        from company_initiation.historic_construction.workflow import _combined_history_challenge, _HistoricalVersionGap
         data,answer,facts,targets,catalog,units=self.fixture();updated,audit=self.merge((data,answer,facts,targets,catalog,units))
         audit.update(affected_years=[2020],source_ids=['old','new'])
         gap=_HistoricalVersionGap(dict(requested_years=[2020],evidence=units),[dict(kind='missing_model_version',evidence=[dict(source_id='new',unit_id='page:1')])])
@@ -5164,11 +5191,11 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
             observed.append(copy.deepcopy(current))
             if len(observed)==1:raise gap
             return {'status':'passed'}
-        with patch('research_platform.workflow._combined_history_challenge_once',side_effect=gate),patch('research_platform.workflow._repair_historical_versions',return_value=(updated,audit)) as repair:
+        with patch('company_initiation.historic_construction.workflow._combined_history_challenge_once',side_effect=gate),patch('company_initiation.historic_construction.workflow._repair_historical_versions',return_value=(updated,audit)) as repair:
             result=_combined_history_challenge(Journal(),data,units,source_catalog=list(catalog.values()))
         self.assertEqual(result['status'],'passed');self.assertEqual(len(observed),2)
         self.assertEqual(len(observed[0]['observations']),1);self.assertEqual(len(observed[1]['observations']),4);repair.assert_called_once()
-        with patch('research_platform.workflow._combined_history_challenge_once',side_effect=gap),patch('research_platform.workflow._repair_historical_versions',return_value=(copy.deepcopy(updated),audit)) as repair:
+        with patch('company_initiation.historic_construction.workflow._combined_history_challenge_once',side_effect=gap),patch('company_initiation.historic_construction.workflow._repair_historical_versions',return_value=(copy.deepcopy(updated),audit)) as repair:
             with self.assertRaisesRegex(ValueError,'revisions exhausted'):_combined_history_challenge(Journal(),data,units)
             repair.assert_called_once()
         self.assertNotIn('combined_history_review',data)
@@ -5176,8 +5203,9 @@ class HistoricalVersionRevisionTests(unittest.TestCase):
 
 class HistoricalVersionScopeCorrectionTests(unittest.TestCase):
     def fixture(self):
-        from research_platform.workflow import _history_scope_findings,_validate_history_revision_scope
-        from research_platform.construction import _object,_array,TEXT,digest
+        from company_initiation.historic_construction.workflow import _history_scope_findings, _validate_history_revision_scope
+        from company_initiation.forecast_construction.construction import _object, _array, TEXT
+        from company_initiation.shared_runtime import digest
         data,_,facts,targets,catalog,units=HistoricalVersionRevisionTests().fixture()
         for period,oid in [('2020-Q1','saved_sales_q1'),('2020-9M','saved_sales_9m')]:
             data['observations'].append(dict(facts[0],id=oid,row_id='sales',period_id=period))
@@ -5208,7 +5236,7 @@ class HistoricalVersionScopeCorrectionTests(unittest.TestCase):
         return response
 
     def test_exact_latest_scope_reuses_own_answer_patches_all_missing_periods_and_freezes_valid_records(self):
-        from research_platform.workflow import _history_scope_stage
+        from company_initiation.historic_construction.workflow import _history_scope_stage
         data,answer,context,schema,validate,call=self.fixture();before=copy.deepcopy(data);outer=self
         class Journal:
             configuration={'limits':{'repairs':2}};entries=[call]
@@ -5231,8 +5259,8 @@ class HistoricalVersionScopeCorrectionTests(unittest.TestCase):
         self.assertEqual(protocol['baseline']['attempt'],2);self.assertEqual(len(protocol['earlier_whole_answer_calls']),1)
 
     def test_invalid_record_patches_do_not_erase_valid_scope_or_real_evidence_gaps(self):
-        from research_platform.workflow import _history_scope_stage
-        from research_platform.construction import digest
+        from company_initiation.historic_construction.workflow import _history_scope_stage
+        from company_initiation.shared_runtime import digest
         for mode,expected in [('unaffected_disposition','no frozen'),('valid_target','no frozen'),('changed_target','frozen target'),
                 ('wrong_digest','exact prior finding'),('no_progress','no progress'),('primary_gap','unresolved primary support')]:
             data,answer,context,schema,validate,call=self.fixture();before=copy.deepcopy(data);outer=self
@@ -5257,8 +5285,8 @@ class HistoricalVersionScopeCorrectionTests(unittest.TestCase):
             self.assertEqual(data,before)
 
     def test_patch_attempt_ownership_survives_resume_and_cannot_reset_after_changed_feedback(self):
-        from research_platform.workflow import _history_scope_stage
-        from research_platform.construction import digest
+        from company_initiation.historic_construction.workflow import _history_scope_stage
+        from company_initiation.shared_runtime import digest
         data,answer,context,schema,validate,call=self.fixture();outer=self
         class Journal:
             configuration={'limits':{'repairs':2}}
@@ -5282,7 +5310,7 @@ class HistoricalVersionScopeCorrectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'bounded allowance cannot restart'):_history_scope_stage(journal,call['stage'],call['request']['instructions'],context,schema,validate)
 
     def test_scope_source_or_prompt_drift_never_selects_an_unrelated_saved_answer(self):
-        from research_platform.workflow import _history_scope_stage
+        from company_initiation.historic_construction.workflow import _history_scope_stage
         for mode in ('source','prompt'):
             data,answer,context,schema,validate,call=self.fixture();changed=copy.deepcopy(context)
             prompt=call['request']['instructions']
@@ -5295,7 +5323,7 @@ class HistoricalVersionScopeCorrectionTests(unittest.TestCase):
                 _history_scope_stage(Journal(),call['stage'],prompt,changed,schema,validate)
 
     def test_fresh_nonpatchable_scope_stops_before_generic_whole_answer_regeneration(self):
-        from research_platform.workflow import _history_scope_stage
+        from company_initiation.historic_construction.workflow import _history_scope_stage
         for mode,message in [('primary','unresolved primary support'),('unknown','unknown/duplicate finding'),('unlinked','unlinked targets')]:
             data,answer,context,schema,validate,call=self.fixture()
             if mode=='primary':answer.update(primary_evidence_absent=True,gaps=['Required primary original is unavailable.'])
@@ -5321,8 +5349,8 @@ class HistoricalVersionScopeCorrectionTests(unittest.TestCase):
 class HistoricalVersionRouteContinuationTests(unittest.TestCase):
     def checkpoint(self,folder,*,selection_gaps=()):
         import hashlib
-        from research_platform.construction import digest
-        from research_platform.workflow import _combined_history_challenge_once,_HistoricalVersionGap,_history_parser_identity
+        from company_initiation.shared_runtime import digest
+        from company_initiation.historic_construction.workflow import _combined_history_challenge_once, _HistoricalVersionGap, _history_parser_identity
         data,answer,facts,targets,catalog,units=HistoricalVersionRevisionTests().fixture()
         data['model_configuration']['limitations']=[]
         data['historical_review_obligations']=[dict(id='prior_version_question',topic='source_vintage',fiscal_years=[2020],
@@ -5345,7 +5373,7 @@ class HistoricalVersionRouteContinuationTests(unittest.TestCase):
                 self.entries.append(dict(call_id='saved_complete_review',stage=stage,request=request,signature=digest(request),result=copy.deepcopy(result)))
                 return assess(result)
         journal=Journal()
-        with patch('research_platform.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs):
+        with patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs):
             with self.assertRaises(_HistoricalVersionGap) as caught:
                 _combined_history_challenge_once(journal,data,units,source_catalog=list(catalog.values()))
         journal.artifact('history_revision_1_findings.json',dict(context=caught.exception.context,findings=caught.exception.findings))
@@ -5362,7 +5390,7 @@ class HistoricalVersionRouteContinuationTests(unittest.TestCase):
         return data,before,record,answer,facts,targets,catalog,units
 
     def test_complete_preparation_allows_only_hash_verified_source_selection_note_delta(self):
-        from research_platform.workflow import restore_history_version_route,prepare_history_review_context,_combined_history_challenge_once,_HistoricalVersionGap
+        from company_initiation.historic_construction.workflow import restore_history_version_route, prepare_history_review_context, _combined_history_challenge_once, _HistoricalVersionGap
         with tempfile.TemporaryDirectory() as temp:
             folder=Path(temp)/'old'
             data,before,record,answer,facts,targets,catalog,units=self.checkpoint(folder,selection_gaps=['Quarterly originals disclose sales only.'])
@@ -5379,12 +5407,12 @@ class HistoricalVersionRouteContinuationTests(unittest.TestCase):
                     outer.assertEqual(stage,'company_history_sources');self.selections+=1;return validate(copy.deepcopy(selection))
                 def review_stage(self,*args,**kwargs):raise AssertionError('Saved complete review must be replayed without another call')
             journal=Journal()
-            with patch('research_platform.evidence._units',side_effect=AssertionError('Reuse exact saved parsed originals')):
+            with patch('company_initiation.historic_construction.evidence._units',side_effect=AssertionError('Reuse exact saved parsed originals')):
                 prepared=prepare_history_review_context(journal,data,frozen,previous=record)
             self.assertEqual(journal.selections,1)
             self.assertEqual(data['model_configuration']['limitations'],['Historical source selection: Quarterly originals disclose sales only.'])
             self.assertNotEqual(resume['input_digest'],resume['prepared_input_digest'])
-            with patch('research_platform.workflow.construction_evidence',side_effect=AssertionError('No repeated section selection')):
+            with patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=AssertionError('No repeated section selection')):
                 with self.assertRaises(_HistoricalVersionGap):
                     _combined_history_challenge_once(journal,data,**prepared,resume_version_route=resume)
             self.assertEqual(resume['gap']['context'],original_context)
@@ -5397,7 +5425,7 @@ class HistoricalVersionRouteContinuationTests(unittest.TestCase):
                 restore_history_version_route(record,[],before,frozen)
 
     def test_saved_route_replays_raw_assessment_then_exact_scope_and_full_independent_repair(self):
-        from research_platform.workflow import restore_history_version_route,_combined_history_challenge,combined_history_review_current
+        from company_initiation.historic_construction.workflow import restore_history_version_route, _combined_history_challenge, combined_history_review_current
         with tempfile.TemporaryDirectory() as temp:
             data,before,record,answer,facts,targets,catalog,units=self.checkpoint(Path(temp)/'old')
             resume=restore_history_version_route(record,[],data,list(catalog.values()));outer=self
@@ -5437,7 +5465,7 @@ class HistoricalVersionRouteContinuationTests(unittest.TestCase):
                         source_refs=[dict(source_id='new',unit_id='page:1')]) for o in payload['financial_review_obligations']]
                     outer.assertEqual(assess(result),[]);return result
             journal=Journal()
-            with patch('research_platform.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs) as sections:
+            with patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=lambda j,docs,*a,**kw:docs) as sections:
                 _combined_history_challenge(journal,data,units,source_catalog=list(catalog.values()),resume_version_route=resume)
             self.assertEqual(journal.reviews,1);self.assertEqual(sections.call_count,1);self.assertEqual(journal.scope_patches,1)
             self.assertTrue(combined_history_review_current(data))
@@ -5448,7 +5476,7 @@ class HistoricalVersionRouteContinuationTests(unittest.TestCase):
 
     def test_restore_rejects_source_call_or_artifact_tamper_and_consumed_routes(self):
         import hashlib
-        from research_platform.workflow import restore_history_version_route
+        from company_initiation.historic_construction.workflow import restore_history_version_route
         with tempfile.TemporaryDirectory() as temp:
             data,before,record,answer,facts,targets,catalog,units=self.checkpoint(Path(temp)/'old')
             changed=copy.deepcopy(list(catalog.values()));changed[1]['sha256']='changed'
@@ -5466,8 +5494,8 @@ class HistoricalVersionRouteContinuationTests(unittest.TestCase):
 
     def test_replay_rejects_missing_new_allegation_context_or_contract_before_any_call(self):
         from types import SimpleNamespace
-        from research_platform.construction import digest
-        from research_platform.workflow import restore_history_version_route,_combined_history_challenge_once
+        from company_initiation.shared_runtime import digest
+        from company_initiation.historic_construction.workflow import restore_history_version_route, _combined_history_challenge_once
         with tempfile.TemporaryDirectory() as temp:
             data,before,record,answer,facts,targets,catalog,units=self.checkpoint(Path(temp)/'old')
             resume=restore_history_version_route(record,[],data,list(catalog.values()))
@@ -5483,13 +5511,13 @@ class HistoricalVersionRouteContinuationTests(unittest.TestCase):
                 if case=='changed_provider':journal.configuration={'provider':{'provider':'different'}}
                 if case=='changed_parser':r['parser_identity']['python']='different'
                 if case=='changed_route':journal.provider=SimpleNamespace(route=lambda *a:('changed-model','changed-effort'))
-                with self.subTest(case=case),patch('research_platform.workflow.construction_evidence',side_effect=AssertionError('No reselection')):
+                with self.subTest(case=case),patch('company_initiation.historic_construction.workflow.construction_evidence',side_effect=AssertionError('No reselection')):
                     with self.assertRaisesRegex(ValueError,'checkpoint'):
                         _combined_history_challenge_once(journal,d,u,source_catalog=list(catalog.values()),resume_version_route=r)
                 journal.review_stage.assert_not_called()
 
     def test_invalid_saved_scope_feedback_names_exact_target_without_assigning_ids(self):
-        from research_platform.workflow import _history_scope_findings,_validate_history_revision_scope
+        from company_initiation.historic_construction.workflow import _history_scope_findings, _validate_history_revision_scope
         data,answer,facts,targets,catalog,units=HistoricalVersionRevisionTests().fixture()
         findings=_history_scope_findings([dict(kind='missing_model_version',check='Published version',period_ids=['2020-FY'])])
         scope=HistoricalVersionRevisionTests.scope_answer(dict(scoped_findings=findings),targets);scope['targets'][0]['existing_observation_ids']=[]
@@ -5512,8 +5540,8 @@ class ExtractionContractTests(unittest.TestCase):
         return entry,[dict(index=5,raw=raw if token_raw is None else token_raw)]
 
     def test_explicit_percent_token_is_scaled_once_by_python(self):
-        from research_platform.evidence import parse_number
-        from research_platform.workflow import _validate_financial_extraction
+        from company_initiation.historic_construction.evidence import parse_number
+        from company_initiation.historic_construction.workflow import _validate_financial_extraction
         entry,tokens=self.entry(raw='4.7%',number_format='dot_decimal',metric_type='ratio',unit='ratio')
         _validate_financial_extraction(entry,tokens)
         self.assertAlmostEqual(parse_number(tokens[0]['raw'],'dot_decimal')*entry['terms'][0]['multiplier'],.047)
@@ -5523,8 +5551,8 @@ class ExtractionContractTests(unittest.TestCase):
                 _validate_financial_extraction(changed,tokens)
 
     def test_comma_decimal_monetary_and_signed_percent_source_bindings(self):
-        from research_platform.evidence import parse_number
-        from research_platform.workflow import _validate_financial_extraction
+        from company_initiation.historic_construction.evidence import parse_number
+        from company_initiation.historic_construction.workflow import _validate_financial_extraction
         for raw,metric,unit,expected in [('1\u00a0286,1','flow','EURm',1286.1),
                                          ('-25,8','flow','EURm',-25.8),
                                          ('-0,7 %','ratio','ratio',-.007)]:
@@ -5534,14 +5562,14 @@ class ExtractionContractTests(unittest.TestCase):
                 self.assertAlmostEqual(parse_number(tokens[0]['raw'],'comma_decimal'),expected)
 
     def test_claimed_table_amount_cannot_select_a_year_or_prose_number(self):
-        from research_platform.workflow import _validate_financial_extraction
+        from company_initiation.historic_construction.workflow import _validate_financial_extraction
         for selected in ('2016','60','3 410,9'):
             entry,tokens=self.entry(raw='3 399,7',token_raw=selected)
             with self.subTest(selected_token=selected),self.assertRaises(ValueError):
                 _validate_financial_extraction(entry,tokens)
 
     def test_only_canonical_measurement_types_are_accepted(self):
-        from research_platform.workflow import _validate_financial_extraction
+        from company_initiation.historic_construction.workflow import _validate_financial_extraction
         for metric in ('flow','stock','ratio','weighted_average'):
             entry,tokens=self.entry(metric_type=metric)
             with self.subTest(valid=metric):_validate_financial_extraction(entry,tokens)
@@ -5551,7 +5579,7 @@ class ExtractionContractTests(unittest.TestCase):
                 _validate_financial_extraction(entry,tokens)
 
     def test_blind_contract_accepts_exact_requested_concept_without_values(self):
-        from research_platform.workflow import _validate_financial_extraction
+        from company_initiation.historic_construction.workflow import _validate_financial_extraction
         entry,tokens=self.entry()
         concepts=[dict(row_id='professional_sales',period_id='2016-FY',unit='EURm')]
         before=copy.deepcopy((entry,tokens,concepts))
@@ -5560,7 +5588,7 @@ class ExtractionContractTests(unittest.TestCase):
         self.assertNotIn('value',concepts[0]);self.assertNotIn('source_refs',concepts[0])
 
     def test_blind_alias_wrong_period_and_unit_change_are_rejected(self):
-        from research_platform.workflow import _validate_financial_extraction
+        from company_initiation.historic_construction.workflow import _validate_financial_extraction
         entry,tokens=self.entry()
         concepts=[dict(row_id='professional_sales',period_id='2016-FY',unit='EURm')]
         for field,value in [('row_id','PP_sales'),('period_id','2015-FY'),('unit','EUR'),('unit','ratio')]:
@@ -5569,7 +5597,7 @@ class ExtractionContractTests(unittest.TestCase):
                 _validate_financial_extraction(changed,tokens,concepts=concepts)
 
     def test_numeric_repair_retains_both_original_and_restated_versions(self):
-        from research_platform.workflow import _validate_reconstruction_revision
+        from company_initiation.historic_construction.workflow import _validate_reconstruction_revision
         original=dict(row_id='sales',period_id='2025-FY',unit='EURm',metric_type='flow',entity_id='group',
             basis='consolidated',definition_id='net_sales',scope='continuing',restatement='original',restatement_vintage=None,value=100)
         restated=dict(original,restatement='restated',restatement_vintage='2026-revision',value=90)
@@ -5583,9 +5611,9 @@ class ExtractionContractTests(unittest.TestCase):
             _validate_reconstruction_revision([],disputed)
 
     def test_materializer_reports_all_rows_roles_tokens_and_reference_errors_without_partial_acceptance(self):
-        from research_platform.evidence import SourceStore
-        from research_platform.integrated import integrated_role_contract
-        from research_platform.workflow import _materialize_financial_observations
+        from company_initiation.historic_construction.evidence import SourceStore
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
+        from company_initiation.historic_construction.workflow import _materialize_financial_observations
         period=dict(id='2023-FY',fiscal_year=2023,kind='FY',start='2022-07-01',end='2023-06-30')
         unit=dict(source_id='original',unit_id='page:4',text='Synthetic directly reported table.',
             numbers=[dict(index=i,raw=raw) for i,raw in enumerate(('5,921','5,306','1,217','786','4.7%','100.0'))])
@@ -5626,7 +5654,7 @@ class ExtractionContractTests(unittest.TestCase):
         self.assertAlmostEqual(facts[-1]['value'],.047)
 
     def test_multiple_invalid_terms_and_blind_contract_errors_are_reported_together(self):
-        from research_platform.workflow import _validate_financial_extraction
+        from company_initiation.historic_construction.workflow import _validate_financial_extraction
         entry,tokens=self.entry(raw='100',token_raw='2016',number_format='dot_decimal')
         entry['terms'].append(copy.deepcopy(entry['terms'][0]));entry['terms'][1]['source_raw']='200'
         tokens.append(dict(raw='300'))
@@ -5640,9 +5668,9 @@ class ExtractionContractTests(unittest.TestCase):
             _validate_financial_extraction(entry,[None,tokens[1]])
 
     def test_construction_number_format_guidance_is_explicit_and_does_not_mutate_initiation(self):
-        from research_platform.workflow import _financial_mapping_schema
-        from research_platform.initiation import NUMBER_REF
-        from research_platform.evidence import parse_number
+        from company_initiation.historic_construction.workflow import _financial_mapping_schema
+        from company_initiation.historic_construction.initiation import NUMBER_REF
+        from company_initiation.historic_construction.evidence import parse_number
         original=copy.deepcopy(NUMBER_REF)
         term=_financial_mapping_schema()['properties']['observations']['items']['properties']['terms']['items']['properties']
         reference=term['reference'];guidance=reference['properties']['number_format']['description']
@@ -5658,7 +5686,7 @@ class ExtractionContractTests(unittest.TestCase):
         self.assertEqual(NUMBER_REF,original,'Construction schema must not mutate the strict initiation contract')
 
     def test_mapping_schema_explains_canonical_roles_without_banning_extra_company_concepts(self):
-        from research_platform.workflow import _financial_mapping_schema
+        from company_initiation.historic_construction.workflow import _financial_mapping_schema
         role=_financial_mapping_schema()['properties']['observations']['items']['properties']['row_id']
         self.assertIn('engine_contract.roles',role['description']);self.assertNotIn('enum',role)
         self.assertNotIn('pattern',role)
@@ -5666,7 +5694,7 @@ class ExtractionContractTests(unittest.TestCase):
 
 class FinancialRoleContractTests(unittest.TestCase):
     def test_source_catalogue_resolves_literal_loops_and_does_not_execute_code(self):
-        from research_platform.integrated import integrated_role_contract
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
         source='''def build_integrated_spec(data):
     raise RuntimeError("must never execute")
     def row(key, label, section):
@@ -5691,8 +5719,8 @@ class FinancialRoleContractTests(unittest.TestCase):
         self.assertNotEqual(contract['source_sha256'],integrated_role_contract(source+'\n# changed scaffold\n')['source_sha256'])
 
     def test_group_aliases_reject_without_losing_auxiliary_or_legacy_entities(self):
-        from research_platform.integrated import integrated_role_contract
-        from research_platform.workflow import _validate_financial_role
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
+        from company_initiation.historic_construction.workflow import _validate_financial_role
         contract=integrated_role_contract();segments=[dict(id='industrial'),dict(id='services')]
         for role in ('sales','cogs','da','distribution','other_trading_income','debt_interest_expense'):
             entry=dict(row_id='group_'+role,entity_id='group',period_id='2025-FY')
@@ -5709,8 +5737,8 @@ class FinancialRoleContractTests(unittest.TestCase):
                 _validate_financial_role(dict(row_id=role,entity_id=entity,period_id='2025-FY'),contract,segments)
 
     def test_known_role_period_suffixes_are_rejected_without_remapping_legacy_definitions(self):
-        from research_platform.integrated import integrated_role_contract
-        from research_platform.workflow import _validate_financial_role
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
+        from company_initiation.historic_construction.workflow import _validate_financial_role
         contract=integrated_role_contract();segments=[dict(id='industrial')]
         for role,expected,entity in [('sales_group_2023-Q1','sales','group'),('sales_group_q1_2023','sales','group'),
                 ('group_cogs_2023','cogs','group'),('industrial_sales_2023_Q1','industrial_sales','industrial'),
@@ -5725,7 +5753,7 @@ class FinancialRoleContractTests(unittest.TestCase):
             _validate_financial_role(dict(row_id=role,period_id='2023-Q1',entity_id=entity),contract,segments)
 
     def test_missing_declarations_preserve_context_without_numeric_facts(self):
-        from research_platform.workflow import _partition_financial_observations, _reconstruction_comparison
+        from company_initiation.historic_construction.workflow import _partition_financial_observations, _reconstruction_comparison
         reported=dict(row_id='sales',period_id='2025-FY',terms=[dict(reference='original')])
         missing=dict(row_id='industrial_da',period_id='2025-FY',terms=[],classification_basis='No pure D&A is disclosed in the segment note.',classification_source_refs=[dict(source_id='annual',unit_id='page:8')])
         answer=dict(observations=[reported,missing],gaps=[]);original=copy.deepcopy(answer)
@@ -5738,8 +5766,8 @@ class FinancialRoleContractTests(unittest.TestCase):
             _partition_financial_observations(dict(observations=[dict(missing,classification_basis='')]))
 
     def test_missing_required_anchor_still_blocks_the_shared_compiler(self):
-        from research_platform.integrated import build_integrated_spec
-        from research_platform.workflow import _partition_financial_observations
+        from company_initiation.forecast_construction.integrated import build_integrated_spec
+        from company_initiation.historic_construction.workflow import _partition_financial_observations
         data=different_period_company();data['historical'].pop('da')
         data['observations']=[o for o in data['observations'] if o['row_id']!='da']
         data['missing_concepts']=_partition_financial_observations(dict(observations=[dict(row_id='da',period_id='2025-FY',terms=[],classification_basis='No supported group D&A anchor.')]))[1]
@@ -5747,9 +5775,9 @@ class FinancialRoleContractTests(unittest.TestCase):
             build_integrated_spec(data)
 
     def test_additive_source_composition_is_derived_but_single_unit_conversion_is_reported(self):
-        from research_platform.evidence import parse_number
-        from research_platform.workflow import _financial_source_classification,_validate_financial_extraction,_bind_mapped_history
-        from research_platform.periods import assumption_contract
+        from company_initiation.historic_construction.evidence import parse_number
+        from company_initiation.historic_construction.workflow import _financial_source_classification, _validate_financial_extraction, _bind_mapped_history
+        from company_initiation.forecast_construction.periods import assumption_contract
         term=lambda raw,index,weight:dict(source_raw=raw,multiplier=1e-6,weight=weight,
             reference=dict(source_id='original',unit_id='page:5',number_index=index,number_format='dot_decimal'))
         entry=dict(row_id='sales',period_id='2025-FY',unit='GBPm',metric_type='flow',
@@ -5790,7 +5818,7 @@ class AccountingExtensionConfigurationTests(unittest.TestCase):
         return answer,observations,[unit]
 
     def test_cited_extensions_preserve_source_roles_without_mutating_or_inventing_facts(self):
-        from research_platform.workflow import _accounting_extension_configuration
+        from company_initiation.historic_construction.workflow import _accounting_extension_configuration
         answer,observations,units=self.fixture();original=copy.deepcopy((answer,observations))
         config=_accounting_extension_configuration(answer,observations,units)
         self.assertEqual((answer,observations),original)
@@ -5801,14 +5829,14 @@ class AccountingExtensionConfigurationTests(unittest.TestCase):
         self.assertEqual(_accounting_extension_configuration(answer,[],units),config)
 
     def test_absent_extensions_preserve_legacy_defaults_but_cited_empty_bridge_is_explicit(self):
-        from research_platform.workflow import _accounting_extension_configuration
+        from company_initiation.historic_construction.workflow import _accounting_extension_configuration
         self.assertEqual(_accounting_extension_configuration(dict(cash_scope=None,operating_expense_functions=[],structural_account_policies=[]),[],[]),{})
         answer,observations,units=self.fixture();answer['cash_scope']['components']=[]
         config=_accounting_extension_configuration(answer,observations,units)
         self.assertIn('cash_scope',config);self.assertEqual(config['cash_scope']['components'],[])
 
     def test_cash_scope_rejects_flow_components_fitted_coefficients_and_debt_sign_conflicts(self):
-        from research_platform.workflow import _accounting_extension_configuration
+        from company_initiation.historic_construction.workflow import _accounting_extension_configuration
         for change in ({'coefficient':.5},{'coefficient':1},{'included_in_debt':'yes'},{'role':'cash'}):
             answer,observations,units=self.fixture();answer['cash_scope']['components'][0].update(change)
             with self.subTest(change=change),self.assertRaises(ValueError):_accounting_extension_configuration(answer,observations,units)
@@ -5816,7 +5844,7 @@ class AccountingExtensionConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'closing stock'):_accounting_extension_configuration(answer,observations,units)
 
     def test_unavailable_citations_duplicates_and_existing_role_collisions_are_rejected(self):
-        from research_platform.workflow import _accounting_extension_configuration
+        from company_initiation.historic_construction.workflow import _accounting_extension_configuration
         for mode in ('uncited','outside_context','duplicate_cash','duplicate_function','canonical_role','stock_cost'):
             answer,observations,units=self.fixture()
             if mode=='uncited':answer['cash_scope']['source_refs']=[]
@@ -5828,7 +5856,7 @@ class AccountingExtensionConfigurationTests(unittest.TestCase):
             with self.subTest(mode=mode),self.assertRaises(ValueError):_accounting_extension_configuration(answer,observations,units)
 
     def test_structural_presentation_policy_retains_citation_without_reported_zero(self):
-        from research_platform.workflow import _accounting_extension_configuration
+        from company_initiation.historic_construction.workflow import _accounting_extension_configuration
         answer,observations,units=self.fixture()
         policy=dict(role='other_revenue',treatment='included_in_role',included_in=['sales'],
             definition='SYNTHETIC total revenue is presented within the sales line.',source_refs=[dict(source_id='primary_original',unit_id='page:17')])
@@ -5839,7 +5867,7 @@ class AccountingExtensionConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'Duplicate structural'):_accounting_extension_configuration(answer,observations,units)
 
     def test_stage_validation_uses_engine_structural_domains_without_saving_normalized_zeros(self):
-        from research_platform.workflow import _accounting_extension_configuration
+        from company_initiation.historic_construction.workflow import _accounting_extension_configuration
         answer,observations,units=self.fixture();data=different_period_company()
         original=copy.deepcopy(data)
         config=_accounting_extension_configuration(answer,observations,units,company_data=data)
@@ -5875,7 +5903,7 @@ class AccountingExtensionConfigurationTests(unittest.TestCase):
         return answer,observations,units,data
 
     def test_cashflow_policy_preserves_distinct_cash_equity_and_eps_concepts(self):
-        from research_platform.workflow import _accounting_extension_configuration
+        from company_initiation.historic_construction.workflow import _accounting_extension_configuration
         answer,observations,units,data=self.cashflow_fixture();before=copy.deepcopy((answer,observations,data))
         config=_accounting_extension_configuration(answer,observations,units,company_data=data)
         self.assertEqual(config['cashflow_presentation'],answer['cashflow_presentation'])
@@ -5887,7 +5915,7 @@ class AccountingExtensionConfigurationTests(unittest.TestCase):
         self.assertNotIn('cashflow_presentation',_accounting_extension_configuration(answer,observations,units,company_data=data))
 
     def test_cashflow_policy_rejects_duplicate_roles_wrong_temporal_types_and_missing_evidence(self):
-        from research_platform.workflow import _accounting_extension_configuration
+        from company_initiation.historic_construction.workflow import _accounting_extension_configuration
         for mode in ('duplicate','stock_transaction','flow_claim','uncited','uncited_eps','wrong_section','debt_counterpart'):
             answer,observations,units,data=self.cashflow_fixture();policy=answer['cashflow_presentation']
             if mode=='duplicate':policy['components'].append(copy.deepcopy(policy['components'][0]))
@@ -5908,20 +5936,20 @@ class ResearchEngineContractCaptureTests(unittest.TestCase):
         return SimpleNamespace(assert_runtime_unchanged=Mock(),artifact=Mock())
 
     def test_engine_contract_is_captured_and_audited_before_research(self):
-        from research_platform.workflow import _capture_research_engine_contract
+        from company_initiation.historic_construction.workflow import _capture_research_engine_contract
         journal=self.journal();roles=dict(group_roles=['sales'],source_sha256='synthetic')
-        with patch('research_platform.integrated.integrated_role_contract',return_value=roles):
+        with patch('company_initiation.historic_construction.model_contract.integrated_role_contract',return_value=roles):
             contract=_capture_research_engine_contract(journal)
         self.assertEqual(journal.assert_runtime_unchanged.call_count,2)
-        self.assertTrue(contract['scaffold'].startswith('def build_integrated_spec('))
+        self.assertTrue(contract['scaffold'].startswith('def historical_model('))
         self.assertEqual(contract['roles'],roles)
         journal.artifact.assert_called_once_with('engine_contract.json',contract)
 
     def test_empty_or_changing_engine_contract_is_not_accepted(self):
-        from research_platform.workflow import _capture_research_engine_contract
-        from research_platform.ai import AIError
+        from company_initiation.historic_construction.workflow import _capture_research_engine_contract
+        from company_initiation.shared_ai import AIError
         journal=self.journal()
-        with patch('research_platform.integrated.integrated_role_contract',return_value=dict(group_roles=[])),self.assertRaisesRegex(ValueError,'cannot begin paid'):
+        with patch('company_initiation.historic_construction.model_contract.integrated_role_contract',return_value=dict(group_roles=[])),self.assertRaisesRegex(ValueError,'cannot begin paid'):
             _capture_research_engine_contract(journal)
         journal.artifact.assert_not_called()
         journal=self.journal();journal.assert_runtime_unchanged.side_effect=[None,AIError('Source changed during capture')]
@@ -5931,9 +5959,9 @@ class ResearchEngineContractCaptureTests(unittest.TestCase):
 
 class MonetarySalesIdentityTests(unittest.TestCase):
     def fixture(self):
-        from research_platform.evidence import SourceStore
-        from research_platform.integrated import integrated_role_contract
-        from research_platform.workflow import _materialize_financial_observations
+        from company_initiation.historic_construction.evidence import SourceStore
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
+        from company_initiation.historic_construction.workflow import _materialize_financial_observations
         source=dict(id='primary',category='financial_reports',sha256='synthetic-original')
         unit=dict(source_id='primary',unit_id='page:1',text='SYNTHETIC FY2025: sales GBP100m; currency contribution 2.5%; sales backlog GBP40m.',
             numbers=[dict(index=0,raw='100'),dict(index=1,raw='2.5%'),dict(index=2,raw='40')])
@@ -5962,7 +5990,7 @@ class MonetarySalesIdentityTests(unittest.TestCase):
         self.assertEqual(facts[1]['source_refs'][0]['raw'],'2.5%')
 
     def test_ratio_and_stock_cannot_occupy_monetary_sales_identity(self):
-        from research_platform.workflow import _FinancialMappingValidationError
+        from company_initiation.historic_construction.workflow import _FinancialMappingValidationError
         for role,kind,measure,index in [('sales','ratio','ratio',1),('legacy_division_sales','ratio','ratio',1),
                 ('sales','stock','GBPm',2),('sales','flow','ratio',1)]:
             answer,materialize,observation,_=self.fixture();entry=observation(index,role,kind,measure)
@@ -5973,7 +6001,7 @@ class MonetarySalesIdentityTests(unittest.TestCase):
             self.assertEqual(answer,before)
 
     def test_sales_presence_requires_a_monetary_flow_not_a_growth_or_stock_fact(self):
-        from research_platform.workflow import _financial_fact_families,_validate_disclosure_coverage
+        from company_initiation.historic_construction.workflow import _financial_fact_families, _validate_disclosure_coverage
         requirement=[dict(period_id='2025-FY',family='sales')]
         for role,kind,measure in [('sales','ratio','ratio'),('segment_sales','ratio','ratio'),('sales','stock','GBPm'),
                 ('sales','flow','shares_m'),('sales','flow','ratio')]:
@@ -5986,7 +6014,7 @@ class MonetarySalesIdentityTests(unittest.TestCase):
             self.assertEqual(_validate_disclosure_coverage([fact],requirement,{}),[fact])
 
     def test_bounded_identity_patch_preserves_exact_numbers_and_all_other_fields(self):
-        from research_platform.workflow import _financial_mapping_stage,_financial_mapping_schema
+        from company_initiation.historic_construction.workflow import _financial_mapping_stage, _financial_mapping_schema
         for forbidden in (False,True):
             answer,materialize,_,context=self.fixture();before=copy.deepcopy(answer);outer=self
             class Journal:

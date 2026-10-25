@@ -7,12 +7,10 @@ import unittest
 from unittest.mock import patch
 
 from openpyxl import load_workbook
-from research_platform.ai import OpenAIProvider, AIError, DEFAULT_MODEL
-from research_platform.evidence import inventory_local_sources, SourceStore
-from research_platform.construction import (
-    source_unit, expression_tree, calculate, validate_spec, initialise_assumptions,
-    validate_results, normalise_history, export_model, construct_company,
-    RunJournal, validate_assumptions, SELECT, digest)
+from company_initiation.shared_ai import OpenAIProvider, AIError, DEFAULT_MODEL
+from company_initiation.historic_construction.evidence import inventory_local_sources, SourceStore
+from company_initiation.forecast_construction.construction import source_unit, calculate, validate_spec, initialise_assumptions, validate_results, normalise_history, export_model, construct_company, validate_assumptions
+from company_initiation.shared_runtime import expression_tree, RunJournal, SELECT, digest
 import test_setup as fixtures
 
 
@@ -205,7 +203,7 @@ class ImportTests(unittest.TestCase):
             normalise_history(m,self.store,[2024,2025])
 
     def test_requested_year_projection_is_explicit_and_preserves_raw_scope(self):
-        from research_platform.construction import _valid_scope
+        from company_initiation.forecast_construction.construction import _valid_scope
         m=vendor_mapping(self.store)
         m['periods'].append(dict(fixtures.VisibleAlphaTests.period(2023),references=[]))
         scope={k:v for k,v in m.items() if k not in ('rows','identities')}
@@ -280,10 +278,10 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(len(provider.requests),before)
 
     def test_offline_review_recalculates_without_provider_or_credentials(self):
-        from research_platform.construction import review_saved
+        from company_initiation.forecast_construction.construction import review_saved
         provider=FixtureProvider(vendor_mapping(self.store))
         first=construct_company(self.root,'SYNTHETIC Manufacturing Group',self.archive,years=[2024,2025],provider=provider)
-        with patch('research_platform.ai.OpenAIProvider.from_env',side_effect=AssertionError('Must not read credentials')):
+        with patch('company_initiation.shared_ai.OpenAIProvider.from_env',side_effect=AssertionError('Must not read credentials')):
             second=review_saved(self.root,first)
         self.assertTrue((second/'model.xlsx').exists())
         self.assertEqual(json.loads((second/'record.json').read_text())['new_paid_calls'],0)
@@ -336,7 +334,7 @@ class JournalTests(unittest.TestCase):
             self.assertNotIn('result',journal.entries[0]);self.assertTrue(journal.state['usage']['cost_is_complete'])
 
     def test_output_cap_identity_preserves_legacy_failures_but_distinguishes_changed_limits(self):
-        from research_platform.construction import saved_output_limit_matches
+        from company_initiation.shared_runtime import saved_output_limit_matches
         response=dict(status='incomplete',incomplete_details=dict(reason='max_output_tokens'),
             usage=dict(output_tokens=32000))
         legacy=dict(response=response)
@@ -347,7 +345,7 @@ class JournalTests(unittest.TestCase):
         self.assertFalse(saved_output_limit_matches(dict(response=dict(status='completed',usage=dict(output_tokens=32000))),32000))
 
     def test_output_cap_is_settled_once_and_never_technically_retried_or_redispatched(self):
-        from research_platform.budget import BudgetLedger
+        from company_initiation.shared_budget import BudgetLedger
         provider=FixtureProvider({})
         response=dict(status='incomplete',incomplete_details=dict(reason='max_output_tokens'),
             usage=dict(input_tokens=260306,output_tokens=32000,total_tokens=292306,
@@ -378,7 +376,7 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(ledger.summary(),before)
 
     def test_saved_context_failure_is_not_redispatched_or_reserved_again(self):
-        from research_platform.budget import BudgetLedger
+        from company_initiation.shared_budget import BudgetLedger
         provider=FixtureProvider({})
         with tempfile.TemporaryDirectory() as t:
             root=Path(t);first=root/'first';first.mkdir();second=root/'second';second.mkdir()
@@ -406,8 +404,8 @@ class JournalTests(unittest.TestCase):
             self.assertEqual(ledger.summary()['unresolved_reservations_usd'],before['unresolved_reservations_usd'])
 
     def test_context_failure_guard_requires_matching_durable_request_identity(self):
-        from research_platform.construction import digest
-        from research_platform.ai import response_usage
+        from company_initiation.shared_runtime import digest
+        from company_initiation.shared_ai import response_usage
         provider=FixtureProvider({})
         with tempfile.TemporaryDirectory() as t:
             journal=RunJournal(Path(t),provider,dict(limits=dict(usd=1,calls=10,repairs=0)))
@@ -421,13 +419,13 @@ class JournalTests(unittest.TestCase):
                 self.assertEqual(dispatch.call_count,1)
 
     def test_source_change_blocks_new_dispatch_and_cached_reuse(self):
-        from research_platform.construction import _LOADED_CODE_IDENTITY
+        from company_initiation.shared_runtime import _LOADED_CODE_IDENTITY
         provider = FixtureProvider({})
         with tempfile.TemporaryDirectory() as t:
             journal = RunJournal(Path(t), provider, dict(limits=dict(usd=1, repairs=0)))
             journal.ask('construction_select', 'test', {}, SELECT)
             changed = dict(_LOADED_CODE_IDENTITY, integrated_py='changed')
-            with patch('research_platform.construction._current_code_identity', return_value=changed):
+            with patch('company_initiation.shared_runtime._current_code_identity', return_value=changed):
                 for prompt in ('test', 'new request'):
                     with self.assertRaisesRegex(AIError, 'Application source changed'):
                         journal.ask('construction_select', prompt, {}, SELECT)
@@ -436,8 +434,8 @@ class JournalTests(unittest.TestCase):
             self.assertIsNone(journal.state['pending_call'])
 
     def test_source_change_during_response_settles_once_and_allows_exact_resume(self):
-        from research_platform.construction import _LOADED_CODE_IDENTITY
-        from research_platform.budget import BudgetLedger
+        from company_initiation.shared_runtime import _LOADED_CODE_IDENTITY
+        from company_initiation.shared_budget import BudgetLedger
         provider = FixtureProvider({})
         original_complete = provider.complete
         identity = dict(_LOADED_CODE_IDENTITY)
@@ -452,7 +450,7 @@ class JournalTests(unittest.TestCase):
             ledger = BudgetLedger(root/'budget.json', 'Synthetic runtime guard', 1)
             config = dict(limits=dict(usd=1, repairs=0, retries=1))
             journal = RunJournal(first, provider, config, ledger=ledger)
-            with patch('research_platform.construction._current_code_identity', side_effect=lambda: dict(identity)), \
+            with patch('company_initiation.shared_runtime._current_code_identity', side_effect=lambda: dict(identity)), \
                     patch.object(provider, 'complete', side_effect=completed_then_changed):
                 with self.assertRaisesRegex(AIError, 'Application source changed'):
                     journal.ask('construction_select', 'test', {}, SELECT)
@@ -557,8 +555,8 @@ def evaluate_luna(root):
     and reports are generated under outputs and are visibly synthetic.
     """
     from datetime import datetime, timezone
-    from research_platform.construction import (FORMULA_PROMPT, FORMULAS, HISTORY_PROMPT,
-        MAPPING_BATCH, metric_catalog, write_json, _valid_spec, _initiation_lock)
+    from company_initiation.forecast_construction.construction import FORMULA_PROMPT, FORMULAS, metric_catalog, _valid_spec, _initiation_lock
+    from company_initiation.shared_runtime import HISTORY_PROMPT, MAPPING_BATCH, write_json
     root=Path(root).resolve()
     directory=root/"outputs"/("luna_known_answer_evaluation_"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
     directory.mkdir()
@@ -588,7 +586,7 @@ def evaluate_luna(root):
     evidence=store.read_documents([dict(source_id=s['id'],unit_id=next(iter(store._units[s['id']])))
                                   for s in store.sources if s.get('category')=='financial_reports'])
     provider=OpenAIProvider.from_env(root/".env");provider.max_output_tokens=6000
-    from research_platform.__main__ import TerminalProgress
+    from company_initiation.__main__ import TerminalProgress
     config=dict(limits=dict(usd=.5,calls=5,repairs=1,generated_tokens=30000),escalations={},
                 purpose="SYNTHETIC known-answer evaluation; not a company forecast",provider=provider.metadata())
     with _initiation_lock(root/"outputs"):

@@ -7,7 +7,7 @@ import unittest
 
 import openpyxl
 
-from research_platform.fx import load_fx_source, fx_for_period
+from shared_FX.fx import load_fx_source, fx_for_period
 
 
 def source_workbook(path, shift=0):

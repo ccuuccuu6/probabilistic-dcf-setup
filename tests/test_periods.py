@@ -7,8 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from research_platform.periods import (build_periods,cell_dependencies,cell_formula_excel,
-    calculate_periodic,validate_periodic,derive_observations,iter_identity_cells)
+from company_initiation.forecast_construction.periods import build_periods, cell_dependencies, cell_formula_excel, calculate_periodic, validate_periodic, derive_observations, iter_identity_cells
 
 
 def observation(kind,value,**changes):
@@ -56,7 +55,7 @@ class FiscalCalendarTests(unittest.TestCase):
         self.assertEqual(len(quarter['source_vintage']),2)
 
     def test_scope_carryover_uses_current_and_comparable_inclusion(self):
-        from research_platform.integrated import scope_period_inclusion
+        from company_initiation.forecast_construction.integrated import scope_period_inclusion
         event=dict(effective_date='2026-10-01',calendar_month_weights=[1/12]*12)
         excluded=[scope_period_inclusion(event,f'{y}-01-01',f'{y}-12-31') for y in (2025,2026,2027,2028)]
         reductions=[100*(b-a) for a,b in zip(excluded,excluded[1:])]
@@ -67,7 +66,7 @@ class FiscalCalendarTests(unittest.TestCase):
         self.assertAlmostEqual(scope_period_inclusion(event,'2026-01-01','2026-12-31'),.4)
 
     def test_estimated_event_accounting_uses_independent_closing_inputs(self):
-        from research_platform.integrated import estimate_scope_events
+        from company_initiation.forecast_construction.integrated import estimate_scope_events
         event=dict(id='sale',type='disposal',source_refs=[{'source_id':'fixture'}],estimation=dict(method='Explicit fixture estimates',
             annual_revenue=100,operating_margin=.2,annual_da=5,cost_weights={'production':.8,'marketing':.2},
             closing=dict(consideration=400,cash_transferred=20,assets={'owned_ppe':300},liabilities={'trade_payables':80},retained_investment=60,cta_recycling=15,net_assets_check=240)))
@@ -81,7 +80,7 @@ class FiscalCalendarTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'net asset'):estimate_scope_events([event])
 
     def test_typed_scenario_evaluates_multiple_drivers_without_changing_history_or_formulas(self):
-        from research_platform.periods import assumption_contract,apply_assumption_payload,model_logic_digest
+        from company_initiation.forecast_construction.periods import assumption_contract, apply_assumption_payload, model_logic_digest
         spec=financial_spec();spec.update(company='Typed fixture',currency='GBP')
         contract=assumption_contract(spec);before=model_logic_digest(spec)
         fields={(f['driver_id'],f['period_id']):f for f in contract['fields']}
@@ -99,7 +98,7 @@ class FiscalCalendarTests(unittest.TestCase):
         self.assertEqual(calculate_periodic(spec)['profit']['2026-Q1'],65)
 
     def test_typed_refresh_preserves_overrides_and_rejects_stale_targets(self):
-        from research_platform.periods import assumption_contract,apply_assumption_payload
+        from company_initiation.forecast_construction.periods import assumption_contract, apply_assumption_payload
         spec=financial_spec();spec.update(company='Typed fixture',currency='GBP');contract=assumption_contract(spec)
         field=contract['fields'][0];item={k:field[k] for k in ('driver_id','period_id','unit','currency','frequency','value_type')};item['value']=.3
         payload=dict(schema='financial_assumptions_v1',company=spec['company'],scenario_id='keep',as_of='2026-01-01',model_digest=contract['model_digest'],inputs=[item])
@@ -144,7 +143,7 @@ class TypedAssumptionContractTests(unittest.TestCase):
         self.spec.update(company='SYNTHETIC typed input fixture',currency='GBP',model_configuration={'as_of':'2026-01-01'})
 
     def payload(self,spec,changes,**extra):
-        from research_platform.periods import assumption_contract
+        from company_initiation.forecast_construction.periods import assumption_contract
         contract=assumption_contract(spec)
         fields={(f['driver_id'],f['period_id']):f for f in contract['fields']}
         inputs=[]
@@ -155,7 +154,7 @@ class TypedAssumptionContractTests(unittest.TestCase):
                     as_of='2026-01-02',model_digest=contract['model_digest'],inputs=inputs,**extra)
 
     def test_contract_shape_includes_support_controls_and_excludes_every_historical_baseline_marker(self):
-        from research_platform.periods import assumption_contract,apply_assumption_payload
+        from company_initiation.forecast_construction.periods import assumption_contract, apply_assumption_payload
         self.spec['driver_registry']=[dict(driver_id='price',entity_id='north',cost_pool='production',
             parameter_role='forecast_assumption',value_type='growth_rate',currency_basis='Functional-currency price')]
         self.spec['rows'][0].update(label='Price growth',source_refs=[{'source_id':'synthetic-disclosure'}])
@@ -199,7 +198,7 @@ class TypedAssumptionContractTests(unittest.TestCase):
         self.assertEqual(calculate_periodic(self.spec)['functional_translation_weight']['2026-Q1'],.7)
 
     def test_payload_rejects_invalid_types_dates_metadata_and_duplicates_atomically(self):
-        from research_platform.periods import apply_assumption_payload
+        from company_initiation.forecast_construction.periods import apply_assumption_payload
         original=self.payload(self.spec,[('price','2026-Q1',.3),('cost_ratio','2026-Q1',.5)])
         apply_assumption_payload(self.spec,original)
         baseline=copy.deepcopy(self.spec)
@@ -219,7 +218,7 @@ class TypedAssumptionContractTests(unittest.TestCase):
         self.assertEqual(calculate_periodic(self.spec)['profit']['2026-Q1'],65)
 
     def test_native_money_exposure_and_event_ratio_metadata_preserve_economic_types(self):
-        from research_platform.periods import assumption_contract,apply_assumption_payload
+        from company_initiation.forecast_construction.periods import assumption_contract, apply_assumption_payload
         definitions=[('foreign_cash_weight','ratio','exposure_assumption',.3),
                      ('foreign_cash_movement','USDm','exposure_assumption',20),
                      ('foreign_share_price','EURm/shares_m','economic_input',5),
@@ -249,7 +248,7 @@ class TypedAssumptionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'currency'):apply_assumption_payload(self.spec,payload)
 
     def test_literal_default_uses_only_explicit_anchor_and_keeps_row_method_when_cell_reason_empty(self):
-        from research_platform.periods import assumption_contract
+        from company_initiation.forecast_construction.periods import assumption_contract
         row=self.spec['rows'][0]
         row['note']='Hold the explicitly selected historical price contribution.'
         row['cells']['2025-Q1']=dict(value=.1,status='actual',editable=False)
@@ -263,7 +262,7 @@ class TypedAssumptionContractTests(unittest.TestCase):
         self.assertEqual(fields['price','2026-Q2']['historical_anchor'],[])
 
     def test_structural_absence_is_read_only_structure_in_both_historical_and_future_periods(self):
-        from research_platform.periods import assumption_contract,apply_assumption_payload
+        from company_initiation.forecast_construction.periods import assumption_contract, apply_assumption_payload
         for role in ('structural_absence','structural_parameter'):
             self.spec['rows'].append(dict(id=role,kind='assumption',unit='GBPm',cells={
                 '2025-Q1':dict(value=0,status='derived_actual',data_role=role,calibration_eligible=False,editable=True),
@@ -281,7 +280,7 @@ class TypedAssumptionContractTests(unittest.TestCase):
                 apply_assumption_payload(self.spec,payload)
 
     def test_adjacent_inputs_allowed_and_overlapping_frequency_inputs_rejected_including_saved_values(self):
-        from research_platform.periods import apply_assumption_payload
+        from company_initiation.forecast_construction.periods import apply_assumption_payload
         self.spec['rows'][0]['cells']['2026-H1']=dict(value=.1,status='forecast',editable=True)
         adjacent=self.payload(self.spec,[('price','2026-Q1',.3),('price','2026-Q2',.4)])
         apply_assumption_payload(self.spec,adjacent)
@@ -295,7 +294,7 @@ class TypedAssumptionContractTests(unittest.TestCase):
         self.assertEqual(self.spec['assumption_overrides'],{'price':{'2026-H1':.5}})
 
     def test_partial_payload_preserves_prior_values_and_explicit_replacement_resets_them(self):
-        from research_platform.periods import apply_assumption_payload,model_logic_digest
+        from company_initiation.forecast_construction.periods import apply_assumption_payload, model_logic_digest
         digest=model_logic_digest(self.spec)
         apply_assumption_payload(self.spec,self.payload(self.spec,[('price','2026-Q1',.3)]))
         apply_assumption_payload(self.spec,self.payload(self.spec,[('cost_ratio','2026-Q1',.5)]))
@@ -307,8 +306,8 @@ class TypedAssumptionContractTests(unittest.TestCase):
         self.assertEqual(self.spec['rows'][0]['cells']['2026-Q1']['value'],.1)
 
     def test_saved_backend_evaluation_versions_artifacts_preserves_fx_and_never_calls_ai_or_excel(self):
-        from research_platform.periods import evaluate_saved_model,model_logic_digest
-        from research_platform.integrated import verified_integrated_record
+        from company_initiation.forecast_construction.periods import evaluate_saved_model, model_logic_digest
+        from company_initiation.forecast_construction.integrated import verified_integrated_record
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);parent=root/'outputs'/'parent';parent.mkdir(parents=True)
             (parent/'model_specification.json').write_text(json.dumps(self.spec),encoding='utf-8')
@@ -320,8 +319,8 @@ class TypedAssumptionContractTests(unittest.TestCase):
             (parent/'record.json').write_text(json.dumps(dict(directory=str(parent),calls=[],sources=[],artifacts=hashes)),encoding='utf-8')
             payload_path=root/'scenario.json'
             payload_path.write_text(json.dumps(self.payload(self.spec,[('price','2026-Q1',.3),('cost_ratio','2026-Q1',.5)])),encoding='utf-8')
-            with patch('research_platform.ai.OpenAIProvider',side_effect=AssertionError('Backend evaluation must not create an AI provider')), \
-                 patch('research_platform.model_excel.export_integrated',side_effect=AssertionError('Backend evaluation must not export Excel')):
+            with patch('company_initiation.shared_ai.OpenAIProvider',side_effect=AssertionError('Backend evaluation must not create an AI provider')), \
+                 patch('company_initiation.forecast_construction.model_excel.export_integrated',side_effect=AssertionError('Backend evaluation must not export Excel')):
                 result=evaluate_saved_model(root,'parent',payload_path)
                 replay=evaluate_saved_model(root,result)
             self.assertNotEqual(result,replay)
@@ -342,8 +341,8 @@ class TypedAssumptionContractTests(unittest.TestCase):
 
     def test_export_projects_saved_overrides_without_mutating_default_formulas_or_history(self):
         from openpyxl import load_workbook
-        from research_platform.model_excel import export_integrated
-        from research_platform.periods import apply_assumption_payload,model_logic_digest
+        from company_initiation.forecast_construction.model_excel import export_integrated
+        from company_initiation.forecast_construction.periods import apply_assumption_payload, model_logic_digest
         from tests.test_model_excel import periodic_example
         spec,_=periodic_example()
         # A sourced default expression remains in the backend while the scenario is an authoritative value.
@@ -574,7 +573,7 @@ if __name__=='__main__':unittest.main()
 class SavedValuationScenarioTests(unittest.TestCase):
     def test_invalid_valuation_payload_is_rejected_instead_of_becoming_an_accepted_snapshot(self):
         from tests.test_valuation import fixture
-        from research_platform.workflow import valuation_snapshot
+        from company_initiation.dcf_construction.workflow import valuation_snapshot
         spec,values,inputs=fixture()
         payload=dict(version=inputs['version'],valuation_date=inputs['valuation_date'],
             source_model_digest=inputs['source_model_digest'],changes=[dict(id='equity_value',value=100.,
@@ -586,8 +585,8 @@ class SavedValuationScenarioTests(unittest.TestCase):
 
     def test_operating_and_valuation_payloads_revalue_without_ai_or_excel(self):
         from tests.test_valuation import fixture
-        from research_platform.periods import assumption_contract, evaluate_saved_model, model_logic_digest
-        from research_platform.valuation import value_company
+        from company_initiation.forecast_construction.periods import assumption_contract, evaluate_saved_model, model_logic_digest
+        from company_initiation.dcf_construction.valuation import value_company
         spec, _, inputs = fixture()
         for key in ('other_claims','other_assets','restricted_cash','pension_claim','deferred_consideration','dilution_shares'):
             inputs['assumptions'][key].update(status='researched',
@@ -622,8 +621,8 @@ class SavedValuationScenarioTests(unittest.TestCase):
             (parent/'record.json').write_text(json.dumps(dict(directory=str(parent),calls=[],sources=[],artifacts=hashes)),encoding='utf-8')
             scenario=root/'scenario.json';scenario.write_text(json.dumps(payload),encoding='utf-8')
             valuation_file=root/'valuation_scenario.json';valuation_file.write_text(json.dumps(valuation_payload),encoding='utf-8')
-            with patch('research_platform.ai.OpenAIProvider',side_effect=AssertionError('No AI during evaluation')), \
-                 patch('research_platform.model_excel.export_integrated',side_effect=AssertionError('No Excel during evaluation')):
+            with patch('company_initiation.shared_ai.OpenAIProvider',side_effect=AssertionError('No AI during evaluation')), \
+                 patch('company_initiation.forecast_construction.model_excel.export_integrated',side_effect=AssertionError('No Excel during evaluation')):
                 revised=evaluate_saved_model(root,parent,scenario)
                 discounted=evaluate_saved_model(root,revised,valuation_payload_file=valuation_file)
             revised_value=json.loads((revised/'valuation.json').read_text(encoding='utf-8'))

@@ -9,7 +9,7 @@ def find_project_root(start: Path | None = None) -> Path:
     origin = (start or Path.cwd()).resolve()
     for candidate in (origin, *origin.parents):
         if (candidate / "pyproject.toml").is_file() and (
-            candidate / "src" / "research_platform" / "__init__.py"
+            candidate / "src" / "company_initiation" / "__init__.py"
         ).is_file():
             return candidate
     raise ValueError("Open a terminal in the project folder and try again.")

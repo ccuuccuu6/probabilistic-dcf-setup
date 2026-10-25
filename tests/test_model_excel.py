@@ -8,8 +8,8 @@ import unittest
 
 from openpyxl import load_workbook
 
-from research_platform.model_excel import export_integrated,validate_workbook_layout
-from research_platform.periods import build_periods, calculate_periodic
+from company_initiation.forecast_construction.model_excel import export_integrated, validate_workbook_layout
+from company_initiation.forecast_construction.periods import build_periods, calculate_periodic
 
 
 def example():
@@ -347,7 +347,7 @@ class PeriodicExcelTests(unittest.TestCase):
 class ValuationExcelTests(unittest.TestCase):
     def render(self, *, transition=0, market=False, event=False):
         from test_valuation import fixture
-        from research_platform.valuation import value_company
+        from company_initiation.dcf_construction.valuation import value_company
         spec, values, inputs = fixture()
         spec.update(historical_years=[2024],forecast_years=[2025],sections=[dict(id='financials',label='Synthetic financial statements')],identities=[],sources=[],gaps=[])
         for row in spec['rows']:row.update(label=row['id'].replace('_',' ').capitalize(),section='financials',kind='reported')

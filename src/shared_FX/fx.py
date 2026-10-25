@@ -510,7 +510,7 @@ def attach_company_fx(spec,data,snapshot):
     the constant-currency cost base once, at the statement calculation cadence.
     """
     config=data.get('model_configuration',{});exposures=config.get('fx_exposures',{})
-    from .integrated import financial_cost_pools
+    from company_initiation.forecast_construction.integrated import financial_cost_pools
     pools=financial_cost_pools(data)
     periods=spec['periods'];pmap={p['id']:p for p in periods};by_kind={(p['fiscal_year'],p['kind']):p['id'] for p in periods}
     rows={r['id']:r for r in spec['rows']};reporting=data['currency'];base=max(spec['historical_years'])
@@ -619,7 +619,7 @@ def attach_company_fx(spec,data,snapshot):
                         if row_id not in rows:continue
                         for pid,cell in rows[row_id]['cells'].items():
                             if not cell.get('expression') or (row_id,pid) in affected:continue
-                            from .periods import cell_dependencies
+                            from company_initiation.forecast_construction.periods import cell_dependencies
                             deps=cell_dependencies(cell,pid)
                             if any((d['row_id'],d['period_id']) in affected for d in deps):
                                 cell['required']=False

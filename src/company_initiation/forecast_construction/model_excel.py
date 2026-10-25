@@ -26,7 +26,7 @@ from openpyxl.styles.numbers import NumberFormat
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.pagebreak import Break
 
-from .construction import dependencies, expression_tree, formula_excel, formula_value
+from company_initiation.shared_runtime import dependencies, expression_tree, formula_excel, formula_value
 
 
 STYLE_VERSION = "financial-model-5"
@@ -518,7 +518,7 @@ def export_integrated(path, spec, values, checks, *, valuation=None):
 
 def _valuation_formula(name, references):
     """Render the valuation backend's restricted expression, without new rules."""
-    from .valuation import VALUATION_EQUATIONS
+    from company_initiation.dcf_construction.valuation import VALUATION_EQUATIONS
     def render(node):
         if isinstance(node, ast.Expression): return render(node.body)
         if isinstance(node, ast.Name): return references[node.id]
@@ -534,7 +534,7 @@ def _valuation_formula(name, references):
 
 def _valuation_sheet(workbook, spec, values, valuation, source_reference):
     """Audit projection: live ordinary equations; dated timing stays a snapshot."""
-    from .valuation import valuation_input_contract
+    from company_initiation.dcf_construction.valuation import valuation_input_contract
     sheet=workbook.create_sheet('Valuation');_style_sheet(sheet, 'D8')
     detail=valuation.get('detailed_cashflows', []);transition=valuation.get('transition_cashflows', [])
     last=max(10, 3+len(detail), 3+len(transition));last_letter=get_column_letter(last)
@@ -891,7 +891,7 @@ def _reporting_bridges(workbook, bridges):
 
 def _export_periodic(path, spec, values, checks, *, valuation=None):
     """Render one explicit cell graph at fiscal quarter, half-year and year frequency."""
-    from .periods import cell_dependencies, cell_formula_excel, iter_identity_cells
+    from company_initiation.forecast_construction.periods import cell_dependencies, cell_formula_excel, iter_identity_cells
     path = Path(path)
     all_periods, rows = spec["periods"], spec["rows"]
     # Cumulative source periods remain in the calculation graph and Historics,
@@ -1445,10 +1445,10 @@ def verify_excel_sensitivities(path, spec, inspection, *, cases=None, output_dir
     cells are compared with Python, plus explicit independent delta/timing checks.
     The original workbook remains byte-for-byte unchanged. No provider calls occur.
     """
-    from .construction import calculate_integrated
+    from company_initiation.forecast_construction.construction import calculate_integrated
     periodic = bool(spec.get("periods"))
     if periodic:
-        from .periods import calculate_periodic, cell_dependencies, iter_identity_cells
+        from company_initiation.forecast_construction.periods import calculate_periodic, cell_dependencies, iter_identity_cells
     calculate = calculate_periodic if periodic else calculate_integrated
     path = Path(path).resolve()
     initial_hash = hashlib.sha256(path.read_bytes()).hexdigest()

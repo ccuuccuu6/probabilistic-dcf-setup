@@ -21,7 +21,7 @@ from time import monotonic, sleep
 import unicodedata
 from uuid import uuid4
 
-from .ai import AIError, OpenAIProvider, aggregate_usage, response_usage
+from company_initiation.shared_ai import AIError, OpenAIProvider, aggregate_usage, response_usage
 
 
 def _hash(value):

@@ -824,7 +824,7 @@ def _scope_stub(inputs, period, day, tax_rate, fraction):
     """
     if fraction == 1:
         return []
-    from .integrated import scope_period_inclusion
+    from company_initiation.forecast_construction.integrated import scope_period_inclusion
     details = []
     for event in _active_events(inputs):
         effective = event.get('effective_date')

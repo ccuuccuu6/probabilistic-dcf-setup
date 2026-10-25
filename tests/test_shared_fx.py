@@ -9,13 +9,13 @@ import unittest
 from unittest.mock import patch
 
 from openpyxl import Workbook,load_workbook
-from research_platform.fx import forecast_rate,publication_dates,spot_quote,exposure_quality,currency_coverage,transaction_fx_for_period,apply_fx_accounting_contracts
-from research_platform.fx_store import FXStore
-from research_platform.ibkr import BrokerError,overlap_check,update_fx,validate_spot
-from research_platform.integrated import build_periodic_spec,periodic_sensitivities,financial_cost_pools
-from research_platform.periods import calculate_periodic,validate_periodic,cell_dependencies
-from research_platform.model_excel import export_integrated
-from research_platform.evidence import SourceStore,_vendor_profile,inventory_local_sources
+from shared_FX.fx import forecast_rate, publication_dates, spot_quote, exposure_quality, currency_coverage, transaction_fx_for_period, apply_fx_accounting_contracts
+from shared_FX.fx_store import FXStore
+from shared_FX.ibkr import BrokerError, overlap_check, update_fx, validate_spot
+from company_initiation.forecast_construction.integrated import build_periodic_spec, periodic_sensitivities, financial_cost_pools
+from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic, cell_dependencies
+from company_initiation.forecast_construction.model_excel import export_integrated
+from company_initiation.historic_construction.evidence import SourceStore, _vendor_profile, inventory_local_sources
 from tests.test_fx import source_workbook
 from tests.test_periodic_model import different_period_company
 
@@ -132,7 +132,7 @@ class SharedRateTests(unittest.TestCase):
                 return [dict(day=d,value=1) for d in days]+[dict(day='2025-01-08',value=1.01)]
             def spot(self,r):return dict(bid=1.009,ask=1.011,value=1.01,timestamp='2025-01-09T12:00:00+00:00',market_data_type='live')
         client=Client()
-        with patch('research_platform.ai.OpenAIProvider.from_env',side_effect=AssertionError('No LLM')):
+        with patch('company_initiation.shared_ai.OpenAIProvider.from_env',side_effect=AssertionError('No LLM')):
             report=update_fx(self.store,client,['EUR/GBP','EUR/XYZ'],as_of=datetime(2025,1,9,12,tzinfo=timezone.utc),pacing_seconds=0)
         self.assertEqual(report['ai_calls'],0);self.assertEqual(report['exit_code'],2)
         self.assertEqual(client.request,('2024-12-31','2025-01-08'))
@@ -447,7 +447,7 @@ class CurrencyCompanyTests(unittest.TestCase):
         snapshot=copy.deepcopy(self.snapshot)
         for q in snapshot['spot_state']:
             if q['quote']=='JPY':q['value']*=1.1
-        with patch('research_platform.ai.OpenAIProvider.from_env',side_effect=AssertionError('No LLM')):
+        with patch('company_initiation.shared_ai.OpenAIProvider.from_env',side_effect=AssertionError('No LLM')):
             spec=build_periodic_spec(self.data,2,snapshot);changed=calculate_periodic(spec)
         self.assertNotEqual(changed['north_sales']['2026-Q1'],self.values['north_sales']['2026-Q1'])
         self.assertNotEqual(changed['north_cash_cost']['2026-H1'],self.values['north_cash_cost']['2026-H1'])

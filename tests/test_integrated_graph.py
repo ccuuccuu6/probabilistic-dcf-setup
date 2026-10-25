@@ -2,7 +2,7 @@
 import copy
 import unittest
 
-from research_platform.construction import calculate_integrated, validate_integrated
+from company_initiation.forecast_construction.construction import calculate_integrated, validate_integrated
 
 
 def financial_example():
@@ -204,8 +204,8 @@ class CompanyPresentationContractTests(unittest.TestCase):
         return data
 
     def test_overdraft_scope_preserves_net_cf_and_counts_gross_cash_and_debt_once(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=self.cash_data();before=copy.deepcopy(data);spec=build_periodic_spec(data,2);values=calculate_periodic(spec)
         self.assertEqual(data,before)
         self.assertEqual(values['cash']['2025-FY'],29.5)
@@ -221,8 +221,8 @@ class CompanyPresentationContractTests(unittest.TestCase):
         self.assertFalse([c for c in validate_periodic(spec,changed) if c['status'] in ('FAIL','MISSING')])
 
     def test_additional_cited_recurring_function_has_its_own_budget_and_profit_effect(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=self.data();refs=[dict(source_id='synthetic_function_note',unit_id='expense_functions')]
         role='other_recurring_costs'
         data['model_configuration']['operating_expense_functions']=[dict(id=role,label='Other recurring operating costs',definition='Separately reported recurring costs within segment operating profit',source_refs=refs)]
@@ -244,8 +244,8 @@ class CompanyPresentationContractTests(unittest.TestCase):
         self.assertFalse([c for c in validate_periodic(spec,changed) if c['status'] in ('FAIL','MISSING')])
 
     def test_explicit_cash_scope_without_hfs_does_not_require_an_invented_hfs_fact(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=self.cash_data();data['model_configuration']['cash_scope']['components']=data['model_configuration']['cash_scope']['components'][1:]
         data['historical'].pop('held_for_sale_cash')
         data['observations']=[o for o in data['observations'] if o['row_id']!='held_for_sale_cash']
@@ -261,8 +261,8 @@ class CompanyPresentationContractTests(unittest.TestCase):
         self.assertFalse([c for c in validate_periodic(spec,values) if c['status'] in ('FAIL','MISSING')])
 
     def test_replacement_cash_scope_preserves_separately_disclosed_hfs_cash(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=self.cash_data()
         data['model_configuration']['cash_scope']['components']=data['model_configuration']['cash_scope']['components'][1:]
         data['model_configuration']['cash_scope']['method']='CF cash nets current overdrafts and excludes the separately disclosed HFS cash.'
@@ -288,7 +288,7 @@ class CompanyPresentationContractTests(unittest.TestCase):
 
     def test_direct_nonzero_net_amount_retains_sign_and_forecast_initialization(self):
         from tests.test_integrated_model import second_company
-        from research_platform.integrated import build_integrated_spec
+        from company_initiation.forecast_construction.integrated import build_integrated_spec
         data=second_company();refs=[dict(source_id='synthetic_net_statement')]
         data['historical'].pop('other_operating_income');data['historical'].pop('other_operating_expense')
         data['historical']['net_other_operating']=dict(values={'2024':-2.,'2025':-3.},sources={'2024':refs,'2025':refs},basis='synthetic_net_presentation')
@@ -300,8 +300,8 @@ class CompanyPresentationContractTests(unittest.TestCase):
         self.assertNotIn('other_operating_income',{r['id'] for r in spec['rows']})
 
     def test_direct_net_and_cited_inactive_presentation_do_not_invent_gross_facts(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic,assumption_contract
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic, assumption_contract
         data=self.data();refs=[dict(source_id='synthetic_presentation_note',unit_id='net_accounts')]
         for role in ('other_trading_income','other_trading_expense','other_operating_income','other_operating_expense','other_revenue'):
             data['historical'].pop(role,None)
@@ -321,7 +321,7 @@ class CompanyPresentationContractTests(unittest.TestCase):
         self.assertFalse([c for c in validate_periodic(spec,values) if c['status'] in ('FAIL','MISSING')])
 
     def test_unproven_or_contradictory_presentation_policies_are_rejected(self):
-        from research_platform.integrated import functional_structure_inputs,operating_expense_functions,cash_scope_policy
+        from company_initiation.forecast_construction.integrated import functional_structure_inputs, operating_expense_functions, cash_scope_policy
         data=self.cash_data();data['model_configuration']['cash_scope']['components'][1]['coefficient']=1
         with self.assertRaisesRegex(ValueError,'deducted'):cash_scope_policy(data)
         data=self.data();data['model_configuration']['operating_expense_functions']=[dict(id='cash',label='Not an expense',definition='Invalid',source_refs=['fixture'])]
@@ -373,8 +373,8 @@ class CompanyPresentationContractTests(unittest.TestCase):
         return data
 
     def test_cash_components_keep_equity_debt_investments_and_eps_distinct(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=self.presentation_data();before=copy.deepcopy(data)
         spec=build_periodic_spec(data,1);values=calculate_periodic(spec);pid='2026-H1'
         self.assertEqual(data,before)
@@ -405,7 +405,7 @@ class CompanyPresentationContractTests(unittest.TestCase):
             self.assertEqual(changed[role][pid],values[role][pid])
 
     def test_noncommon_distribution_cannot_reuse_cash_as_implicit_eps_adjustment(self):
-        from research_platform.integrated import cashflow_presentation_policy
+        from company_initiation.forecast_construction.integrated import cashflow_presentation_policy
         data=self.presentation_data();data['model_configuration']['financial_contracts'].clear()
         with self.assertRaisesRegex(ValueError,'separate cited after-tax EPS'):
             cashflow_presentation_policy(data)
@@ -416,13 +416,13 @@ class CausalContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from tests.test_periodic_model import different_period_company
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         cls.data=different_period_company();cls.spec=build_periodic_spec(cls.data,5)
         cls.values=calculate_periodic(cls.spec)
 
     def run_case(self,overrides):
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.periods import calculate_periodic
         return calculate_periodic(self.spec,overrides)
 
     def test_marketing_cash_budget_reduces_profit_and_after_tax_cash(self):
@@ -474,8 +474,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(repaid['debt_interest'][pid]-v['debt_interest'][pid],-5*v['borrowing_rate'][pid])
 
     def test_issuance_splits_legal_nominal_capital_and_premium(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data);data['model_configuration']['financial_contracts']={'financing':{'issuance_nominal_price':1}}
         s=build_periodic_spec(data,1);base=calculate_periodic(s);pid='2026-H1'
         changed=calculate_periodic(s,{'issuance_shares':{pid:2},'issuance_price':{pid:10}})
@@ -484,8 +484,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(changed['balance_check'][pid],0)
 
     def test_adjusted_eps_bridge_separates_tax_nci_and_after_tax_associates(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'adjusted_earnings':{'label':'Company adjusted','adjustments':[
             {'id':'operating','annual_amount':20,'tax_rate':.25,'nci_share':.1,'basis':'pretax'},
@@ -501,8 +501,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['adjusted_eps_diluted'][pid],(v['adjusted_parent_profit'][pid]+2)/11)
 
     def test_visible_cashflow_components_expose_noncash_portfolio_reversal(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['historical']['business_disposals_cf']=dict(values={'2024':0,'2025':0},sources={'2024':[],'2025':[]})
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='gain',entity_id='north',type='disposal',
@@ -518,8 +518,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertLess(rowids.index('cfo_portfolio_noncash'),rowids.index('cfo'))
 
     def test_dilution_excludes_potential_shares_in_loss_and_tests_annual_independently(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data);data['model_configuration']['financial_contracts']={'dilution':{'incremental_shares':2,'earnings_adjustment':0}}
         s=build_periodic_spec(data,1);positive=calculate_periodic(s)
         self.assertAlmostEqual(positive['shares_diluted']['2026-H1'],12)
@@ -539,8 +539,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertNotEqual(loss['shares_diluted']['2026-FY'],(10*184+12*181)/365)
 
     def test_reported_interim_diluted_eps_is_retained_with_separate_estimated_denominator(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data);data['model_configuration']['actual_through']='2025-12-31'
         for original in list(data['observations']):
             if original['period_id']!='2025-H1':continue
@@ -558,8 +558,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['eps_diluted']['2026-FY'],v['parent_profit']['2026-FY']/12)
 
     def test_historical_adjusted_bridge_uses_its_own_cited_period_amounts(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data);refs=[{'source_id':'synthetic_company_apm','unit_id':'note:earnings'}]
         data['model_configuration']['financial_contracts']={'adjusted_earnings':{'adjustments':[],
             'historical_adjustments':[{'id':basis,'period_id':'2025-FY','basis':basis,'amount':amount,'source_refs':refs}
@@ -573,8 +573,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['adjusted_parent_profit']['2026-FY'],v['parent_profit']['2026-FY'])
 
     def test_unit_cost_including_currency_effect_disables_second_transaction_control(self):
-        from research_platform.integrated import build_periodic_spec,financial_cost_pools
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec, financial_cost_pools
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data);pools=financial_cost_pools(data)
         pools[0]['input_cost_includes_transaction_fx']=True
         data['model_configuration']['financial_contracts']={'cost_pools':pools}
@@ -584,8 +584,8 @@ class CausalContractTests(unittest.TestCase):
             calculate_periodic(s,{'north_pool_cogs_transaction_fx':{pid:.1}})
 
     def test_historical_dilution_preserves_reported_counts_and_estimated_status(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data);refs=[{'source_id':'synthetic_dilution_note'}]
         item={'incremental_shares':2,'earnings_adjustment':0,'status':'estimated','source_refs':refs}
         data['model_configuration']['financial_contracts']={'adjusted_earnings':{'dilution':{'historical':{'2025-FY':item}}}}
@@ -608,7 +608,7 @@ class CausalContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'requires cited evidence'):build_periodic_spec(data,1)
 
     def test_source_rounding_tolerance_is_explicit_and_validated(self):
-        from research_platform.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
         data=copy.deepcopy(self.data)
         for amount in (-1,float('nan'),float('inf'),True):
             data['model_configuration']['financial_contracts']={'source_rounding_tolerance':amount}
@@ -620,8 +620,8 @@ class CausalContractTests(unittest.TestCase):
         build_periodic_spec(data,1)
 
     def test_absent_function_is_structural_classification_not_reported_zero(self):
-        from research_platform.integrated import build_periodic_spec,financial_cost_pools
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec, financial_cost_pools
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=copy.deepcopy(self.data)
         for year,value in data['historical'].pop('distribution')['values'].items():data['historical']['cogs']['values'][year]+=value
         distribution={o['period_id']:o['value'] for o in data['observations'] if o['row_id']=='distribution'}
@@ -643,8 +643,8 @@ class CausalContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'conflicts with a standalone'):build_periodic_spec(conflicting,1)
 
     def test_aggregate_organic_does_not_invent_a_physical_volume_driver(self):
-        from research_platform.integrated import build_periodic_spec,periodic_sensitivities
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec, periodic_sensitivities
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['revenue_models']={s['id']:{'method':'aggregate_organic'} for s in data['segments']}
         for segment in data['segments']:
@@ -661,7 +661,7 @@ class CausalContractTests(unittest.TestCase):
         self.assertFalse([c for c in checks if c['status'] in ('FAIL','MISSING')])
 
     def test_effective_ratios_use_annual_amounts_and_year_end_debt(self):
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.periods import calculate_periodic
         s=copy.deepcopy(self.spec);rows={r['id']:r for r in s['rows']}
         for rid,amounts in [('pretax',(10,90)),('tax_expense',(-4,-9)),('total_profit',(10,90)),('nci_profit',(3,2))]:
             for half,amount in zip(('H1','H2'),amounts):rows[rid]['cells']['2026-'+half]=dict(value=amount,status='forecast',editable=False)
@@ -677,8 +677,8 @@ class CausalContractTests(unittest.TestCase):
             self.assertTrue(rows[rid+'_policy']['cells']['2026-H1']['editable'])
 
     def test_estimated_segment_da_is_separate_from_combined_reported_measure(self):
-        from research_platform.integrated import build_periodic_spec,functional_structure_inputs
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec, functional_structure_inputs
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data);refs=[{'source_id':'synthetic_combined_depreciation_and_provisions'}]
         data['observations']=[o for o in data['observations'] if o['row_id']!='north_da']
         data['model_configuration']['historical_allocations']=[dict(row_id='north_da',year=2025,amount=5,
@@ -701,8 +701,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(changed['short_debt']['2026-FY']/changed['total_debt']['2026-FY'],.1)
 
     def test_sourced_closing_shares_replace_proxy_without_rewriting_weighted_shares(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data);refs=[{'source_id':'synthetic_closing_shares'}]
         data['model_configuration']['financial_contracts']={'financing':{'historical_closing_shares':[dict(period_id='2025-FY',value=9,source_refs=refs)]}}
         s=build_periodic_spec(data,1);v=calculate_periodic(s);rows={r['id']:r for r in s['rows']}
@@ -716,8 +716,8 @@ class CausalContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'conflict with a preserved'):build_periodic_spec(data,1)
 
     def test_hybrid_coupon_changes_eps_attribution_without_expensing_it_twice(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data);data['model_configuration']['forecast_frequency']='annual'
         baseline=calculate_periodic(build_periodic_spec(data,1));refs=[{'source_id':'synthetic_hybrid_terms'}]
         data['model_configuration']['financial_contracts']={'adjusted_earnings':{'adjustments':[],
@@ -747,7 +747,7 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(changed['north_pool_marketing_admin'][pid],v['north_pool_marketing_admin'][pid])
 
     def test_dormant_missing_buyback_price_then_timed_repurchase(self):
-        from research_platform.integrated import validate_financial_contracts
+        from company_initiation.forecast_construction.integrated import validate_financial_contracts
         pid='2026-H1';v=self.values
         self.assertIsNone(v['buyback_price'][pid]);self.assertEqual(v['buyback_shares'][pid],0)
         bad=self.run_case({'buyback_cash':{pid:20}})
@@ -764,8 +764,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['dividends_parent']['2026-FY'],-11)
 
     def test_annual_payout_uses_annual_amounts_with_asymmetric_half_profits(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'dividends':{
             'parent':{'annual_amount':40,'payment_weights':{'H1':1,'H2':0}},
@@ -798,7 +798,7 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(changed['balance_check'][pid],0)
 
     def test_cash_fx_does_not_feed_oci_reserves(self):
-        from research_platform.integrated import validate_financial_contracts
+        from company_initiation.forecast_construction.integrated import validate_financial_contracts
         pid='2026-H1';v=self.values
         changed=self.run_case({'cash_fx_assumption':{pid:7}})
         self.assertAlmostEqual(changed['reserves'][pid],v['reserves'][pid])
@@ -806,8 +806,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertTrue(any(c['status']=='FAIL' and c['name']=='cash_fx_attribution:'+pid for c in validate_financial_contracts(self.spec,changed)))
 
     def test_scope_effect_annualises_once_in_correct_region(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='test_disposal',entity_id='north',
             type='disposal',effective_date='2026-01-01',enabled=True,accounting_enabled=False,annual_revenue=-20,
@@ -821,7 +821,7 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['specialty_sales']['2026-H2'],self.values['specialty_sales']['2026-H2'])
 
     def test_all_annual_only_years_keep_financial_contracts_and_reconcile(self):
-        from research_platform.periods import validate_periodic
+        from company_initiation.forecast_construction.periods import validate_periodic
         self.assertEqual([p['kind'] for p in self.spec['periods'] if p['fiscal_year']==2029],['FY'])
         failures=[c for c in validate_periodic(self.spec,self.values) if c['status'] in ('FAIL','MISSING')]
         self.assertEqual(failures,[])
@@ -829,8 +829,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(self.values['balance_check']['2029-FY'],0)
 
     def test_explicit_scope_cash_and_assets_reconcile_without_reserve_plug(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=copy.deepcopy(self.data)
         # A supported disposal removes five of goodwill for six of cash and a
         # one-unit accounting gain; no operating revenue run-rate changes here.
@@ -857,8 +857,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(changed['balance_check'][pid],0)
 
     def test_statement_frequency_contract_overrides_quarterly_sales_default(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration'].update(forecast_frequency='quarterly',full_statement_frequency='half_year',primary_sales_frequency='quarterly')
         spec=build_periodic_spec(data,5);v=calculate_periodic(spec)
@@ -879,8 +879,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['wc_inventory_cf']['2026-H1'],self.values['wc_inventory_cf']['2026-H1'])
 
     def test_scope_da_reduces_only_affected_segment_and_asset_depreciation(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='depreciable_disposal',entity_id='north',
             type='disposal',effective_date='2026-01-01',enabled=True,accounting_enabled=False,annual_revenue=0,
@@ -892,8 +892,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['balance_check']['2026-FY'],0)
 
     def test_whole_entity_disposal_has_no_negative_cost_or_residual_business(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='whole_business',entity_id='north',
             type='disposal',effective_date='2027-01-01',enabled=True,accounting_enabled=False,entity_scope_fraction=1,
@@ -906,8 +906,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertFalse([c for c in validate_periodic(s,v) if c['status'] in ('FAIL','MISSING')])
 
     def test_held_for_sale_stop_reallocates_da_before_control_is_lost(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='held_unit',entity_id='north',
             type='disposal',effective_date='2027-01-01',enabled=True,accounting_enabled=False,entity_scope_fraction=1,
@@ -927,8 +927,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertFalse([c for c in validate_periodic(s,v) if c['status'] in ('FAIL','MISSING')])
 
     def test_disposed_receivables_leave_cash_bridge_without_double_closing_reduction(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=copy.deepcopy(self.data)
         # Selling50annual revenue with receivables of25/180 of sales transfers
         # exactly125/18 receivables. It is sold at book value for the same cash.
@@ -948,8 +948,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertFalse([c for c in validate_periodic(s,v) if c['status'] in ('FAIL','MISSING')])
 
     def test_partial_period_full_exit_does_not_weight_scope_da_twice(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='mid_half_exit',entity_id='north',
             type='disposal',effective_date='2025-10-01',enabled=True,accounting_enabled=False,entity_scope_fraction=1,
@@ -966,8 +966,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['corporate_da']['2026-H1'],10.7*.2*184/365)
 
     def test_full_exit_with_month_weights_has_no_residual_sales_or_costs(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='monthly_full_exit',entity_id='north',
             type='disposal',effective_date='2026-01-01',enabled=True,accounting_enabled=False,entity_scope_fraction=1,
@@ -984,8 +984,8 @@ class CausalContractTests(unittest.TestCase):
             self.assertAlmostEqual(v['north_utop'][pid],0)
 
     def test_midyear_full_disposal_uses_closing_scope_for_receivables(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data);data['model_configuration']['forecast_frequency']='annual'
         data['historical']['business_disposals_cf']=dict(values={'2024':0,'2025':0},sources={'2024':[],'2025':[]})
         transferred=100*25/180
@@ -1005,8 +1005,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['balance_check']['2026-FY'],0)
 
     def test_partial_midperiod_scope_uses_full_exit_run_rate_for_working_capital(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='partial_scope',entity_id='north',
             type='disposal',effective_date='2026-04-01',enabled=True,accounting_enabled=False,
@@ -1022,8 +1022,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['inventories']['2026-FY']-baseline['inventories']['2026-FY'],-(20+4*da_share)*v['inventory_ratio'][pid])
 
     def test_no_remaining_da_recipient_is_explicitly_incomplete(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='exit_'+e,entity_id=e,
             type='disposal',effective_date='2027-01-01',depreciation_stop_date='2025-07-01',enabled=True,accounting_enabled=False,entity_scope_fraction=1,
@@ -1036,8 +1036,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertTrue(any(c['name']=='depreciation_allocation:2026-H1' and c['status']=='FAIL' for c in validate_periodic(s,v)))
 
     def test_previously_reclassified_working_capital_is_not_removed_again_at_sale(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data);data['model_configuration']['actual_through']='2025-12-31'
         transferred=100*25/180
         for original in list(data['observations']):
@@ -1067,8 +1067,8 @@ class CausalContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'cannot be removed again'):build_periodic_spec(data,1)
 
     def test_depreciation_uses_assets_removed_on_the_accounting_close_date(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['historical']['business_disposals_cf']=dict(values={'2024':0,'2025':0},sources={'2024':[],'2025':[]})
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='year_end_assets',entity_id='north',
@@ -1084,8 +1084,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['group_scope_da']['2026-H2'],0)
 
     def test_future_retained_investment_seeds_are_not_historical_evidence(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['historical']['business_disposals_cf']=dict(values={'2024':0,'2025':0},sources={'2024':[],'2025':[]})
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='retained',entity_id='north',
@@ -1109,7 +1109,7 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(v['scope_retained_retained_investment_earnings']['2027-H2'],2*181/365)
 
     def test_da_allocation_conditional_fits_excel_formula_limit(self):
-        from research_platform.periods import cell_formula_excel
+        from company_initiation.forecast_construction.periods import cell_formula_excel
         rows={r['id']:r for r in self.spec['rows']}
         positions={rid:i+100000 for i,rid in enumerate(rows)}
         targets=[(rid,'2026-H1') for rid in ('remaining_da_per_allocation_weight','north_da','specialty_da','corporate_da')]
@@ -1120,8 +1120,8 @@ class CausalContractTests(unittest.TestCase):
             self.assertLessEqual(len(formula),8192)
 
     def test_mixed_actual_year_does_not_invent_historical_fx_attribution(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['actual_through']='2025-12-31'
         data['historical']['shares_end_outstanding']=copy.deepcopy(data['historical']['shares_basic'])
@@ -1150,7 +1150,7 @@ class CausalContractTests(unittest.TestCase):
         self.assertEqual(missing,[])
 
     def test_presentation_allocations_are_read_only_diagnostics_not_profit_drivers(self):
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.periods import calculate_periodic
         rows={r['id']:r for r in self.spec['rows']}
         contracts={c['id']:c for c in self.spec['financial_contracts']['drivers']}
         pid='2026-H1';before=self.values['operating_profit'][pid]
@@ -1168,8 +1168,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(calculate_periodic(self.spec)['operating_profit'][pid],before)
 
     def test_normalisation_separates_recurring_adjustments_from_operating_performance(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'normalisation':{
             'net_other_trading':{'annual_amount':-10,'reason':'Explicit synthetic recurring restructuring budget'},
@@ -1193,7 +1193,7 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(changed['statutory_operating_profit_change'][pid]-v['statutory_operating_profit_change'][pid],-5)
 
     def test_annual_transition_carries_previous_modelled_sales_and_functional_costs(self):
-        from research_platform.periods import calculate_periodic
+        from company_initiation.forecast_construction.periods import calculate_periodic
         rows={r['id']:r for r in self.spec['rows']};v=self.values
         # This June year-end fixture retains detailed FY2028 then switches to FY
         # only. A changed spending budget in its last half must survive transition.
@@ -1210,8 +1210,8 @@ class CausalContractTests(unittest.TestCase):
         self.assertAlmostEqual(changed['north_pool_marketing_admin']['2029-FY']-v['north_pool_marketing_admin']['2029-FY'],20)
 
     def test_exit_scope_at_annual_transition_uses_partial_previous_year_not_original_history(self):
-        from research_platform.integrated import build_periodic_spec
-        from research_platform.periods import calculate_periodic,validate_periodic
+        from company_initiation.forecast_construction.integrated import build_periodic_spec
+        from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
         data=copy.deepcopy(self.data)
         data['model_configuration']['financial_contracts']={'scope_events':[dict(id='exit_at_midyear',entity_id='north',
             type='disposal',effective_date='2028-01-01',enabled=True,accounting_enabled=False,entity_scope_fraction=1,

@@ -10,8 +10,8 @@ from datetime import date, datetime, timedelta, timezone
 import math
 import time
 
-from .fx import _cross_quotes, publication_dates
-from .fx_store import utc_now
+from shared_FX.fx import _cross_quotes, publication_dates
+from shared_FX.fx_store import utc_now
 
 
 class BrokerError(RuntimeError):pass

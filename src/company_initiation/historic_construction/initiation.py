@@ -29,10 +29,9 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter, quote_sheetname
 from openpyxl.workbook.properties import CalcProperties
 
-from research_platform.ai import (AIError, AIProvider, OpenAIProvider, aggregate_usage,
-                                  format_usage, has_known_pricing, response_usage)
-from research_platform.evidence import SourceStore
-from research_platform.project import read_json
+from company_initiation.shared_ai import AIError, AIProvider, OpenAIProvider, aggregate_usage, format_usage, has_known_pricing, response_usage
+from company_initiation.historic_construction.evidence import SourceStore
+from company_initiation.shared_project import read_json
 
 
 SECTIONS = ("segments", "income_statement", "balance_sheet", "cash_flow",
@@ -837,7 +836,7 @@ def materialize_and_check(candidate, discovery, store, read_units):
     years = list(periods)
     rows = candidate["rows"]
     if not rows or len(rows) > 500:
-        raise ValueError("A candidate needs 1–500 financial rows")
+        raise ValueError("A candidate needs 1â€“500 financial rows")
     by_id = {row["id"]: row for row in rows}
     if len(by_id) != len(rows) or any(not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", key) for key in by_id):
         raise ValueError("Financial row IDs must be unique short identifiers")
@@ -2149,7 +2148,7 @@ def initiate_company(root: Path, company: str, *, historical_years: int = 10,
     root = Path(root).resolve()
     local_inventory = None
     if source_directory is not None:
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.historic_construction.evidence import inventory_local_sources
         source_directory = Path(source_directory)
         if not source_directory.is_absolute():
             source_directory = root / source_directory
@@ -2159,7 +2158,7 @@ def initiate_company(root: Path, company: str, *, historical_years: int = 10,
         request.update(source_directory=str(source_directory.resolve()),
                        source_manifest_sha256=local_inventory["manifest_sha256"], input_mode="local")
     elif fetcher is None:
-        raise ValueError("Supply --sources with the company archive folder, for example --sources local_store/nestle. Initiation no longer starts a browser search")
+        raise ValueError("Supply --sources with the company archive folder, for example --sources local_store/company. Initiation no longer starts a browser search")
     else:
         # Explicit injected acquisition adapters remain available for offline
         # regression fixtures; the CLI never exposes this former network route.
@@ -2175,8 +2174,10 @@ def _run_initiation(root, request, provider, provider_metadata, fetcher, progres
     max_cost_usd = request["max_cost_usd"]
     environment = {"python": platform.python_version(), "openpyxl": version("openpyxl"),
                    "pypdf": version("pypdf"), "xlrd": version("xlrd")}
-    code = {name: Path(__file__).with_name(name).read_text(encoding="utf-8")
-            for name in ("initiation.py", "ai.py", "evidence.py")}
+    from company_initiation import shared_ai
+    code = {"initiation.py": Path(__file__).read_text(encoding="utf-8"),
+            "ai.py": Path(shared_ai.__file__).read_text(encoding="utf-8"),
+            "evidence.py": Path(__file__).with_name("evidence.py").read_text(encoding="utf-8")}
     parent, previous = _saved_run(outputs, request, resume, fresh)
     replay, source_events = [], []
     if parent is not None:
@@ -2557,7 +2558,7 @@ files cannot be fixed by browser calls. Include meaningful gaps, never invented 
                         raise ValueError("Local initiation cannot fetch new sources; record missing archive evidence as a gap")
                     elif action["action"] == "save_rows":
                         if len(action["rows"]) > 25 or not (action["rows"] or action["delete_row_ids"]):
-                            raise ValueError("Save 1–25 rows or explicitly delete incorrect draft rows")
+                            raise ValueError("Save 1â€“25 rows or explicitly delete incorrect draft rows")
                         for row_id in action["delete_row_ids"]:
                             draft.pop(row_id, None)
                         for row in action["rows"]:
@@ -2663,7 +2664,7 @@ files cannot be fixed by browser calls. Include meaningful gaps, never invented 
                         feedback = add_sources(action["sources"])
                     elif action["action"] == "save_rows":
                         if len(action["rows"]) > 25 or not (action["rows"] or action["delete_row_ids"]):
-                            raise ValueError("Save 1–25 rows per batch, or explicitly remove draft rows")
+                            raise ValueError("Save 1â€“25 rows per batch, or explicitly remove draft rows")
                         for row_id in action["delete_row_ids"]:
                             draft_rows.pop(row_id, None)
                         for row in action["rows"]:

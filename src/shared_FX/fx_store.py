@@ -61,14 +61,14 @@ class FXStore:
                 q=dict(original)
                 required=('provider','base','quote','day','definition','value','status','source_date','timezone')
                 if any(q.get(k) is None for k in required):raise ValueError('FX observation missing required metadata')
-                from .fx import _number, _date
+                from shared_FX.fx import _number, _date
                 if _number(q['value']) is None:raise ValueError('Nonpositive/nonfinite FX quote')
                 _date(q['day']);_date(q['source_date'])
                 if q['status'] not in ('actual','projected','carried'):raise ValueError('Invalid FX evidence status')
                 if q['status']=='actual' and q['source_date']!=q['day']:
                     raise ValueError('A carried quote cannot be an actual observation for another day')
                 if q['definition']=='bid_ask_midpoint':
-                    from .ibkr import validate_spot
+                    from shared_FX.ibkr import validate_spot
                     stamped=datetime.fromisoformat(q['timestamp'].replace('Z','+00:00'))
                     validated=validate_spot(q,stamped)
                     if abs(q['value']/validated['value']-1)>1e-12:raise ValueError('Stored midpoint differs from bid/ask')
@@ -98,7 +98,7 @@ class FXStore:
         return dict(import_id=import_id,added=added,duplicates=duplicates,quarantined=quarantined,ai_calls=0)
 
     def import_workbook(self,path,adapter=None):
-        from .fx import load_fx_source
+        from shared_FX.fx import load_fx_source
         source=load_fx_source(path,adapter=adapter)
         metadata=dict(source['source'],kind='workbook',adapter=adapter or {},metadata=source['metadata'])
         quotes=[];projection_dates={d for days in source['metadata']['projected_publication_dates'].values() for d in days}
@@ -127,7 +127,7 @@ class FXStore:
     def import_ecb(self,payload,*,url='https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist-90d.xml'):
         """ECB's native EUR reference fixings; keep overlap and revisions visible."""
         import xml.etree.ElementTree as ET
-        from .ibkr import overlap_check
+        from shared_FX.ibkr import overlap_check
         root=ET.fromstring(payload);quotes=[];version=hashlib.sha256(payload).hexdigest()
         for node in root.iter():
             if 'time' not in node.attrib:continue
@@ -167,7 +167,7 @@ class FXStore:
         return key
 
     def snapshot(self,as_of,policy=None):
-        from .fx import prepare_snapshot
+        from shared_FX.fx import prepare_snapshot
         policy=dict(policy or {})
         if len(as_of)==10:as_of+='T23:59:59+00:00'
         dt=datetime.fromisoformat(as_of.replace('Z','+00:00'))
@@ -241,7 +241,7 @@ def fx_command(root,args):
             result=store.import_ecb(target.read_bytes(),url=url)
             result['original']=str(target)
         else:
-            from .ibkr import TWSClient,update_fx,BrokerError
+            from shared_FX.ibkr import TWSClient, update_fx, BrokerError
             settings=defaults.get('ibkr',{});client=None
             try:
                 client=TWSClient(host=args.host or settings.get('host','127.0.0.1'),port=args.port or settings.get('port',7497),

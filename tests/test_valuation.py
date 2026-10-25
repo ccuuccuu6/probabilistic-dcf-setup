@@ -3,8 +3,7 @@ import copy
 from datetime import date
 import unittest
 
-from research_platform.valuation import (DEFAULT_ROLES, VERSION, VALUATION_EQUATIONS, apply_valuation_payload,
-    generate_valuation_inputs, valuation_equation, valuation_input_contract, value_company)
+from company_initiation.dcf_construction.valuation import DEFAULT_ROLES, VERSION, VALUATION_EQUATIONS, apply_valuation_payload, generate_valuation_inputs, valuation_equation, valuation_input_contract, value_company
 
 
 def fixture(valuation_date='2024-12-31', currency='GBP'):
@@ -54,7 +53,7 @@ class ValuationTests(unittest.TestCase):
         values['amortization']['2026-FY']=None
         with self.assertRaisesRegex(ValueError,'Forecast FCFF coverage is incomplete from 2026-01-01 through 2026-12-31'):
             value_company(spec,values,inputs,include_sensitivities=False)
-        from research_platform.workflow import valuation_snapshot
+        from company_initiation.dcf_construction.workflow import valuation_snapshot
         public=valuation_snapshot(spec,values,{},valuation_date=inputs['valuation_date'],previous_inputs=inputs)
         self.assertEqual(public['result']['status'],'incomplete')
         self.assertEqual(public['checks'][0]['status'],'MISSING')
@@ -606,7 +605,7 @@ class EventValuationChecks(unittest.TestCase):
             method='Synthetic original states this signed cash amount and its payment at closing.', unit='GBP', scale=1e6)
 
     def test_unknown_future_cash_and_date_block_public_valuation_boundary(self):
-        from research_platform.workflow import valuation_snapshot
+        from company_initiation.dcf_construction.workflow import valuation_snapshot
         spec, values, inputs = self.supported_fixture()
         baseline = value_company(spec, values, inputs, include_sensitivities=False)
         event = dict(id='purchase', date='2025-06-30', net_cash=self.amount(None), cash_tax=self.amount(0.),
@@ -704,6 +703,69 @@ class EventValuationChecks(unittest.TestCase):
                 revised['events'][0]['net_cash'].update(change)
                 with self.assertRaisesRegex(ValueError, message):
                     value_company(spec, values, revised, include_sensitivities=False)
+
+
+class ValuationStageHandoffTests(unittest.TestCase):
+    def test_research_uses_existing_journal_and_preserves_upstream_model(self):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from company_initiation.dcf_construction.workflow import construct_valuation
+        spec,values,_=fixture()
+        data=dict(company=spec['company'],currency='GBP',observations=[{'value':1000.}],
+            model_configuration={'as_of':'2024-12-31'})
+        original=copy.deepcopy((spec,values,data))
+        provider=SimpleNamespace(max_output_tokens=12000,timeout=240)
+        journal=SimpleNamespace(directory=Path('synthetic-run'),provider=provider,progress=None)
+        events=[];configuration={'assumptions':{'risk_free_rate':{'value':.04}}}
+        def research(actual_journal,actual_data,documents,store):
+            self.assertIs(actual_journal,journal)
+            self.assertEqual((provider.max_output_tokens,provider.timeout),(16000,300))
+            events.append('valuation_research')
+            return configuration
+        def snapshot(actual_spec,actual_values,actual_data,**kwargs):
+            self.assertIs(actual_spec,spec);self.assertIs(actual_values,values)
+            self.assertEqual(actual_data['model_configuration']['valuation'],configuration)
+            self.assertEqual((provider.max_output_tokens,provider.timeout),(12000,240))
+            events.append('dcf')
+            return dict(result={'status':'provisional'},artifacts={},checks=[])
+        with patch('company_initiation.dcf_construction.workflow._valuation_research_current',return_value=False), \
+                patch('company_initiation.dcf_construction.workflow._valuation_research_documents',return_value=[]), \
+                patch('company_initiation.dcf_construction.workflow.research_valuation_configuration',side_effect=research), \
+                patch('company_initiation.dcf_construction.workflow.valuation_snapshot',side_effect=snapshot):
+            result=construct_valuation(journal,spec,values,data,Path('synthetic-archive'))
+        self.assertEqual(events,['valuation_research','dcf'])
+        self.assertEqual((spec,values,data),original)
+        self.assertEqual(result['company_inputs']['model_configuration']['valuation'],configuration)
+
+    def test_current_research_needs_no_provider_or_original_reparse(self):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from company_initiation.dcf_construction.workflow import construct_valuation
+        spec,values,_=fixture()
+        data=dict(company=spec['company'],currency='GBP',model_configuration={'as_of':'2024-12-31'})
+        journal=SimpleNamespace(progress=None)
+        with patch('company_initiation.dcf_construction.workflow._valuation_research_current',return_value=True), \
+                patch('company_initiation.dcf_construction.workflow._valuation_research_documents',side_effect=AssertionError('No research on reuse')), \
+                patch('company_initiation.dcf_construction.workflow.valuation_snapshot',return_value=dict(result={},artifacts={},checks=[])):
+            result=construct_valuation(journal,spec,values,data,Path('synthetic-archive'))
+        self.assertEqual(result['company_inputs'],data)
+
+    def test_failed_research_restores_existing_provider_limits(self):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from company_initiation.dcf_construction.workflow import construct_valuation
+        spec,values,_=fixture()
+        data=dict(company=spec['company'],currency='GBP',model_configuration={'as_of':'2024-12-31'})
+        provider=SimpleNamespace(max_output_tokens=12000,timeout=240)
+        journal=SimpleNamespace(directory=Path('synthetic-run'),provider=provider,progress=None)
+        with patch('company_initiation.dcf_construction.workflow._valuation_research_current',return_value=False), \
+                patch('company_initiation.dcf_construction.workflow._valuation_research_documents',side_effect=ValueError('Unsupported evidence')):
+            with self.assertRaisesRegex(ValueError,'Unsupported evidence'):
+                construct_valuation(journal,spec,values,data,Path('synthetic-archive'))
+        self.assertEqual((provider.max_output_tokens,provider.timeout),(12000,240))
 
 
 if __name__ == '__main__':

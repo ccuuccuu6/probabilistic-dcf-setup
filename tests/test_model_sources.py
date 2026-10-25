@@ -9,12 +9,12 @@ from openpyxl import Workbook
 from pypdf import PdfWriter
 from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject, NumberObject
 
-from research_platform.evidence import verify_model_input_sources
+from company_initiation.historic_construction.evidence import verify_model_input_sources
 
 
 class DateEvidenceTests(unittest.TestCase):
     def test_declared_date_must_match_original_single_full_date(self):
-        from research_platform.evidence import date_phrase_matches
+        from company_initiation.historic_construction.evidence import date_phrase_matches
         cases = [('2025-07-29T16:30:00Z', '2025-07-29'),
                  ('Paris, 29 juillet 2025', '2025-07-29'),
                  ('February 21st, 2024', '2024-02-21'),
@@ -27,7 +27,7 @@ class DateEvidenceTests(unittest.TestCase):
                 self.assertFalse(date_phrase_matches(phrase, '2026-10-25'))
 
     def test_ambiguous_partial_invalid_and_conflicting_dates_fail(self):
-        from research_platform.evidence import date_phrase_matches
+        from company_initiation.historic_construction.evidence import date_phrase_matches
         for phrase in ('2025', 'July 2025', '01/02/2025', '31 February 2025',
                        '31 December 2025 and 31 December 2024', 'retrieved today'):
             with self.subTest(phrase=phrase):
@@ -143,7 +143,7 @@ class ModelSourceTests(unittest.TestCase):
         self.assertTrue(self.failures())
 
     def test_real_blank_pdf_pages_preserve_empty_units_and_original_bytes(self):
-        from research_platform.evidence import _units
+        from company_initiation.historic_construction.evidence import _units
         writer=PdfWriter()
         for _ in range(3):writer.add_blank_page(600,800)
         path=self.root/'blank.pdf';writer.write(path);original=path.read_bytes()
@@ -155,7 +155,7 @@ class ModelSourceTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(),original)
 
     def test_missing_or_malformed_content_with_resources_is_not_silently_blank(self):
-        from research_platform.evidence import _units
+        from company_initiation.historic_construction.evidence import _units
         for malformed in (False,True):
             writer=PdfWriter();page=writer.add_blank_page(600,800)
             if malformed:page[NameObject('/Contents')]=NumberObject(42)
@@ -169,8 +169,8 @@ class ConstructionVendorPeriodTests(unittest.TestCase):
     """The source adapter accepts fiscal periods without changing their schema."""
 
     def setUp(self):
-        from research_platform.evidence import SourceStore
-        from research_platform.periods import build_periods
+        from company_initiation.historic_construction.evidence import SourceStore
+        from company_initiation.forecast_construction.periods import build_periods
         import io
         book=Workbook();sheet=book.active;sheet.title='Company Reported'
         sheet['D1']='Synthetic manufacturing business'
@@ -236,7 +236,7 @@ class ConstructionVendorPeriodTests(unittest.TestCase):
         self.assertEqual(result['slot'],'H1');self.assertEqual(custom,before)
 
     def test_legacy_initiation_contract_and_forecast_exclusion_are_unchanged(self):
-        from research_platform.evidence import _vendor_reference_period
+        from company_initiation.historic_construction.evidence import _vendor_reference_period
         legacy=dict(id='2023-H1',year=2023,kind='half_year',start='2022-07-01',end='2022-12-31',
                     fiscal_year_start='2022-07-01',fiscal_year_end='2023-06-30')
         self.assertIs(_vendor_reference_period(legacy),legacy)
@@ -248,8 +248,8 @@ class ConstructionVendorPeriodTests(unittest.TestCase):
             self.store.validate_historical_reference(reference,self.by_kind['FY'],fiscal_periods=self.periods)
 
     def test_materializer_supplies_fy_anchor_even_for_single_quarter_cohort(self):
-        from research_platform.integrated import integrated_role_contract
-        from research_platform.workflow import _materialize_financial_observations
+        from company_initiation.forecast_construction.integrated import integrated_role_contract
+        from company_initiation.historic_construction.workflow import _materialize_financial_observations
         ref=self.reference('Q1');period=self.by_kind['Q1']
         entry=dict(row_id='sales',label='Revenue',period_id=period['id'],unit='GBPm',metric_type='flow',entity_id='group',
             basis='consolidated',definition_id='revenue',scope='consolidated',rounding_increment=1,

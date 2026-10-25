@@ -34,6 +34,15 @@ Tell the user explicitly when a proposed step weakens this vision or is unlikely
 
 # Design rules
 
+- Package layout, 25 October 2026: `src/company_initiation` owns three ordered
+  stages: `historic_construction`, `forecast_construction`, `dcf_construction`.
+  Historical construction must not import either downstream stage. Pass cited
+  company inputs and stage results forward. Shared root files use the `shared_`
+  prefix; FX modules live in `src/shared_FX`. Keep financial behavior unchanged
+  during relocation and keep company-specific preparation code out of the engine.
+  The user requested deletion of the six old Nestle preparation scripts; preserve
+  their produced data and prior run records, not executable/text script copies.
+
 - Latest architecture clarification, 24 October 2026: the saved backend owns the
   financial model and typed, dated scenario inputs. Excel is a formula-auditable
   projection; workbook edits do not silently change backend inputs. Preserve
@@ -121,7 +130,7 @@ The first Nestlé reference used 2024–2025 annual history. Its originals, work
 From the project root after an editable install:
 
 ```text
-python -m research_platform doctor
+python -m company_initiation doctor
 python -m unittest discover -s tests -v
 ```
 

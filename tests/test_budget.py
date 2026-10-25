@@ -11,8 +11,8 @@ from time import monotonic
 import unittest
 from unittest.mock import patch, Mock
 
-from research_platform.ai import AIError, OpenAIProvider, response_usage
-from research_platform.budget import BudgetLedger, company_key, ledger_path, reconstruct_allowance, company_budget_migration_plan
+from company_initiation.shared_ai import AIError, OpenAIProvider, response_usage
+from company_initiation.shared_budget import BudgetLedger, company_key, ledger_path, reconstruct_allowance, company_budget_migration_plan
 
 
 SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}},
@@ -201,7 +201,7 @@ class BudgetTests(unittest.TestCase):
             BudgetLedger(self.path, "Company", 20.01)
 
     def test_independent_companies_wait_for_shared_ownership_index_and_keep_separate_caps(self):
-        from research_platform.budget import _lock, _registry_path
+        from company_initiation.shared_budget import _lock, _registry_path
         outputs=Path(self.temp.name)/'concurrent';outputs.mkdir()
         started=[Event(),Event()]
         def reserve_company(index):
@@ -223,7 +223,7 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(len({request['company_key'] for request in index['requests'].values()}),2)
 
     def test_budget_lock_timeout_is_bounded_without_replacing_existing_owner(self):
-        from research_platform.budget import _lock, _registry_path
+        from company_initiation.shared_budget import _lock, _registry_path
         registry=_registry_path(Path(self.temp.name));started=monotonic()
         with _lock(registry):
             with self.assertRaisesRegex(AIError,'after 0.1s'):
@@ -278,7 +278,7 @@ class BudgetTests(unittest.TestCase):
         self.assertFalse(list(outputs.glob('construction_company_budget_*.json')))
 
     def test_interrupted_migration_is_idempotent_and_never_releases_unknown_reserve(self):
-        from research_platform import budget
+        from company_initiation import shared_budget as budget
         outputs=Path(self.temp.name)/'interrupted';legacy,state=legacy_fixture(outputs)
         write=budget._write_atomic
         def interrupted(path,value):
@@ -305,7 +305,7 @@ class ProviderRecoveryTests(unittest.TestCase):
 
     def test_preassigned_identity_survives_single_timeout_without_sdk_retry(self):
         self.provider.next_client_request_id = "saved-before-dispatch"
-        with patch("research_platform.ai.urlopen", side_effect=socket.timeout()) as network:
+        with patch("company_initiation.shared_ai.urlopen", side_effect=socket.timeout()) as network:
             with self.assertRaises(AIError):
                 self.provider.complete(role="reviewer", instructions="fixture", payload={}, schema=SCHEMA)
         self.assertEqual(network.call_count, 1)
@@ -314,12 +314,12 @@ class ProviderRecoveryTests(unittest.TestCase):
         self.assertIsNone(self.provider.next_client_request_id)
 
     def test_retrieve_requires_provider_response_id_and_uses_only_get(self):
-        with patch("research_platform.ai.urlopen") as network:
+        with patch("company_initiation.shared_ai.urlopen") as network:
             with self.assertRaisesRegex(AIError, "saved provider resp_"):
                 self.provider.retrieve_response("2aaabb4a-ab48-4513-b0ea-1bea204fb9b4")
             network.assert_not_called()
         stream = io.BytesIO(json.dumps(response()).encode())
-        with patch("research_platform.ai.urlopen", return_value=stream) as network:
+        with patch("company_initiation.shared_ai.urlopen", return_value=stream) as network:
             result = self.provider.retrieve_response("resp_fixture")
         self.assertEqual(result["id"], "resp_fixture")
         self.assertEqual(network.call_args.args[0].method, "GET")

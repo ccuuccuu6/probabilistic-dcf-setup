@@ -21,12 +21,11 @@ from uuid import UUID
 
 from openpyxl import Workbook, load_workbook
 
-from research_platform.project import find_project_root, read_json
-from research_platform.__main__ import TerminalProgress
-from research_platform.ai import AIError, OpenAIProvider, aggregate_usage, response_usage
-from research_platform.evidence import SourceStore, download, parse_number
-from research_platform.initiation import (REVIEW_TOPICS, SECTIONS, _rounding_bound,
-                                          export_workbook, initiate_company, materialize_and_check)
+from company_initiation.shared_project import find_project_root, read_json
+from company_initiation.__main__ import TerminalProgress
+from company_initiation.shared_ai import AIError, OpenAIProvider, aggregate_usage, response_usage
+from company_initiation.historic_construction.evidence import SourceStore, download, parse_number
+from company_initiation.historic_construction.initiation import REVIEW_TOPICS, SECTIONS, _rounding_bound, export_workbook, initiate_company, materialize_and_check
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -73,10 +72,10 @@ class ProjectTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.package = self.root / "src" / "research_platform"
+        self.package = self.root / "src" / "company_initiation"
         self.package.mkdir(parents=True)
         (self.package / "__init__.py").write_bytes(
-            (PROJECT / "src" / "research_platform" / "__init__.py").read_bytes())
+            (PROJECT / "src" / "company_initiation" / "__init__.py").read_bytes())
         (self.root / "pyproject.toml").write_bytes((PROJECT / "pyproject.toml").read_bytes())
 
     def tearDown(self):
@@ -1460,7 +1459,7 @@ class InitiationTests(unittest.TestCase):
         self.assertEqual(continuity["basis"], "not_applicable")
 
     def test_missing_api_configuration_creates_no_outputs_or_network_calls(self):
-        with patch.dict(os.environ, {}, clear=True), patch("research_platform.ai.urlopen") as api:
+        with patch.dict(os.environ, {}, clear=True), patch("company_initiation.shared_ai.urlopen") as api:
             with self.assertRaisesRegex(AIError, "OPENAI_API_KEY"):
                 initiate_company(self.root, "Arbitrary Unconfigured Company")
             api.assert_not_called()
@@ -1563,7 +1562,7 @@ class InitiationTests(unittest.TestCase):
         ]
         responses = [io.BytesIO(json.dumps(discovery).encode("utf-8")),
                      URLError(TimeoutError("SYNTHETIC-SECRET"))]
-        with patch("research_platform.ai.urlopen", side_effect=responses) as network:
+        with patch("company_initiation.shared_ai.urlopen", side_effect=responses) as network:
             directory, record, _ = self.run_case(company, provider)
         self.assertEqual(network.call_count, 2)
         self.assertEqual(record["call_count"], 2)
@@ -2061,7 +2060,7 @@ class ResumeTests(unittest.TestCase):
             def today(cls):
                 return cls(2035, 1, 1)
 
-        with patch("research_platform.initiation.date", LaterDate):
+        with patch("company_initiation.historic_construction.initiation.date", LaterDate):
             directory, record, provider = self.run_company()
         self.assertEqual(record["status"], "accepted", record["issues"])
         self.assertEqual(record["request"]["as_of"], before["request"]["as_of"])
@@ -2109,7 +2108,7 @@ class ResumeTests(unittest.TestCase):
         self.assertEqual(self.calls(directory)[0], self.calls(parent)[0])
 
     def test_interrupt_during_excel_export_resumes_without_repeating_any_ai_call(self):
-        with patch("research_platform.initiation.export_workbook",
+        with patch("company_initiation.historic_construction.initiation.export_workbook",
                    side_effect=KeyboardInterrupt("Synthetic interrupted workbook export")):
             with self.assertRaises(KeyboardInterrupt):
                 self.run_company()
@@ -2142,7 +2141,7 @@ class ResumeTests(unittest.TestCase):
         self.assert_blocked_without_spending(ValueError, "outside|ancestry")
 
     def test_project_lock_prevents_concurrent_budget_branches_and_releases_after_error(self):
-        from research_platform.initiation import _initiation_lock
+        from company_initiation.historic_construction.initiation import _initiation_lock
 
         with _initiation_lock(self.root / "outputs"):
             self.assert_blocked_without_spending(AIError, "Another initiation|active")
@@ -2525,7 +2524,7 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(store.resolve({"source_id": "annual", "unit_id": "chunk:1",
                                             "number_index": number["index"],
                                             "number_format": "comma_decimal"}), 1234.5)
-        with patch("research_platform.evidence.build_opener") as opener:
+        with patch("company_initiation.historic_construction.evidence.build_opener") as opener:
             for url in ("file:///private", "http://example.invalid", "https://user:password@example.invalid"):
                 with self.subTest(url=url), self.assertRaises(ValueError):
                     download(url)
@@ -2539,7 +2538,7 @@ class AIAdapterTests(unittest.TestCase):
 
     def complete(self, provider, response, *, web=False):
         stream = io.BytesIO(json.dumps(response).encode("utf-8"))
-        with patch("research_platform.ai.urlopen", return_value=stream) as network:
+        with patch("company_initiation.shared_ai.urlopen", return_value=stream) as network:
             result = provider.complete(role="researcher", instructions="Synthetic instructions",
                                        payload={"synthetic": True},
                                        schema={"type": "object", "properties": {}, "required": [],
@@ -2558,7 +2557,7 @@ class AIAdapterTests(unittest.TestCase):
                 "EXTRACTION_MODEL=file-extractor\n"
                 "REVIEW_MODEL=file-reviewer\n", encoding="utf-8")
             with patch.dict(os.environ, {"RESEARCH_MODEL": "environment-researcher"}, clear=True), \
-                    patch("os.system") as shell, patch("research_platform.ai.urlopen") as network:
+                    patch("os.system") as shell, patch("company_initiation.shared_ai.urlopen") as network:
                 before = dict(os.environ)
                 provider = OpenAIProvider.from_env(env_file)
                 provider.validate_configuration()
@@ -2574,7 +2573,7 @@ class AIAdapterTests(unittest.TestCase):
     def test_env_configuration_errors_do_not_reveal_values(self):
         with tempfile.TemporaryDirectory() as temporary:
             env_file = Path(temporary) / ".env"
-            with patch.dict(os.environ, {}, clear=True), patch("research_platform.ai.urlopen") as network:
+            with patch.dict(os.environ, {}, clear=True), patch("company_initiation.shared_ai.urlopen") as network:
                 env_file.write_text("OPENAI_API_KEY=SYNTHETIC-SECRET\n", encoding="utf-8")
                 provider = OpenAIProvider.from_env(env_file)
                 provider.validate_configuration()
@@ -2614,7 +2613,7 @@ class AIAdapterTests(unittest.TestCase):
         request_ids = []
         for _ in range(2):
             stream = io.BytesIO(json.dumps(response).encode("utf-8"))
-            with patch("research_platform.ai.urlopen", return_value=stream) as network:
+            with patch("company_initiation.shared_ai.urlopen", return_value=stream) as network:
                 result = provider.complete(role="researcher", instructions="test", payload={},
                                            schema={"type": "object"})
             self.assertEqual(result, {})
@@ -2653,7 +2652,7 @@ class AIAdapterTests(unittest.TestCase):
             with self.subTest(kind=expected, during_read=during_read):
                 provider = self.provider()
                 stream = io.BytesIO(b"")
-                with patch("research_platform.ai.urlopen", return_value=stream,
+                with patch("company_initiation.shared_ai.urlopen", return_value=stream,
                            side_effect=None if during_read else error) as network, \
                         patch.object(stream, "read", side_effect=error), \
                         self.assertRaises(AIError) as raised:
@@ -2694,7 +2693,7 @@ class AIAdapterTests(unittest.TestCase):
         for read_failure in (None, BadStatusLine("SYNTHETIC-SECRET")):
             error = HTTPError("https://example.invalid/SYNTHETIC-SECRET", 429, "SYNTHETIC-SECRET", {}, None)
             with self.subTest(error_body_interrupted=read_failure is not None), \
-                    patch("research_platform.ai.urlopen", side_effect=error) as network, \
+                    patch("company_initiation.shared_ai.urlopen", side_effect=error) as network, \
                     patch.object(error, "read", return_value=b"", side_effect=read_failure):
                 with self.assertRaises(AIError) as raised:
                     provider.complete(role="researcher", instructions="test", payload={},
@@ -2743,7 +2742,7 @@ class AIUsageTests(unittest.TestCase):
         self.assertAlmostEqual(dated["estimated_cost_usd"], 0.003)
 
     def test_known_pricing_requires_an_exact_model_or_dated_snapshot(self):
-        from research_platform.ai import has_known_pricing
+        from company_initiation.shared_ai import has_known_pricing
 
         for model in ("gpt-6.1-sol", "gpt-6-luna", "gpt-6-astra", "gpt-6.1-sol-2026-10-01"):
             self.assertTrue(has_known_pricing(model))
@@ -2871,7 +2870,7 @@ class AIUsageTests(unittest.TestCase):
         self.assertIn("unspecified", aggregate_usage([known])["by_stage"])
 
     def test_terminal_usage_shows_total_and_stage_subtotals_without_zero_for_unknown(self):
-        from research_platform.ai import format_stage_usage, format_usage
+        from company_initiation.shared_ai import format_stage_usage, format_usage
 
         known = response_usage(self.response(reasoning=80), "gpt-6.1-sol")
         missing = response_usage(None, "gpt-6.1-sol")
@@ -3007,7 +3006,7 @@ class ApiCostEffortTests(unittest.TestCase):
 
     def test_invalid_effort_is_rejected_before_a_request(self):
         for effort in ("", "extreme", None, [], "SYNTHETIC-SECRET"):
-            with self.subTest(effort=effort), patch("research_platform.ai.urlopen") as network:
+            with self.subTest(effort=effort), patch("company_initiation.shared_ai.urlopen") as network:
                 provider = self.provider(reasoning_efforts={"extractor": effort})
                 with self.assertRaises(AIError) as raised:
                     provider.complete(**self.arguments({}))
@@ -3016,7 +3015,7 @@ class ApiCostEffortTests(unittest.TestCase):
 
     def test_local_allowance_reserves_input_and_full_output_without_spending_or_usage(self):
         provider = self.provider()
-        with patch("research_platform.ai.urlopen") as network:
+        with patch("company_initiation.shared_ai.urlopen") as network:
             small = provider.estimate_request_cost(**self.arguments({"text": "tiny"}))
             large = provider.estimate_request_cost(**self.arguments({"text": "x" * 280000}))
             unknown_web = provider.estimate_request_cost(**self.arguments({}), web=True)
@@ -3043,7 +3042,7 @@ class LocalSourceTests(unittest.TestCase):
         (self.archive / "financial_reports").mkdir(parents=True)
 
     def inventory(self):
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.historic_construction.evidence import inventory_local_sources
         return inventory_local_sources(self.archive)
 
     @staticmethod
@@ -3196,7 +3195,7 @@ class LocalSourceTests(unittest.TestCase):
         self.assertEqual(indexed["sources"][0]["url"], "https://example.com/results")
 
     def test_root_ancillary_files_are_hashed_but_never_financial_inputs(self):
-        from research_platform.evidence import source_inventory_fingerprint
+        from company_initiation.historic_construction.evidence import source_inventory_fingerprint
         self.report();before=self.inventory()
         ancillary=self.archive/'research_context.json';ancillary.write_text('{"note":"Synthetic context, not a company observation"}',encoding='utf-8')
         (self.archive/'factor_reference.pdf').write_bytes(b'%PDF synthetic ancillary reference')
@@ -3222,7 +3221,7 @@ class LocalSourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'required source input is missing'):self.inventory()
 
     def test_ancillary_index_metadata_does_not_change_financial_compatibility(self):
-        from research_platform.evidence import source_inventory_fingerprint
+        from company_initiation.historic_construction.evidence import source_inventory_fingerprint
         path=self.report();before=self.inventory()
         (self.archive/'context.json').write_text('{}',encoding='utf-8')
         (self.archive/'sources.csv').write_text('relative_filename,required_input,reason\ncontext.json,false,Ancillary research only\n',encoding='utf-8')
@@ -3233,8 +3232,8 @@ class LocalSourceTests(unittest.TestCase):
         self.assertNotEqual(source_inventory_fingerprint(before),self.inventory()['source_input_sha256'])
 
     def test_saved_inventory_accepts_frozen_withdrawal_but_rejects_new_changed_or_unpreserved_originals(self):
-        from research_platform.evidence import saved_source_inventory_compatibility
-        from research_platform.integrated import verified_integrated_record
+        from company_initiation.historic_construction.evidence import saved_source_inventory_compatibility
+        from company_initiation.forecast_construction.integrated import verified_integrated_record
         first=self.report();second=self.report('second.html','456');before=self.inventory()
         outputs=self.root/'outputs';run=outputs/'construct_fixture';run.mkdir(parents=True)
         store=SourceStore(run/'sources')
@@ -3357,7 +3356,7 @@ class LocalSourceTests(unittest.TestCase):
         self.assertEqual(len(store.sources), 2)
 
     def test_apostrophe_grouping_is_one_token_and_bad_grouping_is_not_split(self):
-        from research_platform.evidence import _tokens
+        from company_initiation.historic_construction.evidence import _tokens
         for raw, expected, number_format in (("8'639", 8639, "dot_decimal"),
                                               ("(1\u2019234.50)", -1234.5, "dot_decimal"),
                                               ("1\u2018234,50", 1234.5, "comma_decimal")):
@@ -3452,7 +3451,7 @@ class LocalInitiationTests(unittest.TestCase):
         self.prepare_company(SyntheticCompany())
 
     def prepare_company(self, company):
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.historic_construction.evidence import inventory_local_sources
 
         self.company = company
         self.original.write_bytes(self.company.payload())
@@ -3503,8 +3502,8 @@ class LocalInitiationTests(unittest.TestCase):
     def run_local(self, *, company=None, provider=None, **kwargs):
         company = company or self.company
         provider = provider or self.LocalProvider(company)
-        with patch("research_platform.ai.urlopen") as ai_network, \
-                patch("research_platform.evidence.download") as browser:
+        with patch("company_initiation.shared_ai.urlopen") as ai_network, \
+                patch("company_initiation.historic_construction.evidence.download") as browser:
             directory = initiate_company(self.root, company.name, provider=provider,
                                          source_directory=self.archive, **kwargs)
             ai_network.assert_not_called()
@@ -3888,7 +3887,7 @@ class HistoricalBasisTests(unittest.TestCase):
         self.assertEqual(result["scale"], 1)
 
     def test_review_scope_omits_unavailable_subtotal_equations_without_broadening_periods(self):
-        from research_platform.initiation import _scope_model
+        from company_initiation.historic_construction.initiation import _scope_model
 
         subtotal = copy.deepcopy(next(row for row in self.candidate["rows"] if row["id"] == "expenses"))
         subtotal.update(id="old_subtotal", label="Earlier disclosed expense subtotal",
@@ -3977,7 +3976,7 @@ class VisibleAlphaTests(unittest.TestCase):
         (self.archive / "visible_alpha").mkdir(parents=True)
         self.path = self.archive / "visible_alpha" / "synthetic_vendor.xlsx"
         self.addresses = self.make_workbook(self.path)
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.historic_construction.evidence import inventory_local_sources
         self.spec = inventory_local_sources(self.archive)["sources"][0]
         self.store = SourceStore(self.root / "originals")
         self.descriptor = self.store.add_local(self.spec, root=self.archive)
@@ -4131,7 +4130,7 @@ class VisibleAlphaTests(unittest.TestCase):
     def test_unrecognized_vendor_layout_cannot_supply_historical_cells(self):
         path = self.archive / "visible_alpha" / "unrecognized.xlsx"
         self.make_workbook(path, recognized=False)
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.historic_construction.evidence import inventory_local_sources
         spec = next(item for item in inventory_local_sources(self.archive)["sources"]
                     if item["local_path"].endswith("unrecognized.xlsx"))
         descriptor = self.store.add_local(spec, root=self.archive)
@@ -4145,7 +4144,7 @@ class VisibleAlphaTests(unittest.TestCase):
         book.create_sheet("Forecasts").append(["Consensus FY2027", 900009])
         book.save(self.path)
         book.close()
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.historic_construction.evidence import inventory_local_sources
         spec = inventory_local_sources(self.archive)["sources"][0]
         descriptor = self.store.add_local(spec, root=self.archive)
         reference = self.reference("filing", descriptor=descriptor)
@@ -4167,7 +4166,7 @@ class VisibleAlphaTests(unittest.TestCase):
         book["Vendor data"]["G19"] = "Not disclosed: refer to reporting note"
         book.save(self.path)
         book.close()
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.historic_construction.evidence import inventory_local_sources
         spec = inventory_local_sources(self.archive)["sources"][0]
         descriptor = self.store.add_local(spec, root=self.archive)
         reference = self.reference("filing", descriptor=descriptor)
@@ -4252,7 +4251,7 @@ class VisibleAlphaTests(unittest.TestCase):
         book.active.append(["SYNTHETIC original company sales", 2024, 100])
         book.save(path)
         book.close()
-        from research_platform.evidence import inventory_local_sources
+        from company_initiation.historic_construction.evidence import inventory_local_sources
         spec = next(item for item in inventory_local_sources(self.archive)["sources"]
                     if item["category"] == "financial_reports")
         descriptor = self.store.add_local(spec, root=self.archive)
