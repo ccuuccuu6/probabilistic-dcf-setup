@@ -38,6 +38,49 @@ LOCAL_FORMATS = {".pdf": "pdf", ".xlsx": "xlsx", ".xls": "xls", ".html": "html",
                  ".txt": "txt", ".csv": "csv"}
 
 
+def excel_fraction_percent(number_format):
+    """An unquoted Excel percent scales a fraction; a quoted percent is literal."""
+    syntax=re.sub(r'"[^"]*"|\\.', '', str(number_format or ''))
+    return '%' in syntax
+
+
+def va_unit_options(reported_unit, currency):
+    """Vendor-format dimensions, without inferring a financial concept or FX rate.
+
+    VA M/Abs/# conventions are source-format rules. Ambiguous or foreign units
+    are surfaced for review rather than assigned the company's currency.
+    """
+    unit=re.sub(r'[\s_]+', '',str(reported_unit or '')).upper().replace('€','EUR').replace('£','GBP')
+    if unit in ('%','PERCENT','PCT'):
+        return [dict(measure='ratio',unit='ratio',multiplier=1.,percentage_points=True)]
+    if unit in ('RATIO','X','TIMES','MULTIPLE'):
+        return [dict(measure='ratio',unit='ratio',multiplier=1.,percentage_points=False)]
+    if unit in ('BPS','BP'):
+        return [dict(measure='ratio',unit='ratio',multiplier=.0001,percentage_points=False)]
+    if unit in ('M#','MSHARES','SHARESM','MILLIONSHARES'):
+        return [dict(measure='shares',unit='shares_m',multiplier=1.)]
+    if unit in ('#','ABS#','SHARES','NO.','NUMBER'):
+        return [dict(measure='shares',unit='shares_m',multiplier=.000001),
+                dict(measure='count',unit='count',multiplier=1.)]
+    if unit in ('DAY','DAYS'):
+        return [dict(measure='days',unit='days',multiplier=1.)]
+    match=re.fullmatch(r'([A-Z]{3})(M|MN|MILLION|MILLIONS|K|THOUSAND|B|BN|BILLION|ABS)?',unit)
+    if match and match[1]==currency:
+        scale={None:1.,'ABS':1.,'K':1000.,'THOUSAND':1000.,'M':1e6,'MN':1e6,
+               'MILLION':1e6,'MILLIONS':1e6,'B':1e9,'BN':1e9,'BILLION':1e9}[match[2]]
+        options=[dict(measure='money',unit=currency+'m',multiplier=scale/1e6)]
+        if scale==1:options.append(dict(measure='money_per_share',unit=currency+'_per_share',multiplier=1.))
+        return options
+    return []
+
+
+def va_cell_multiplier(option, cell):
+    """Normalize native fractions and literal-percent VA point values once."""
+    if option.get('percentage_points'):
+        return 1. if str(cell['source_raw']).strip().endswith('%') or excel_fraction_percent(cell.get('display_format')) else .01
+    return option['multiplier']
+
+
 def date_phrase_matches(phrase, iso_date):
     """Verify one explicit calendar date, without inventing a numeric-date locale.
 
@@ -493,7 +536,7 @@ def parse_number(value, number_format="dot_decimal"):
                 raise ValueError("A parenthesized number cannot carry another sign.")
         decimal, thousands = (".", ",") if number_format == "dot_decimal" else (",", ".")
         integer = rf"(?:\d+|\d{{1,3}}(?:{re.escape(thousands)}\d{{3}})+|\d{{1,3}}(?: \d{{3}})+|\d{{1,3}}(?:'\d{{3}})+)"
-        if not re.fullmatch(rf"[+-]?{integer}(?:{re.escape(decimal)}\d+)?", text):
+        if not re.fullmatch(rf"[+-]?{integer}(?:{re.escape(decimal)}\d+)?(?:[eE][+-]?\d+)?", text):
             raise ValueError(f"Unrecognized financial number: {value!r}")
         text = text.replace(thousands, "").replace(" ", "").replace("'", "").replace(decimal, ".")
         result = float(text) * (-1 if negative else 1) / (100 if percent else 1)
@@ -1258,6 +1301,72 @@ class SourceStore:
             result.append(copy.deepcopy(unit))
         return result
 
+    def company_reported_rows(self, source_ids, periods, *, as_of):
+        """Read eligible VA cells once; AI maps rows, never transcribes amounts.
+
+        Explicit dataset/section roles and the existing historical-cell validator
+        own eligibility. Filings wins within the same row and fiscal slot when it
+        has a value; a missing filing may use VA Actuals. No standardized fallback.
+        Original token indexes, cell addresses and both available series survive.
+        """
+        cutoff = date.fromisoformat(as_of)
+        period_map = {(p['fiscal_year'], p['kind']): p for p in periods
+                      if date.fromisoformat(p['end']) <= cutoff}
+        by_id = {period['id']:period for period in period_map.values()}
+        def recency(period_id):
+            period=by_id[period_id]
+            return (period['end'],period['kind']=='FY',period['start'],period_id)
+        years = {year for year, _ in period_map}
+        rows = []
+        sources = {source['id']: source for source in self.sources}
+        for source_id in sorted(source_ids):
+            source = sources[source_id]
+            if source.get('category') != 'visible_alpha':
+                raise ValueError('Company-reported row extraction requires a VA spreadsheet')
+            if source.get('vendor_layout', {}).get('status') != 'recognized':
+                raise ValueError('Unrecognized VA layout; declare a company_reported dataset or labelled sections')
+            for unit in self._vendor_history(source, years):
+                row = unit.get('vendor_row', {})
+                if row.get('section') != 'company_reported' or row.get('role') != 'metric':
+                    continue
+                headers = source['vendor_profile']['header_sets'][row['header_id']]['columns']
+                candidates = {}
+                for token in unit['numbers']:
+                    column = re.sub(r'\d+$', '', token['locator'])
+                    header = headers[column]
+                    period = period_map.get((header['year'], header['slot']))
+                    if period is None:
+                        continue
+                    reference = dict(source_id=source_id, unit_id=unit['unit_id'],
+                                     number_index=token['index'], number_format='dot_decimal')
+                    eligibility = self.validate_historical_reference(reference, period, fiscal_periods=periods)
+                    candidates.setdefault(period['id'], []).append(dict(
+                        reference=reference, source_raw=str(token['raw']), cell=token['locator'],
+                        series=eligibility['series'], period_id=period['id'],
+                        period_metadata=dict(period_id=period['id'],kind=period['kind'],start=period['start'],end=period['end'],
+                            source_period_label=header['period_label'],header_ref=dict(source_id=source_id,unit_id=row['header_id']),
+                            source_series=eligibility['series'],interval_basis='cumulative' if period['kind']=='9M' else 'source_fiscal_interval',
+                            caveat='Period label and fiscal dates do not establish original/restated provenance or independent company verification.'),
+                        display_format=token.get('display_format','')))
+                cells = []
+                for period_id in sorted(candidates,key=recency,reverse=True):
+                    choices=candidates[period_id]
+                    filings = [item for item in choices if item['series'].casefold() == 'filings']
+                    preferred = filings or choices
+                    if len(preferred) != 1:
+                        raise ValueError('Ambiguous duplicate VA historical columns: '+source_id+' '+unit['unit_id']+' '+period_id)
+                    cells.append(dict(preferred[0], available_series=choices))
+                if cells:
+                    rows.append(dict(row_key='row_'+str(len(rows)+1), source_id=source_id,
+                        unit_id=unit['unit_id'], label=row['label'], reported_unit=row['unit'],
+                        dataset_role='company_reported',source_row_role='metric',
+                        navigation_note='Analytics is a vendor navigation control on this base metric row, not a classification as an analytics helper.',
+                        context=row['context'], cells=cells))
+        # Current reporting rows precede legacy-only rows. This changes research
+        # order, never source values, fiscal dates or historical reporting bases.
+        rows.sort(key=lambda row:recency(row['cells'][0]['period_id']),reverse=True)
+        return rows
+
     def _vendor_history(self, source, years):
         """Create an explicit historical input view, never change source evidence."""
         if source.get("vendor_layout", {}).get("status") != "recognized":
@@ -1334,9 +1443,10 @@ class SourceStore:
     def validate_historical_reference(self, reference, period, *, fiscal_periods=None):
         """Reject vendor estimates, standardized/helper rows and wrong periods.
 
-        This is eligibility, not source acceptance. Independent company-source
-        reconstruction still establishes whether the company's reporting supports
-        the observation. Interim slots require the discovered annual fiscal dates.
+        This is eligibility, not source acceptance. Historical-only initiation
+        retains independent company-source reconstruction; VA-led construction
+        explicitly records that such independent verification was not performed.
+        Interim slots require the discovered annual fiscal dates.
         """
         source = next((source for source in self.sources if source["id"] == reference.get("source_id")), None)
         if source is None:
@@ -1631,7 +1741,9 @@ def verify_model_input_sources(data: dict, archive: Path) -> list[dict]:
             observation(f"interims:{index}:{interim.get('period')}", interim.get("value"),
                         [interim["source_ref"]] if interim.get("source_ref") else [])
         for item in data.get("observations", []):
-            if item.get("status") in ("unverified", "conflict", "excluded", "vendor_unverified", "primary_conflict") or not item.get("eligible", True):
+            from .model_contract import provisional_history_fact
+            if (item.get("status") in ("unverified", "conflict", "excluded", "vendor_unverified", "primary_conflict")
+                    or not item.get("eligible", True) and not provisional_history_fact(item)):
                 check("observation_excluded:" + item["id"], "WARNING",
                       item.get("reason", "Candidate retained for audit but excluded from model inputs."))
                 continue

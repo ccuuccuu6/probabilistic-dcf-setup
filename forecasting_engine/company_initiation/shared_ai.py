@@ -35,7 +35,13 @@ ROLE_SETTINGS = {
 DEFAULT_MODEL = "gpt-6-luna"
 STAGE_EFFORTS = {"construction_select": "low", "construction_map": "low",
                  "construction_history": "medium", "construction_drivers": "medium",
-                 "construction_formulas": "medium", "construction_review": "medium"}
+                 "construction_formulas": "medium", "construction_review": "medium",
+                 "company_identity_sources": "low", "company_source_sections": "low",
+                 "company_history_sources": "low", "company_forecast_sources": "low", "company_va_scope": "medium", "company_forecast_scope": "medium",
+                 "company_reporting_scope": "medium", "company_va_row_mapping": "medium",
+                 "company_va_row_mapping_patch": "medium", "company_va_core_coverage": "medium",
+                 "company_va_core_coverage_patch": "medium", "company_va_core_review": "medium",
+                 "company_va_core_review_repair_patch": "medium", "company_va_evidence_resolution": "medium"}
 EXTRA_SETTINGS = {"STAGE_MODELS", "STAGE_REASONING_EFFORTS", "MODEL_PRICING_JSON", "OPENAI_TIMEOUT_SECONDS"}
 REASONING_SETTINGS = {
     "researcher": "RESEARCH_REASONING_EFFORT",
@@ -339,7 +345,7 @@ def _provider_error_code(error: HTTPError) -> str | None:
     code = detail.get("code") if isinstance(detail, dict) else None
     allowed = ("invalid_api_key", "insufficient_quota", "model_not_found",
                "permission_denied", "rate_limit_exceeded", "billing_hard_limit_reached",
-               "invalid_request_error", "invalid_value", "unsupported_value",
+               "invalid_request_error", "invalid_json_schema", "invalid_value", "unsupported_value",
                "context_length_exceeded", "account_deactivated")
     return code if isinstance(code, str) and code in allowed else None
 

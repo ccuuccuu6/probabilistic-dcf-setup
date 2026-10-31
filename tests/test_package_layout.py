@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -59,7 +60,7 @@ for item in pkgutil.walk_packages(history.__path__, history.__name__+'.'):
 print(json.dumps(sorted(name for name in sys.modules if name.startswith((
     'company_initiation.forecast_construction', 'company_initiation.dcf_construction')))))
 """
-        env=dict(os.environ,PYTHONPATH=str(ROOT/'src'))
+        env=dict(os.environ,PYTHONPATH=str(ROOT/'forecasting_engine'))
         process=subprocess.run([sys.executable,'-c',script],cwd=ROOT,env=env,
                                capture_output=True,text=True,timeout=30)
         self.assertEqual(process.returncode,0,process.stderr)
@@ -67,8 +68,8 @@ print(json.dumps(sorted(name for name in sys.modules if name.startswith((
 
     def test_historical_functions_have_no_deferred_downstream_imports(self):
         # Import-only checks cannot detect a forbidden import inside a function.
-        roots=[ROOT/'src/company_initiation/historic_construction']
-        files=list(roots[0].glob('*.py'))+list((ROOT/'src/company_initiation').glob('shared_*.py'))
+        roots=[ROOT/'forecasting_engine/company_initiation/historic_construction']
+        files=list(roots[0].glob('*.py'))+list((ROOT/'forecasting_engine/company_initiation').glob('shared_*.py'))
         violations=[]
         for path in files:
             for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
@@ -81,10 +82,47 @@ print(json.dumps(sorted(name for name in sys.modules if name.startswith((
     def test_shared_fx_modules_live_in_their_own_package(self):
         for name in ('fx','fx_store','ibkr'):
             module=importlib.import_module('shared_FX.'+name)
-            self.assertEqual(Path(module.__file__).resolve().parent,ROOT/'src/shared_FX')
+            self.assertEqual(Path(module.__file__).resolve().parent,ROOT/'forecasting_engine/shared_FX')
 
 
 class HistoricalHandoffTests(unittest.TestCase):
+    def test_historical_workbook_preserves_facts_derivations_and_stage_boundary(self):
+        from openpyxl import load_workbook
+        from company_initiation.historic_construction.model_excel import write_historical_output
+        from company_initiation.shared_excel import NAVY
+        data=historical_fixture();before=copy.deepcopy(data)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory=Path(temporary)
+            result=write_historical_output(directory,data)
+            self.assertEqual(data,before)
+            self.assertEqual(set(result['files']),{'historical_model.json','historical_model.xlsx','historical_workbook_validation.json'})
+            book=load_workbook(directory/result['workbook'],data_only=False)
+            self.addCleanup(book.close)
+            self.assertFalse({'Valuation','Assumptions'} & set(book.sheetnames))
+            self.assertEqual(book.active.title,'Model')
+            self.assertFalse(book['Model'].sheet_view.showGridLines)
+            self.assertEqual(book['Historics']['A5'].fill.fgColor.rgb[-6:],NAVY)
+            headers=[book['Model'].cell(5,column).value for column in range(4,book['Model'].max_column+1)]
+            self.assertNotIn('2026 FY',headers)
+            self.assertFalse(any('9M' in str(value) for value in headers))
+            values=[book['Historics'].cell(row,5).value for row in range(6,book['Historics'].max_row+1)]
+            self.assertIn(140,values)
+            self.assertTrue(any(isinstance(value,str) and value.startswith('=') for value in values))
+            report=json.loads((directory/result['validation']).read_text(encoding='utf-8'))
+            self.assertEqual(report['saved_value_and_formula_readback'],'passed')
+            self.assertEqual(report['desktop_excel_recalculation'],'not_performed')
+            book.close()
+
+    def test_historical_export_rejects_inconsistent_derived_fact(self):
+        from company_initiation.historic_construction.model_contract import historical_model
+        from company_initiation.historic_construction.model_excel import export_historical_model
+        spec=historical_model(historical_fixture())
+        derived=next(item for item in spec['observations'] if item.get('expression'))
+        derived['value']+=1
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError,'does not reproduce'):
+                export_historical_model(Path(temporary)/'bad.xlsx',spec)
+
     def test_history_stops_at_latest_report_and_preserves_reorganisation(self):
         from company_initiation.historic_construction.model_contract import historical_model
         data=historical_fixture();before=copy.deepcopy(data)

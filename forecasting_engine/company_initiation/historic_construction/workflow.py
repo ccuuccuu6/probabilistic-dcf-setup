@@ -12,6 +12,795 @@ from pathlib import Path
 import shutil
 from uuid import uuid4
 
+from .model_excel import save_historical_output
+from ..shared_project import resolve_data_path
+
+VA_SOURCE_POLICY = 'company_reported_va_v1'
+VA_MAPPING_CONTRACT = 'va_semantic_mapping_v7'
+
+
+def _va_numeric_preflight(store, source_ids):
+    """Check native/text numeric round-trips before dispatching semantic work."""
+    from .evidence import parse_number
+    import math
+    issues=[];checked=0
+    for sid in source_ids:
+        source=next(s for s in store.sources if s['id']==sid)
+        years={c['year'] for h in source['vendor_profile']['header_sets'].values() for c in h['columns'].values() if c['eligible']}
+        for unit in store._vendor_history(source,years):
+            if unit.get('vendor_row',{}).get('section')!='company_reported' or unit['vendor_row'].get('role')!='metric':continue
+            for token in unit['numbers']:
+                checked+=1
+                try:
+                    native=parse_number(token['raw']);text=parse_number(str(token['raw']))
+                    if not math.isclose(native,text,rel_tol=0,abs_tol=0):raise ValueError('Numeric round-trip changed the native value')
+                except (ValueError,TypeError) as exc:
+                    issues.append(dict(source_id=sid,unit_id=unit['unit_id'],number_index=token['index'],detail=str(exc)))
+    return dict(status='passed' if not issues else 'failed',checked_cells=checked,issues=issues,ai_calls=0,
+                scope='Numeric representations only; period/basis eligibility is checked separately')
+
+
+def _identity_source_selection(journal, company, as_of, catalog, prompt):
+    """Use compact navigation metadata and exact catalogue membership."""
+    from ..shared_runtime import SELECT
+    schema=copy.deepcopy(SELECT)
+    schema['properties']['source_ids']['items']={'type':'string','enum':list(catalog)}
+    fields=('id','title','category','format','local_path','dataset_role','published_at','publication_date',
+            'reporting_year','coverage_kind','declared_role')
+    navigation=[{key:source[key] for key in fields if key in source} for source in catalog.values()]
+    def validate(answer):
+        invalid=[sid for sid in answer['source_ids'] if sid not in catalog]
+        if invalid:raise ValueError('Select exact catalogue source IDs; unknown '+', '.join(invalid))
+        if not answer['source_ids']:raise ValueError('Select company originals or report the evidence gap')
+        return dict(answer,source_ids=list(dict.fromkeys(answer['source_ids'])))
+    answer=journal.stage('company_identity_sources',prompt,dict(company=company,as_of=as_of,catalog=navigation),schema,validate)
+    # Documents are selected for an actual question; filenames never force bulk loading.
+    return answer
+
+
+def _va_date_schema():
+    return {'type':['string','null'],'pattern':r'^\d{4}-\d{2}-\d{2}$'}
+
+
+def _va_schema(keys, measures, source_keys=None):
+    from ..shared_runtime import _object,_array,TEXT
+    from .model_contract import integrated_role_contract
+    enum=lambda values:dict(type='string',enum=list(values))
+    roles=integrated_role_contract()
+    financial_roles=sorted(set(roles['group_roles']+roles['corporate_roles'])|
+        {suffix.lstrip('_') for suffix in roles['segment_role_suffixes']})
+    citation=_object(source_id=TEXT,unit_id=TEXT)
+    version=_object(row_id={'type':['string','null']},financial_role={'type':['string','null'],'enum':financial_roles+[None]},label=TEXT,entity_id=TEXT,
+        statement_section=enum(['income','balance','cashflow','segment','supplementary']),
+        entity_kind=enum(['group','corporate','current_segment','legacy_segment','supplementary']),
+        measure=enum(measures),metric_type=enum(['flow','stock','ratio','weighted_average']),
+        basis=TEXT,definition_id=TEXT,scope=TEXT,restatement=enum(['original','restated','vendor_normalized','unknown']),
+        restatement_vintage={'type':['string','null']},classification_basis=TEXT,
+        definition_status=enum(['source_defined','unresolved']),basis_status=enum(['period_defined','unresolved']),
+        period_basis=enum(['source_period','closing','weighted_average','unresolved']),
+        period_kinds=_array(enum(['Q1','Q2','Q3','Q4','H1','H2','9M','FY'])),
+        effective_from=_va_date_schema(),effective_to=_va_date_schema(),
+        version_refs=_array(citation),polarity={'type':'integer','enum':[-1,1]})
+    mapped=_object(row_key=enum(keys),action=enum(['map']),versions=_array(version))
+    excluded=_object(row_key=enum(keys),action=enum(['exclude']),
+        reason_code=enum(['duplicate','presentation_diagnostic']),reason=TEXT,
+        duplicate_of={'type':['string','null']},evidence_refs=_array(citation))
+    pending=_object(row_key=enum(keys),action=enum(['pending']),reason=TEXT,evidence_refs=_array(citation))
+    decision={'anyOf':[mapped,excluded,pending]}
+    return _object(decisions=_array(decision),gaps=_array(TEXT)),decision
+
+
+def _va_reporting_schema():
+    from ..shared_runtime import _object,_array,TEXT
+    citation=_object(source_id=TEXT,unit_id=TEXT)
+    nullable=_va_date_schema()
+    return _object(declarations=_array(_object(topic={'type':'string','enum':['period_convention','definition','reporting_change']},
+        detail=TEXT,change_kind={'type':'string','enum':['redefinition','numeric_revision','none']},change_date=nullable,
+        effective_from=nullable,effective_to=nullable,source_refs=_array(citation))),
+        entity_versions=_array(_object(entity_id=TEXT,label=TEXT,
+            entity_kind={'type':'string','enum':['current_segment','legacy_segment','supplementary']},
+            effective_from=nullable,effective_to=nullable,source_refs=_array(citation))),
+        hierarchies=_array(_object(effective_from=nullable,effective_to=nullable,entity_ids=_array(TEXT),source_refs=_array(citation))))
+
+
+def _va_validate_reporting_context(context, units, segments):
+    """Validate cited declarations, without inferring historical equivalence."""
+    current={s['id'] for s in segments};known=set(current);intervals=[]
+    redefined=any(d.get('change_kind')=='redefinition' for d in context['declarations'])
+    legacy=any(v['entity_kind']=='legacy_segment' for v in context['entity_versions'])
+    if context['declarations'] and not redefined and not legacy and any(
+            item.get('effective_from') or item.get('effective_to') for item in context['entity_versions']+context['hierarchies']):
+        raise ValueError('No redefinition supports hard entity/hierarchy boundaries. Use null applicability bounds; document coverage dates are not entity birth/death dates.')
+    for item in context['entity_versions']:
+        if item['entity_kind']=='current_segment' and item['entity_id'] not in current:
+            raise ValueError('Current reporting version must name a supplied current segment')
+        if item['entity_kind']=='legacy_segment' and item['entity_id'] in current:
+            raise ValueError('Changed historical reporting entities need distinct legacy IDs')
+        known.add(item['entity_id'])
+    for item in context['declarations']+context['entity_versions']+context['hierarchies']:
+        start=item['effective_from'];end=item['effective_to']
+        if item.get('change_date'):date.fromisoformat(item['change_date'])
+        if start:date.fromisoformat(start)
+        if end:date.fromisoformat(end)
+        if start and end and start>end:raise ValueError('Reporting declaration has reversed effective dates')
+        if not item['source_refs'] or any(ref['source_id'] not in units or ref['unit_id'] not in units[ref['source_id']] for ref in item['source_refs']):
+            raise ValueError('Reporting declarations require original sections supplied in the scope context')
+    for item in context['hierarchies']:
+        if not item['entity_ids'] or len(set(item['entity_ids']))!=len(item['entity_ids']) or set(item['entity_ids'])-known:
+            raise ValueError('Dated hierarchy must name distinct declared reporting entities')
+        start=item['effective_from'] or '0001-01-01';end=item['effective_to'] or '9999-12-31'
+        entities=frozenset(item['entity_ids'])
+        if any(start<=previous_end and previous_start<=end and entities==previous_entities for previous_start,previous_end,previous_entities in intervals):
+            raise ValueError('Duplicate reporting hierarchy applicability intervals overlap')
+        intervals.append((start,end,entities))
+    return context
+
+
+def _va_reporting_entities(data, period):
+    context=data['model_configuration'].get('va_reporting_context',{})
+    hierarchies=context.get('hierarchies',[])
+    matches=[h for h in hierarchies if (not h['effective_from'] or h['effective_from']<=period['end'])
+        and (not h['effective_to'] or period['end']<=h['effective_to'])]
+    current={s['id'] for s in data['segments']}
+    preferred=[h for h in matches if set(h['entity_ids'])==current]
+    if preferred:return preferred[0]['entity_ids']
+    if len(matches)>1:matches=sorted(matches,key=lambda h:h['effective_from'] or '',reverse=True)
+    if matches:return matches[0]['entity_ids']
+    if hierarchies:raise ValueError('No cited primary reporting hierarchy covers '+period['id'])
+    return [s['id'] for s in data['segments']]
+
+
+def _va_coverage_gaps(data, facts, periods):
+    annual={p['fiscal_year']:p for p in periods if p['kind']=='FY'};gaps=[]
+    required=[('sales','group',year) for year in data['history_years']]
+    year=max(data['history_years'])
+    required.extend((entity+'_sales',entity,year) for entity in _va_reporting_entities(data,annual[year]))
+    for role,entity,year in required:
+        if not any((f['row_id'] in ({'sales','total_revenue'} if entity=='group' else {role})
+                or entity=='group' and f.get('definition_status')=='source_defined' and bool(_va_coverage_roles(dict(label=f.get('label','')))&{'sales','total_revenue'}))
+                and f['entity_id']==entity and f['fiscal_year']==year and f['kind']=='FY'
+                and f.get('metric_type')=='flow' and (f.get('eligible') or f.get('historical_display_eligible')) for f in facts):
+            gaps.append(dict(row_id=role,entity_id=entity,period_id=annual[year]['id'],
+                detail='Missing source-backed monetary annual sales binding; retain original definitions and dated entities'))
+    return gaps
+
+
+def _va_semantic_fingerprint(candidate, report):
+    """Ignore prose-only repairs; include the financial fields that could resolve findings."""
+    from ..shared_runtime import digest
+    fields=('row_id','financial_role','entity_id','entity_kind','definition_id','metric_type','definition_status','basis_status',
+        'period_basis','period_kinds','effective_from','effective_to','version_refs','polarity')
+    decisions=[dict(row_key=d['row_key'],action=d['action'],versions=[{k:v.get(k) for k in fields} for v in d.get('versions',[])],
+        reason_code=d.get('reason_code'),duplicate_of=d.get('duplicate_of'),evidence_refs=d.get('evidence_refs')) for d in candidate['decisions']]
+    return digest(dict(decisions=decisions,findings=[{k:i.get(k) for k in ('row_key','detail','paths','kind')} for i in report['issues']]))
+
+
+def _va_patch_contract(candidate, report, decision_schema):
+    from ..shared_runtime import _object,_array,TEXT,digest
+    permitted={};decisions={item['row_key']:item for item in candidate['decisions']}
+    for issue in report['issues']:
+        permitted.setdefault(issue['row_key'],set()).update(issue['paths'])
+    allowed=[]
+    for key,paths in permitted.items():
+        affected={int(path.split('.')[1]) for issue in report['issues'] if issue['row_key']==key
+            and not issue['detail'].startswith('Definition intervals must cover') for path in issue['paths'] if path.startswith('versions.')}
+        structural=any(any(word in path for word in ('effective_','entity_','period_kinds')) for path in paths)
+        frozen=[digest(v) for i,v in enumerate(decisions.get(key,{}).get('versions',[])) if i not in affected] if structural else []
+        if structural and decisions.get(key,{}).get('action')=='map':
+            paths={path for path in paths if not path.startswith('versions.') or int(path.split('.')[1]) in affected}
+            paths.add('versions.append')
+            paths.update('versions.'+str(i) for i in affected)
+        allowed.append(dict(row_key=key,expected_digest=digest(decisions[key]) if key in decisions else None,
+            paths=sorted(paths),frozen_version_digests=frozen))
+    version_schema=decision_schema['anyOf'][0]['properties']['versions']['items']
+    values=[decision_schema,{'type':'string'},{'type':'null'},{'type':'integer','enum':[-1,1]},
+            version_schema,_array(version_schema),_array(_object(source_id=TEXT,unit_id=TEXT)),_array(TEXT)]
+    # Binding and membership are checked below in Python, once; do not expand a
+    # full copy of the schema for every failed row or citation in a large archive.
+    schema=_object(changes=_array(_object(row_key=TEXT,expected_digest={'type':['string','null']},
+        path=TEXT,value={'anyOf':values})))
+    return dict(schema=schema,permitted_changes=allowed,
+                repair_instruction='Use versions.append for missing intervals and versions.<index> only for a failed version. Do not copy, rewrite or remove valid versions. ',
+                candidate_schema=_object(decisions=_array(decision_schema),gaps=_array(TEXT)))
+
+
+def _va_apply_patch(candidate, patch, contract):
+    from ..shared_runtime import digest
+    original={item['row_key']:item for item in candidate['decisions']}
+    revised=copy.deepcopy(original);allowed={item['row_key']:item for item in contract['permitted_changes']};seen=set()
+    if not patch['changes']:raise ValueError('Empty patch leaves unresolved mapping work')
+    for change in patch['changes']:
+        key=change['row_key'];path=change['path'];rule=allowed.get(key)
+        if rule is None or path not in rule['paths']:raise ValueError('Patch changed a frozen row or field: '+key+' '+path)
+        if change['expected_digest']!=rule['expected_digest']:raise ValueError('Patch candidate digest differs from its saved decision')
+        if any(k==key and (path==old or '$' in (path,old) or path.startswith(old+'.') or old.startswith(path+'.')) for k,old in seen):
+            raise ValueError('Duplicate or overlapping patch paths')
+        seen.add((key,path))
+        if path=='$':
+            if change['value'].get('row_key')!=key:raise ValueError('Replacement decision changed row identity')
+            versions={digest(v) for v in change['value'].get('versions',[])}
+            if not set(rule.get('frozen_version_digests',[]))<=versions:
+                raise ValueError('Version-set repair changed an unaffected validated version')
+            revised[key]=copy.deepcopy(change['value'])
+        elif path=='versions.append':
+            if not isinstance(change['value'],list) or not change['value']:raise ValueError('Append repair requires new reporting versions')
+            revised[key]['versions'].extend(copy.deepcopy(change['value']))
+        else:
+            target=revised[key];parts=path.split('.')
+            for part in parts[:-1]:target=target[int(part)] if isinstance(target,list) else target[part]
+            if isinstance(target,list):
+                position=int(parts[-1])
+                if position<0 or position>=len(target):raise ValueError('Patch version index is outside the candidate')
+                target[position]=copy.deepcopy(change['value'])
+            else:
+                if parts[-1] not in target:raise ValueError('Patch cannot add an unsupported field')
+                target[parts[-1]]=copy.deepcopy(change['value'])
+    result=dict(candidate,decisions=list(revised.values()))
+    from ..shared_runtime import validate_shape
+    validate_shape(result,contract['candidate_schema'])
+    return result
+
+
+def _va_required_rows(rows):
+    """Coverage signals only; these labels never assign a company financial mapping."""
+    import re
+    core={'sales','group sales','net sales','revenue','net revenue','total revenue','turnover',
+          'cash','group cash','cash and cash equivalents','total assets','total liabilities','total equity',
+          'operating profit','operating income','net income','net profit',
+          'cash flow from operating activities','net cash from operating activities',
+          'net cash provided by operating activities','net cash generated from operating activities'}
+    return {row['row_key'] for row in rows if re.sub(r'[^a-z0-9]+',' ',row['label'].casefold()).strip() in core}
+
+
+def _va_canonical_decision(item, data):
+    """Derive identifiers from AI-selected roles/entities, without interpreting labels."""
+    item=copy.deepcopy(item)
+    kinds={v['entity_id']:v['entity_kind'] for v in data['model_configuration'].get('va_reporting_context',{}).get('entity_versions',[])}
+    kinds.update({s['id']:'current_segment' for s in data['segments']});kinds.update(group='group',corporate='corporate')
+    for version in item.get('versions',[]):
+        entity=version['entity_id']
+        if entity in kinds:version['entity_kind']=kinds[entity]
+        role=version.get('financial_role')
+        if role is not None:version['row_id']=role if entity in ('group','corporate') else entity+'_'+role
+    return item
+
+
+def _va_coverage_roles(row):
+    """Alternative coverage candidates only; names never assign financial meaning."""
+    import re
+    name=re.sub(r'[^a-z0-9]+',' ',row['label'].casefold()).strip()
+    for names,roles in (
+        ({'sales','group sales','net sales','revenue','net revenue','total revenue','turnover'},{'sales','total_revenue'}),
+        ({'cash','group cash','cash and cash equivalents'},{'cash'}),
+        ({'total assets'},{'total_assets'}),({'total liabilities'},{'total_liabilities'}),({'total equity'},{'total_equity'}),
+        ({'operating profit','operating income'},{'operating_profit'}),
+        ({'net income','net profit'},{'total_profit','parent_profit'}),
+        ({'cash flow from operating activities','net cash from operating activities','net cash provided by operating activities',
+          'net cash generated from operating activities'},{'cfo'})):
+        if name in names:return roles
+    return set()
+
+
+def _va_assess(candidate, rows, all_rows, data, store, catalog, periods, contract, evidence, prior_facts=()):
+    from ..shared_runtime import digest
+    from .evidence import va_unit_options,va_cell_multiplier
+    from .model_contract import _HISTORICAL_ROW_METADATA,_SEGMENT_ROW_METADATA
+    by_key={row['row_key']:row for row in rows};all_by_key={row['row_key']:row for row in all_rows}
+    pmap={period['id']:period for period in periods};required=_va_required_rows(rows)
+    decisions={};issues=[];facts=[];valid=[];diagnostics=[];duplicates=set()
+    def problem(key,detail,paths,**extra):issues.append(dict(row_key=key,detail=detail,paths=paths,**extra))
+    for item in candidate['decisions']:
+        key=item['row_key']
+        if key not in by_key:raise ValueError('Unknown decision row_key: '+key)
+        if key in decisions:duplicates.add(key)
+        decisions[key]=_va_canonical_decision(item,data)
+    for key,row in by_key.items():
+        item=decisions.get(key);before=len(issues);row_facts=[]
+        if item is None:
+            problem(key,'Assigned row has no decision: '+row['label'],['$']);continue
+        if key in duplicates:
+            problem(key,'Assigned row has duplicate decisions; return one complete definition',['$']);continue
+        ref=dict(source_id=row['source_id'],unit_id=row['unit_id'])
+        if item['action']!='map':
+            import re
+            reason=item['reason'].strip()
+            if item['action']=='pending' or (key in required and item.get('reason_code')!='duplicate') or not reason or re.search(
+                r'not assessed|not reviewed|not processed|no mappings returned|not mapped|response.{0,20}(limit|schema)|schema.{0,20}(permit|enum)|no supported.{0,20}(role|segment)',reason,re.I):
+                problem(key,'Row requires a substantive mapping or evidenced disposition: '+row['label']+'; '+reason,['$'],
+                    kind='financial_evidence' if item['action']=='pending' and reason and not re.search(
+                        r'not assessed|not reviewed|not processed|no mappings returned|not mapped|schema|response.{0,20}limit',reason,re.I) else 'mapping',
+                    evidence_refs=item.get('evidence_refs',[]));continue
+            if ref not in item['evidence_refs']:
+                problem(key,'Exclusion requires the exact supplied row citation',['$']);continue
+            if item['reason_code']=='duplicate':
+                other=all_by_key.get(item['duplicate_of'])
+                if (not other or other['row_key']==key or other['label']!=row['label'] or other['reported_unit']!=row['reported_unit']
+                        or other['source_id']!=row['source_id']):
+                    problem(key,'Duplicate exclusion requires an identical labelled, dimensioned retained row',['$']);continue
+                if dict(source_id=other['source_id'],unit_id=other['unit_id']) not in item['evidence_refs']:
+                    problem(key,'Duplicate equivalence must cite both source rows',['$']);continue
+                lhs={(c['period_id'],c['source_raw']) for c in row['cells']};rhs={(c['period_id'],c['source_raw']) for c in other['cells']}
+                if not lhs<=rhs:
+                    problem(key,'Duplicate row does not preserve all original periods and values',['$']);continue
+            else:
+                dimensions=va_unit_options(row['reported_unit'],data['currency'])
+                if item.get('duplicate_of') is not None or not dimensions or any(o['measure']!='ratio' for o in dimensions):
+                    problem(key,'Reported financial amounts must be retained; diagnostic exclusions require an evidenced ratio and no duplicate target',['$']);continue
+            valid.append(item);continue
+        if not item['versions']:
+            problem(key,'Mapped row requires a financial definition',['$']);continue
+        occupied=set()
+        for vi,version in enumerate(item['versions']):
+            prefix='versions.'+str(vi)+'.';entries=[]
+            start=version['effective_from'];end=version['effective_to'];bounded=start is not None or end is not None or bool(version.get('period_kinds'))
+            try:
+                if start:date.fromisoformat(start)
+                if end:date.fromisoformat(end)
+                if start and end and start>end:raise ValueError('reversed definition interval')
+                allowed={(u['source_id'],u['unit_id']) for u in evidence}
+                if bounded and (not version['version_refs'] or any((r['source_id'],r['unit_id']) not in allowed for r in version['version_refs'])):
+                    raise ValueError('Definition intervals need supplied source citations')
+            except ValueError as exc:
+                problem(key,str(exc),[prefix+'effective_from',prefix+'effective_to',prefix+'version_refs']);continue
+            kinds=version.get('period_kinds',[])
+            selected=[cell for cell in row['cells'] if (not start or pmap[cell['period_id']]['end']>=start)
+                and (not end or pmap[cell['period_id']]['end']<=end) and (not kinds or pmap[cell['period_id']]['kind'] in kinds)]
+            if not selected or any(c['period_id'] in occupied for c in selected):
+                problem(key,'Definition intervals are empty or overlapping',[prefix+'effective_from',prefix+'effective_to']);continue
+            occupied.update(c['period_id'] for c in selected)
+            if not version['classification_basis'].strip() or not version['definition_id'].strip() or not version['basis'].strip():
+                problem(key,'Financial definition and period basis require explicit explanations',
+                    [prefix+'classification_basis',prefix+'definition_id',prefix+'basis']);continue
+            import re
+            role=version.get('financial_role');kind=version['entity_kind'];entity=version['entity_id']
+            if not version['row_id'] or re.match(r'^row_\d+(?:_|$)',version['row_id']):
+                problem(key,'Source row_key cannot be a financial model identity. Choose financial_role and its canonical row_id, or a distinct sourced concept ID.',
+                    [prefix+'row_id',prefix+'financial_role']);continue
+            if role is not None:
+                expected=role if kind in ('group','corporate') else entity+'_'+role
+                permitted=(role in contract['roles']['group_roles'] if kind=='group' else
+                    role in contract['roles']['corporate_roles'] if kind=='corporate' else
+                    '_'+role in contract['roles']['segment_role_suffixes'])
+                if not permitted or version['row_id']!=expected:
+                    problem(key,'Financial role/entity binding requires row_id='+expected+' for the declared entity; preserve distinct accounting concepts.',
+                        [prefix+'row_id',prefix+'financial_role',prefix+'entity_id',prefix+'entity_kind']);continue
+            elif version['row_id'] in (contract['roles']['group_roles']+contract['roles']['corporate_roles']+
+                    [s['id']+suffix for s in data['segments'] for suffix in contract['roles']['segment_role_suffixes']]):
+                problem(key,'Canonical model rows require an explicit typed financial_role',[prefix+'financial_role']);continue
+            temporal=({item[0]:item[3] for item in _HISTORICAL_ROW_METADATA} if kind in ('group','corporate')
+                else {item[0]:item[3] for item in _SEGMENT_ROW_METADATA}).get(version['row_id'] if kind in ('group','corporate') else role)
+            if temporal and version['metric_type']!=temporal:
+                problem(key,'Typed financial role requires metric_type='+temporal+'; verify the financial meaning against the source.',
+                    [prefix+'financial_role',prefix+'metric_type',prefix+'period_basis'],kind='financial_evidence');continue
+            period_basis=version.get('period_basis','unresolved')
+            coherent=(version['basis_status']=='period_defined')==(period_basis!='unresolved')
+            coherent=coherent and not (version['basis_status']=='period_defined' and re.match(r'^\s*unresolved\s*:',version['basis'],re.I))
+            coherent=coherent and (period_basis=='unresolved' or period_basis=={'stock':'closing','weighted_average':'weighted_average'}.get(version['metric_type'],'source_period'))
+            if not coherent:
+                problem(key,'Period basis, status and explanation must agree; provenance uncertainty is separate from fiscal interval meaning.',
+                    [prefix+field for field in ('basis','basis_status','period_basis','definition_status','classification_basis','version_refs')]);continue
+            essential_annual=key in required and any(pmap[c['period_id']]['kind']=='FY' and pmap[c['period_id']]['fiscal_year'] in data['history_years'] for c in selected)
+            if essential_annual and role is not None and (version['definition_status']!='source_defined' or version['basis_status']!='period_defined'):
+                problem(key,'Essential financial concept needs a clear sourced definition and period basis; preserve genuine uncertainty',
+                    [prefix+field for field in ('row_id','financial_role','definition_status','basis_status','basis','period_basis','period_kinds','classification_basis','version_refs')],
+                    kind='financial_evidence',evidence_refs=version['version_refs']);continue
+            options=va_unit_options(row['reported_unit'],data['currency'])
+            option=next((o for o in options if o['measure']==version['measure']),None)
+            if option is None:
+                problem(key,'Measure must match evidenced source dimensions '+repr(row['reported_unit']),[prefix+'measure']);continue
+            current={s['id'] for s in data['segments']}
+            if (kind=='group' and entity!='group' or kind=='corporate' and entity!='corporate'
+                or version['row_id'] in contract['roles']['group_roles'] and (kind!='group' or entity!='group')
+                or kind=='current_segment' and entity not in current
+                or kind in ('legacy_segment','supplementary') and entity in current|{'group','corporate'}):
+                problem(key,'Entity kind and identity are incompatible',[prefix+'entity_id',prefix+'entity_kind']);continue
+            declared=data['model_configuration'].get('va_reporting_context',{}).get('entity_versions',[])
+            versions=[v for v in declared if v['entity_id']==entity]
+            if versions and any(not any(v['entity_kind']==kind and (not v['effective_from'] or pmap[c['period_id']]['end']>=v['effective_from'])
+                    and (not v['effective_to'] or pmap[c['period_id']]['end']<=v['effective_to']) for v in versions) for c in selected):
+                problem(key,'Entity version is outside its cited reporting dates; split versions without relabelling old history.',
+                    [prefix+field for field in ('entity_id','entity_kind','effective_from','effective_to','period_kinds','version_refs')]);continue
+            for cell in selected:
+                base={k:copy.deepcopy(version[k]) for k in ('row_id','label','entity_id','metric_type','basis','definition_id','scope','restatement','restatement_vintage','classification_basis')}
+                base.update(unit=option['unit'],period_id=cell['period_id'],rounding_increment=0,
+                    classification_source_refs=[ref],terms=[dict(reference=dict(cell['reference'],number_format='dot_decimal'),
+                    source_raw=cell['source_raw'],multiplier=va_cell_multiplier(option,cell),weight=version['polarity'])])
+                entries.append(base)
+            try:
+                version_facts=_materialize_financial_observations(dict(observations=entries),store=store,catalog=catalog,
+                    periods=periods,currency=data['currency'],roles=contract['roles'],segments=data['segments'],
+                    evidence=evidence,requested_period_ids=set(pmap))
+                for fact in version_facts:
+                    defined=version['definition_status']=='source_defined' and version['basis_status']=='period_defined'
+                    fact.update(definition_status=version['definition_status'],basis_status=version['basis_status'],
+                        statement_section=version.get('statement_section'),
+                        financial_role=role,entity_kind=kind,period_basis=period_basis,
+                        source_arithmetic_checked=True,publication_vintage_status='known' if fact.get('published_at') else 'unknown',
+                        historical_display_eligible=defined and version['restatement']!='vendor_normalized',
+                        eligible=fact.get('eligible',False) and defined,
+                        calibration_eligible=fact.get('eligible',False) and defined,cross_basis_comparable=False)
+                    if role is None and version['basis_status']=='period_defined' and version['restatement']!='vendor_normalized':
+                        fact.update(native_history_display=True,eligible=False,calibration_eligible=False,
+                            native_history_note='VA label retained; common financial definition is not asserted.')
+                row_facts.extend(version_facts)
+            except (ValueError,KeyError,TypeError) as exc:
+                failures=getattr(exc,'invalid_entries',[])
+                diagnostics.append(dict(row_key=key,version_index=vi,invalid_entries=failures,error=str(exc)))
+                fields=set().union(*(set(f.get('allowed_fields',[])) for f in failures)) if failures else {'row_id','entity_id','metric_type','basis','restatement','classification_basis'}
+                if 'entity_id' in fields:fields.add('entity_kind')
+                paths=[prefix+field for field in fields if field in version]
+                messages=list(dict.fromkeys(message for failure in failures for message in failure.get('errors',[])))
+                # Group cell-level findings by mapping field. Full originals and
+                # exact failed entries are retained in the journal audit below.
+                normalized=[]
+                import re
+                for message in messages:
+                    text=re.sub(r'\b\d{4}-(?:FY|H1|H2|Q[1-4]|9M)\b','[period]',message)
+                    if text not in normalized:normalized.append(text)
+                detail='; '.join(normalized) or str(exc)
+                if not paths:
+                    problem(key,detail,[]);issues[-1]['kind']='source_parser'
+                else:problem(key,detail,paths)
+        if occupied!={cell['period_id'] for cell in row['cells']}:
+            problem(key,'Definition intervals must cover every eligible source period; missing '+', '.join(sorted({c['period_id'] for c in row['cells']}-occupied)),
+                [f'versions.{i}.{field}' for i in range(len(item['versions'])) for field in ('effective_from','effective_to','period_kinds','version_refs')])
+        if len(issues)==before:
+            facts.extend(row_facts);valid.append(item)
+    for fact in facts:
+        fact.update(source_provider='visible_alpha',source_dataset='company_reported',independent_source_status='not_independently_verified',
+            point_in_time_eligible=False,direct_company_disclosure_verified=False)
+        cadence=data['model_configuration'].get('full_statement_frequency')
+        permitted={'annual':{'FY'},'half_year':{'H1','H2','FY'}}.get(cadence)
+        sales=fact['row_id']=='sales' or fact['row_id'].endswith(('_sales','_pricing','_rig','_organic'))
+        if permitted and fact['kind'] not in permitted and not sales:
+            fact.update(eligible=False,model_selection_eligible=False,calibration_eligible=False,historical_display_eligible=False,
+                reason='VA cell retained for audit; unsupported full-statement cadence.')
+    quarantined=[]
+    for key,row in by_key.items():
+        findings=[i for i in issues if i['row_key']==key];roles=_va_coverage_roles(row)
+        if not roles or not findings or any(i.get('kind')!='financial_evidence' for i in findings):continue
+        if any(v.get('restatement')=='restated' for v in decisions[key].get('versions',[])):continue
+        periods_needed={c['period_id'] for c in row['cells']}
+        alternatives=[f for f in list(prior_facts)+facts if f.get('entity_id')=='group' and f['row_id'] in roles
+            and f.get('definition_status')=='source_defined' and f.get('basis_status')=='period_defined'
+            and f.get('source_arithmetic_checked') and (f.get('eligible') or f.get('historical_display_eligible'))]
+        if not periods_needed<={f['period_id'] for f in alternatives}:continue
+        # Keep the unresolved series and all its cells in audit, outside financial selection.
+        quarantined.append(dict(row_key=key,label=row['label'],status='unresolved_alternate',model_selection_eligible=False,
+            reason='; '.join(i['detail'] for i in findings),source_ref=dict(source_id=row['source_id'],unit_id=row['unit_id']),
+            cells=copy.deepcopy(row['cells']),supported_alternative_ids=sorted({f['id'] for f in alternatives})))
+        issues=[i for i in issues if i['row_key']!=key];valid.append(decisions[key])
+    return dict(issues=issues,facts=facts,validated_decisions=valid,diagnostics=diagnostics,quarantined_rows=quarantined,
+                addressed_rows=len(decisions),target_rows=len(rows),candidate_digest=digest(candidate))
+
+
+def _va_progress(journal, data, facts, decisions, issues, complete=False):
+    """Persist source-checked work; this does not claim financial review acceptance."""
+    from .model_contract import select_revised_observations
+    snapshot=copy.deepcopy(data);snapshot['observations']=select_revised_observations(facts)
+    snapshot['historical']={};snapshot['active_basis_by_period']={}
+    _bind_mapped_history(snapshot,snapshot['observations'])
+    snapshot['model_configuration']['va_mapping_progress']=dict(complete=complete,issues=issues,
+        validated_rows=len(decisions),observations=len(facts),financial_review='not_completed')
+    journal.artifact('va_mapping_progress.json',dict(company_inputs=snapshot,decisions=decisions,
+        issues=issues,complete=complete,source_policy=VA_SOURCE_POLICY))
+    return snapshot
+
+
+def _va_incomplete_output(journal, data, error):
+    """Export only source-checked checkpoint facts after a failed continuation."""
+    if getattr(journal,'_va_draft_attempted',False):return None
+    journal._va_draft_attempted=True
+    path=journal.directory/'va_mapping_progress.json'
+    if path.is_file():
+        progress=json.loads(path.read_text(encoding='utf-8'));snapshot=progress['company_inputs']
+    else:snapshot=copy.deepcopy(data)
+    snapshot['model_configuration']['historical_incomplete_reason']=str(error)
+    journal.artifact('company_model_inputs_progress.json',snapshot)
+    output=save_historical_output(journal,snapshot,incomplete=True)
+    if journal.progress:journal.progress('INCOMPLETE historical workbook: '+str(output))
+    return output
+
+
+def _va_cohorts(rows, maximum=24):
+    """Keep native labelled entities together and pack small groups efficiently."""
+    groups={}
+    for row in rows:groups.setdefault((row['source_id'],row['label'].partition(' - ')[2]),[]).append(row)
+    cohorts=[];pending=[]
+    for group in groups.values():
+        for offset in range(0,len(group),maximum):
+            chunk=group[offset:offset+maximum]
+            if pending and len(pending)+len(chunk)>maximum:cohorts.append(pending);pending=[]
+            pending.extend(chunk)
+    if pending:cohorts.append(pending)
+    return cohorts
+
+
+def _va_resolve_evidence(journal, data, rows, report, supporting, headers):
+    """One focused evidence interpretation, bounded across the build; never numeric edits."""
+    from ..shared_runtime import _object,_array,TEXT,digest
+    questions=[i for i in report['issues'] if i.get('kind') in ('financial_evidence','semantic_review')
+        or 'Entity version is outside' in i['detail']]
+    if not questions or not supporting:return None
+    questions=[dict(q,finding_id='finding_'+str(i)) for i,q in enumerate(questions,1)]
+    queried={q['row_key'] for q in questions};rows=[r for r in rows if r['row_key'] in queried]
+    context=data['model_configuration'].get('va_reporting_context',{})
+    supporting=_va_semantic_sections(supporting)
+    headers=_va_semantic_sections(headers)
+    key=digest(dict(rows=[r['row_key'] for r in rows],questions=questions))
+    resolutions=journal.state.setdefault('va_evidence_resolutions',{})
+    if key not in resolutions and len(resolutions)>=3:
+        return dict(status='resolution_limit_reached',detail='Three targeted evidence tasks already retained; uncertainty must remain visible.')
+    resolutions[key]=dict(status='requested');journal.save()
+    refs={(u['source_id'],u['unit_id']) for u in supporting+headers}|{(r['source_ref']['source_id'],r['source_ref']['unit_id']) for r in rows}
+    citation=_object(source_id=TEXT,unit_id=TEXT)
+    schema=_object(conclusions=_array(_object(row_key={'type':'string','enum':[r['row_key'] for r in rows]},
+        finding_id={'type':'string','enum':[q['finding_id'] for q in questions]},
+        status={'type':'string','enum':['supported','unresolved']},detail=TEXT,source_refs=_array(citation))),summary=TEXT)
+    revise_scope=bool(context.get('entity_versions')) and any('effective' in path for q in questions for path in q['paths'])
+    if revise_scope:
+        schema['properties']['reporting_context']={'anyOf':[_va_reporting_schema(),{'type':'null'}]}
+        schema['required'].append('reporting_context')
+    def validate(answer):
+        if len({c['finding_id'] for c in answer['conclusions']})!=len(answer['conclusions']):
+            raise ValueError('Evidence resolution must not return conflicting duplicate conclusions')
+        expected={q['finding_id']:q['row_key'] for q in questions}
+        if {c['finding_id'] for c in answer['conclusions']}!=set(expected):raise ValueError('Resolve each exact finding once; do not assess other rows')
+        for conclusion in answer['conclusions']:
+            invalid=[r for r in conclusion['source_refs'] if (r['source_id'],r['unit_id']) not in refs]
+            if expected[conclusion['finding_id']]!=conclusion['row_key'] or invalid or not conclusion['source_refs'] or not conclusion['detail'].strip():
+                raise ValueError('Invalid evidence for '+conclusion['finding_id']+' '+conclusion['row_key']+': '+json.dumps(invalid)+
+                    '; cite the supplied citation_manifest and explain the exact unresolved question')
+        if not {q['row_key'] for q in questions}<={c['row_key'] for c in answer['conclusions']}:
+            raise ValueError('Evidence resolution omitted an unresolved row')
+        revised=answer.get('reporting_context')
+        if revised is not None:
+            units={}
+            for unit in supporting+headers:units.setdefault(unit['source_id'],{})[unit['unit_id']]=unit
+            _va_validate_reporting_context(revised,units,data['segments'])
+            before={(v['entity_id'],v['entity_kind']) for v in context['entity_versions']}
+            after={(v['entity_id'],v['entity_kind']) for v in revised['entity_versions']}
+            if not before<=after:raise ValueError('Reporting-context correction must preserve established entity identities')
+            if not {frozenset(h['entity_ids']) for h in context['hierarchies']}<={frozenset(h['entity_ids']) for h in revised['hierarchies']}:
+                raise ValueError('Reporting-context correction must retain both historical and current hierarchy compositions')
+        return answer
+    answer=journal.stage('company_va_evidence_resolution',
+        'Resolve only these specific financial interpretation questions using the newly supplied original sections and complete period headers. '
+        'Distinguish fiscal interval meaning, accounting definition, original/restated provenance and publication vintage. '
+        'Describe dated current/legacy reporting identities; never invent a numerical bridge or rewrite older history. '
+        'A supported conclusion needs a citation and explanation. If evidence cannot resolve it, say unresolved. '
+        'Answer each finding_id once. Supporting a fiscal interval alone does not resolve an entity-definition or historical-comparability finding. '
+        'VA already supplies the restated numbers. Use originals for definitions and comparative dates only; do not extract restated tables or require a numerical bridge. '
+        'When reporting_context is requested, return null or a cited correction to financial applicability, preserving entity IDs and both hierarchy compositions. '
+        'Do not return numeric values or a generic pass verdict.',
+        dict(company=data['company'],questions=questions,rows=rows,headers=headers,original_sections=supporting,
+            citation_manifest=[dict(source_id=sid,unit_id=uid) for sid,uid in sorted(refs)],
+            reporting_context=data['model_configuration'].get('va_reporting_context',{})),schema,validate)
+    resolutions[key]=dict(status='completed',conclusions=answer);journal.save()
+    revised=answer.get('reporting_context')
+    if revised is not None:
+        journal.artifact('va_reporting_context_revision.json',dict(before=copy.deepcopy(context),after=revised,numerical_source='company_reported_va'))
+        context.clear();context.update(copy.deepcopy(revised))
+    return dict(conclusions=answer)
+
+
+def _va_semantic_sections(units):
+    """Full original text for interpretation; numeric indexes remain in the source store."""
+    return [{key:u[key] for key in ('source_id','unit_id','text','warnings','notes','sheet') if key in u} for u in units]
+
+
+def _va_history_inputs(journal, data, store, catalog, source_ids, periods, contract, *, supporting_evidence=(),load_evidence=None):
+    """Map definitions; Python owns dimensions, period expansion and patch merges."""
+    from ..shared_runtime import digest
+    from .evidence import va_unit_options
+    rows=store.company_reported_rows(source_ids,periods,as_of=data['model_configuration']['as_of'])
+    if not rows:raise ValueError('No eligible company-reported VA historical cells')
+    data['model_configuration']['va_source_rows']=copy.deepcopy(rows)
+    journal.artifact('va_import.json',dict(rows=rows,numerical_source='company_reported_va',status='source_imported_before_mapping'))
+    pmap={p['id']:p for p in periods};actual={c['period_id'] for r in rows for c in r['cells']}
+    newest=lambda ids:max(ids,key=lambda pid:(pmap[pid]['end'],pmap[pid]['kind']=='FY',pid))
+    annual={pid for pid in actual if pmap[pid]['kind']=='FY'}
+    anchor=dict(policy='latest_reported_actual_first',as_of=data['model_configuration']['as_of'],latest_actual_period_id=newest(actual),
+        latest_annual_period_id=newest(annual) if annual else None,current_segment_ids=[s['id'] for s in data['segments']],
+        reporting_basis=data['forecast_basis'],workbook_period_order='chronological',
+        historical_treatment='Retain dated legacy definitions and cited financial applicability; read all revised/restated numbers from VA cells.')
+    data['model_configuration']['historical_anchor']=anchor
+    data['model_configuration']['va_mapping_contract']=VA_MAPPING_CONTRACT
+    data['model_configuration']['historical_display_policy']='provisional_vendor_v1'
+    data['sources'].update({sid:catalog[sid] for sid in store._units if sid in catalog})
+    evidence=store.read_documents([dict(source_id=sid,unit_id=next(iter(store._units[sid]))) for sid in source_ids],
+        historical_years={p['fiscal_year'] for p in periods})
+    supporting=list(supporting_evidence)
+    context=data['model_configuration'].get('va_reporting_context',{})
+    cited={(r['source_id'],r['unit_id']) for kind in ('declarations','entity_versions','hierarchies')
+        for declaration in context.get(kind,[]) for r in declaration['source_refs']}
+    cited.update((r['source_id'],r['unit_id']) for r in data['model_configuration'].get('va_scope_source_refs',[]))
+    note_ids=set(data['model_configuration'].get('va_reporting_note_source_ids',[]))
+    reporting_evidence=_va_semantic_sections([u for u in supporting if (u['source_id'],u['unit_id']) in cited or u['source_id'] in note_ids])
+    evidence.extend(u for u in supporting if (u['source_id'],u['unit_id']) not in {(v['source_id'],v['unit_id']) for v in evidence})
+    header_refs={(c['period_metadata']['header_ref']['source_id'],c['period_metadata']['header_ref']['unit_id']) for r in rows for c in r['cells']}
+    headers=_va_semantic_sections([dict(store._units[sid][uid],source_id=sid,unit_id=uid) for sid,uid in sorted(header_refs)])
+    def compact_period(cell):return {k:v for k,v in cell['period_metadata'].items() if k not in ('header_ref','caveat')}
+    unique_periods={digest(compact_period(c)):compact_period(c) for r in rows for c in r['cells']}
+    period_keys={key:'period_'+str(index) for index,key in enumerate(sorted(unique_periods),1)}
+    period_catalogue={period_keys[key]:value for key,value in unique_periods.items()}
+    declarations=[]
+    for row in rows:
+        declarations.append(dict(row_key=row['row_key'],label=row['label'],reported_unit=row['reported_unit'],context=row['context'],
+            source_ref=dict(source_id=row['source_id'],unit_id=row['unit_id']),unit_options=va_unit_options(row['reported_unit'],data['currency']),
+            dataset_role=row['dataset_role'],source_row_role=row['source_row_role'],navigation_note=row['navigation_note'],
+            source_period_keys=[period_keys[digest(compact_period(c))] for c in row['cells']],
+            source_header_refs=list({(c['period_metadata']['header_ref']['source_id'],c['period_metadata']['header_ref']['unit_id']):c['period_metadata']['header_ref'] for c in row['cells']}.values()),
+            available_period_count=len(row['cells']),latest_period_id=row['cells'][0]['period_id'],oldest_period_id=row['cells'][-1]['period_id'],
+            representation_examples=[dict(period_id=c['period_id'],source_raw=c['source_raw'],display_format=c['display_format']) for c in row['cells'][:2]]))
+    # Group native row sections and labelled entities, then bound response work.
+    # This is source-format navigation; no company identity list or equations.
+    cohorts=_va_cohorts(rows)
+    by_key={r['row_key']:r for r in declarations};facts=[];decisions=[];last=[];unresolved=[]
+    try:
+        for index,cohort in enumerate(cohorts):
+            if getattr(journal,'progress',None):
+                journal.progress(f'VA mapping cohort {index+1}/{len(cohorts)}: {len(cohort)} target rows; '+
+                    f'{len(decisions)}/{len(rows)} rows completed. Latest-first semantic mapping; Python expands source periods.')
+            keys=[r['row_key'] for r in cohort]
+            measures=sorted({o['measure'] for r in cohort for o in va_unit_options(r['reported_unit'],data['currency'])}) or ['unsupported']
+            schema,decision_schema=_va_schema(keys,measures,[r['row_key'] for r in rows])
+            payload=dict(company=data['company'],currency=data['currency'],fiscal_calendar=data['fiscal_calendar'],historical_anchor=anchor,
+                company_scope=dict(segments=data['segments'],reporting_basis=data['forecast_basis']),engine_contract=contract,
+                reporting_context=context,reporting_evidence=reporting_evidence,
+                period_catalogue=period_catalogue,
+                target_rows=[by_key[k] for k in keys],context_catalogue=[dict(row_key=r['row_key'],label=r['label'],reported_unit=r['reported_unit']) for r in rows],
+                task_scope='Return one decision for each target_rows entry only. context_catalogue is read-only comparison context, not assigned work.',
+                cohort_index=index,mapping_contract=VA_MAPPING_CONTRACT)
+            needed={key for r in payload['target_rows'] for key in r['source_period_keys']}
+            payload['period_catalogue']={key:period_catalogue[key] for key in needed}
+            def assess(answer):
+                return _va_assess(answer,cohort,rows,data,store,catalog,periods,contract,evidence,prior_facts=facts)
+            def checkpoint(answer,report):
+                nonlocal last,last_report
+                last_report=report
+                last=report['issues']
+                old={q['row_key']:q for q in data['model_configuration'].get('va_unresolved_series',[]) if q['row_key'] not in keys}
+                old.update({q['row_key']:q for q in report.get('quarantined_rows',[])})
+                data['model_configuration']['va_unresolved_series']=list(old.values())
+                _va_progress(journal,data,facts+report['facts'],decisions+report['validated_decisions'],last)
+            def resolve(report):
+                if load_evidence and any(i.get('kind')=='financial_evidence' or 'Entity version is outside' in i['detail'] for i in report['issues']):
+                    extra=load_evidence(report['issues'])
+                    present={(u['source_id'],u['unit_id']) for u in supporting}
+                    supporting.extend(u for u in extra if (u['source_id'],u['unit_id']) not in present)
+                    evidence.extend(u for u in extra if (u['source_id'],u['unit_id']) not in {(v['source_id'],v['unit_id']) for v in evidence})
+                result=_va_resolve_evidence(journal,data,payload['target_rows'],report,supporting,headers)
+                refs={(r['source_id'],r['unit_id']) for kind in ('declarations','entity_versions','hierarchies')
+                    for item in context.get(kind,[]) for r in item['source_refs']}
+                present={(u['source_id'],u['unit_id']) for u in reporting_evidence}
+                reporting_evidence.extend(_va_semantic_sections([u for u in supporting if (u['source_id'],u['unit_id']) in refs-present]))
+                return result
+            last_report=None
+            try:answer=journal.patch_stage('company_va_row_mapping',
+                'Map the financial meaning of every TARGET row; the CONTEXT catalogue is not a task list. Start with the latest eligible actuals, then work backwards. '
+                'Return one map/exclude/pending decision per target row. Python reads exact cells, normalizes units/percentages and expands ALL available periods. '
+                'row_key identifies a source row only. financial_role is a typed economic role, not the source key. '
+                'For an engine role return row_id=null; Python derives the canonical ID from financial_role and entity_id. '
+                'Additional distinct source concepts use financial_role=null and meaningful stable row_id values, never row_<number>. '
+                'Preserve company-native labels and meanings. If accounting attribution cannot be established, retain a distinct native row with financial_role=null and definition_status=unresolved; do not force a statutory/adjusted or Group/parent role. '
+                'Do not enumerate periods, amounts, multipliers, cell coordinates or unit spellings. Choose measure from supplied unit_options. '
+                'For a stable definition use one version with null effective dates. Split only for a source-evidenced definition change with dated intervals and version_refs. '
+                'Retain original/adjusted/restated definitions and separate legacy entities. Canonical group rows require group entity; segment rows keep their entity prefix. '
+                'When regions/business definitions change, preserve current and legacy entities as distinct sourced identities, including overlapping comparative periods. '
+                'When only numbers are revised, retain the SAME row_id/entity_id/definition_id, label the newer observation restated and cite its vintage; do not create a new segment. '
+                'Financial applicability can precede an operational reorganisation date when published comparatives are restated. '
+                'Extra historical or supplementary concepts may use distinct supported row IDs; lacking a forecast role is not grounds to discard reported history. '
+                'Assess definition_status and basis_status independently of original/restated status and publication vintage. '
+                'source_period_keys resolve into the shared period_catalogue of Python-verified header labels, fiscal dates and series, not independent financial verification. '
+                'period_basis=source_period follows the evidenced column interval for flows/ratios; closing applies to stocks and weighted_average to weighted shares. '
+                'Use unresolved only for actual measurement uncertainty, not missing original/restated provenance. Flags and basis text must agree. '
+                'period_kinds=[] covers all available kinds; when only interims are genuinely uncertain, separate those kinds from supported FY observations. '
+                'Use the cited reporting_context and reporting_evidence for dated entity versions, preserving historical hierarchies. '
+                'Analytics is a navigation control on these company-reported metric rows, not proof that a base metric is a vendor calculation. '
+                'Use source_defined only for a clear cited financial concept, and period_defined only for its evidenced measurement basis at each period; otherwise unresolved. '
+                'Unknown original/restated classification stays unknown and excluded from calibration; clear reported facts may be displayed provisionally. '
+                'Do not label a company-reported dataset vendor_normalized merely because VA delivered it. Never invent a vintage or reporting bridge. '
+                'Exclusions need exact source-row citations and specific evidence. duplicate_of is an exact physical row_key from context_catalogue, never a financial/model ID. Not assessed is pending, not an exclusion. '
+                'Duplicate exclusions must cite BOTH original row units and establish the same entity, definition and period basis; equal amounts alone do not establish equivalence. '
+                'Restated numbers already exist in VA. Use PDFs for definition and comparative applicability only; do not extract PDF tables or require a numerical bridge where a restated presentation is explicitly established. '
+                'Current-segment historical compatibility requires evidence. Vendor actuals are not independent primary verification or point-in-time evidence.',
+                payload,schema,assess=assess,patch_contract=lambda candidate,report:_va_patch_contract(candidate,report,decision_schema),
+                apply_patch=_va_apply_patch,checkpoint=checkpoint,semantic_fingerprint=_va_semantic_fingerprint,
+                resolve_context=resolve)
+            except ValueError:
+                if not last_report or not last_report['issues'] or any(i.get('kind') in ('source_parser','source_integrity','implementation') for i in last_report['issues']):raise
+                unresolved.extend(last_report['issues'])
+                facts.extend(last_report['facts']);decisions.extend(last_report['validated_decisions'])
+                journal.artifact(f'va_cohort_{index}_incomplete.json',dict(issues=last_report['issues'],retained_observations=len(last_report['facts'])))
+                if journal.progress:journal.progress('Retained supported cohort rows; continuing other history with '+str(len(last_report['issues']))+' unresolved findings.')
+                continue
+            report=assess(answer)
+            facts.extend(report['facts']);decisions.extend(report['validated_decisions'])
+            data['model_configuration'].setdefault('limitations',[]).extend(answer['gaps'])
+            journal.artifact(f'va_cohort_{index}_validated.json',dict(input_fingerprint=digest(payload),candidate=answer,facts=report['facts']))
+        retained={d['row_key']:d for d in decisions}
+        for item in decisions:
+            if item['action']=='exclude' and item['reason_code']=='duplicate' and retained.get(item['duplicate_of'],{}).get('action')!='map':
+                raise ValueError('Duplicate exclusion does not ultimately retain an equivalent mapped row: '+item['row_key'])
+        gaps=_va_coverage_gaps(data,facts,periods)
+        data['model_configuration']['historical_mapping_issues']=unresolved
+        data['model_configuration']['historical_coverage_gaps']=gaps
+        data['model_configuration']['va_mapping_plan']=decisions
+        data['model_configuration']['native_revenue_rows']=sorted({f['row_id'] for f in facts if f['entity_id']=='group'
+            and f.get('definition_status')=='source_defined' and bool(_va_coverage_roles(dict(label=f.get('label','')))&{'sales','total_revenue'})})
+        seen={}
+        for fact in facts:
+            identity=tuple(fact[k] for k in ('row_id','period_id','basis','entity_id','restatement','restatement_vintage'))
+            if identity in seen and seen[identity]!=fact['value']:raise ValueError('Conflicting duplicate VA model binding: '+str(identity))
+            seen[identity]=fact['value']
+        from .model_contract import select_revised_observations
+        data['observations']=select_revised_observations(data['observations']+facts);_bind_mapped_history(data,data['observations'])
+        data['historical_source_review']=dict(status='vendor_history_not_independently_verified',source_policy=VA_SOURCE_POLICY,
+            source_ids=list(source_ids),detail='Exact company-reported VA cells checked; independent primary reconstruction was not performed.')
+        journal.artifact('va_history_bindings.json',dict(source_policy=VA_SOURCE_POLICY,historical_anchor=anchor,rows=rows,
+            decisions=decisions,observation_count=len(facts),mapping_contract=VA_MAPPING_CONTRACT))
+        journal.artifact('va_unresolved_series.json',data['model_configuration'].get('va_unresolved_series',[]))
+        journal.artifact('historical_source_review.json',data['historical_source_review'])
+        _va_progress(journal,data,facts,decisions,unresolved+gaps,complete=not(unresolved or gaps))
+        return evidence
+    except Exception as exc:
+        if not (journal.directory/'va_mapping_progress.json').is_file():
+            _va_progress(journal,data,facts,decisions,last or [dict(detail=str(exc))])
+        try:_va_incomplete_output(journal,data,exc)
+        except Exception as export_error:exc.add_note('Incomplete workbook export failed: '+str(export_error))
+        raise
+
+
+def _review_va_history(journal, data, evidence):
+    """Challenge vendor history without mislabelling it independent verification."""
+    from ..shared_runtime import _object, _array, _enum, TEXT, digest
+    from .model_contract import historical_model
+    refs = {(unit['source_id'],unit['unit_id']) for unit in evidence}
+    citation = _object(source_id=TEXT, unit_id=TEXT)
+    schema = _object(checks=_array(_object(topic=_enum(_HISTORY_GATE_TOPICS),
+        status=_enum(('pass','warning','error')), detail=TEXT, source_refs=_array(citation))), summary=TEXT)
+    def validate(answer):
+        if len(answer['checks'])!=len(_HISTORY_GATE_TOPICS) or {c['topic'] for c in answer['checks']}!=set(_HISTORY_GATE_TOPICS):
+            raise ValueError('VA history review must address every combined-history topic once')
+        for check in answer['checks']:
+            if not check['detail'].strip() or not check['source_refs'] or any((r['source_id'],r['unit_id']) not in refs for r in check['source_refs']):
+                raise ValueError('VA history review requires supplied source citations')
+        return answer
+    answer = journal.stage('company_va_history_review',
+        'Challenge the combined company-reported VA history, all requested years and interims. '
+        'Check period coverage, stable financial definitions, current/legacy segments, original/restated versions, '
+        'source vintage and reporting bridges. Unsupported material relabelling, omitted periods, incompatible bases or '
+        'invented bridges are errors. Use the spreadsheet source and supplied local supporting documents. '
+        'A VA cell is not independent company-original verification. Record that and unknown publication vintage as warnings; '
+        'Clearly defined company-reported facts may display provisionally despite unknown original/restated provenance. '
+        'Keep that distinct from unresolved financial definitions or period bases, cross-basis comparability and calibration eligibility. '
+        'Inspect quarantined_series: these retain source values outside active financial selection. A warning is sufficient only if a correctly defined sourced alternative covers the essential concept and periods; material missing or conflicting definitions remain errors. '
+        'do not claim either was verified. Do not require online release discovery or re-extraction of every figure from PDFs. '
+        'Do not waive a concrete financial ambiguity merely because the input is VA.',
+        dict(company=data['company'], history=_history_review_matrix(data['observations']),
+             arithmetic_checks=historical_model(data)['derivation_checks'],mapping_plan=data['model_configuration'].get('va_mapping_plan',[]),
+             reporting_changes=data.get('reporting_changes',[]),
+             reporting_bridges=data.get('reporting_bridges',[]), evidence=_va_semantic_sections(evidence),
+             reporting_context=data['model_configuration'].get('va_reporting_context',{}),
+             unresolved_mapping=data['model_configuration'].get('historical_mapping_issues',[]),
+             missing_essential_coverage=data['model_configuration'].get('historical_coverage_gaps',[]),
+             quarantined_series=data['model_configuration'].get('va_unresolved_series',[]),
+             source_review=data.get('historical_source_review',{})), schema, validate)
+    checks = [dict(item, issue_type='none', period_ids=[]) for item in answer['checks']]
+    for item in checks:
+        if item['topic']=='source_vintage':
+            item['status']='warning'; item['detail']+=' Vendor export is not independent verification or proof of historical availability.'
+    errors=[c for c in checks if c['status']=='error']
+    essential=data['model_configuration'].get('historical_coverage_gaps',[])
+    data['combined_history_review'] = dict(status='incomplete' if errors or essential else 'passed', gate_version=_HISTORY_GATE_VERSION,
+        input_fingerprint=combined_history_fingerprint(data), context_fingerprint=digest(evidence),
+        checks=checks, financial_adjudications=[], summary=answer['summary'],
+        source_policy=VA_SOURCE_POLICY, independent_primary_verification=False)
+    journal.artifact('combined_history_review.json', data['combined_history_review'])
+    return data['combined_history_review']
+
+
 
 
 
@@ -929,7 +1718,8 @@ def restore_discovery_obligations(previous, records, archive, as_of, historical_
     from company_initiation.historic_construction.periods import build_periods
     if not previous:return dict(obligations=[],audit=[])
     if not previous.get('_reuse_verified'):raise ValueError('Discovery obligations require a verified selected parent run')
-    archive=Path(archive).resolve();cutoff=date.fromisoformat(as_of)
+    root=Path(previous['directory']).resolve().parent.parent
+    archive=resolve_data_path(root,archive);cutoff=date.fromisoformat(as_of)
     company=company_key(previous.get('configuration',{}).get('company','unknown'))
     years=set(historical_years);years.add(max(years)+1)
     periods={(period['fiscal_year'],period['kind']):period for period in build_periods(sorted(years),fiscal_calendar)}
@@ -942,7 +1732,7 @@ def restore_discovery_obligations(previous, records, archive, as_of, historical_
         if Path(record['directory']).resolve().parent!=Path(previous['directory']).resolve().parent:
             raise ValueError('Prior discovery lineage leaves the recorded outputs directory')
         if (company_key(record.get('configuration',{}).get('company','unknown'))==company
-            and Path(record.get('configuration',{}).get('sources','')).resolve()==archive):lineage.append(record)
+            and resolve_data_path(root,record.get('configuration',{}).get('sources',''))==archive):lineage.append(record)
         record=by_directory.get(str(Path(record['parent_run']).resolve())) if record.get('parent_run') else None
     obligations=[];audit=[];parsed={}
     def artifact(record,name):
@@ -1066,7 +1856,7 @@ def restore_discovery_checkpoint(previous, records, archive, inventory, index_ur
         return urlunsplit(('https' if part.scheme.lower()=='http' else part.scheme.lower(),part.netloc.lower(),
             '' if part.path in ('','/') else part.path,part.query,''))
     if not previous:return None
-    archive=Path(archive).resolve();outputs=Path(previous['directory']).resolve().parent
+    outputs=Path(previous['directory']).resolve().parent;archive=resolve_data_path(outputs.parent,archive)
     by_directory={str(Path(record['directory']).resolve()):record for record in records}
     by_directory[str(Path(previous['directory']).resolve())]=previous
     verified=set()
@@ -1109,7 +1899,7 @@ def restore_discovery_checkpoint(previous, records, archive, inventory, index_ur
             raise ValueError('Discovery continuation does not reference a preserved ancestor')
         parent=by_directory[target];config=parent.get('configuration',{})
         if (company_key(config.get('company','unknown'))!=company_key(company)
-            or Path(config.get('sources','')).resolve()!=archive or config.get('as_of')!=as_of
+            or resolve_data_path(outputs.parent,config.get('sources',''))!=archive or config.get('as_of')!=as_of
             or continuation.get('checked_as_of')!=as_of
             or config.get('provider',{})!=owner.get('configuration',{}).get('provider',{})):
             raise ValueError('Discovery continuation ancestor has incompatible company/archive/as-of/provider scope')
@@ -1138,7 +1928,7 @@ def restore_discovery_checkpoint(previous, records, archive, inventory, index_ur
         seen.add(location);config=record.get('configuration',{});candidate=record
         record=by_directory.get(str(Path(record['parent_run']).resolve())) if record.get('parent_run') else None
         if (company_key(config.get('company','unknown'))!=company_key(company)
-            or Path(config.get('sources','')).resolve()!=archive or config.get('as_of')!=as_of):continue
+            or resolve_data_path(outputs.parent,config.get('sources',''))!=archive or config.get('as_of')!=as_of):continue
         names=candidate.get('artifacts',{})
         name=next((name for name in ('source_freshness.json','source_freshness_partial.json') if name in names),None)
         if not name or 'official_downloaded_originals.json' not in names:continue
@@ -2183,7 +2973,8 @@ def _validate_financial_extraction(entry, resolved_terms, concepts=None):
                 '. Correct the original number_index; headings, years and subtotals cannot replace the intended fact.')
         if not all(math.isfinite(float(term[key])) for key in ('multiplier','weight')):
             errors.append('Financial scaling and contribution weights must be finite for term '+str(term_index))
-        is_percent=str(token['raw']).strip().endswith('%') or '%' in str(token.get('display_format',''))
+        from .evidence import excel_fraction_percent
+        is_percent=str(token['raw']).strip().endswith('%') or excel_fraction_percent(token.get('display_format'))
         if entry['unit']=='ratio' and is_percent and term['multiplier']!=1:
             errors.append('Percentage token already resolves to a decimal ratio for '+entry['row_id']+
                 '; use multiplier 1, not a second percent conversion. Keep sign in the source or contribution weight.')
@@ -2245,12 +3036,23 @@ def _validate_reconstruction_revision(facts, disputed, prior_candidates=None):
 
 def _bind_mapped_history(data, facts):
     """Bind eligible annual facts; all observations stay in the evidence archive."""
-    for observation in facts:
+    from .model_contract import select_revised_observations
+    for observation in select_revised_observations(facts):
+        if not observation.get('model_selection_eligible',True):
+            if observation.get('kind')=='FY':
+                history=data.get('historical',{}).get(observation['row_id'],{});year=str(observation['fiscal_year'])
+                if history.get('observation_ids',{}).get(year)==observation['id']:
+                    for field in ('values','sources','basis','observation_ids'):
+                        if isinstance(history.get(field),dict):history[field].pop(year,None)
+            continue
         if not observation.get('eligible',True) or observation.get('restatement') in ('unknown','vendor_normalized'):
             data['model_configuration'].setdefault('limitations',[]).append('Excluded from model calibration: '+observation['row_id']+' '+observation['period_id']+' has '+observation.get('restatement','ineligible')+' reporting classification.')
             continue
         group=observation['entity_id']=='group'
-        data.setdefault('active_basis_by_period',{}).setdefault(observation['period_id'],{})['group' if group else 'segments']=observation['basis']
+        active=data.setdefault('active_basis_by_period',{}).setdefault(observation['period_id'],{})
+        active[observation['entity_id']]=observation['basis']
+        if group:active['group']=observation['basis']
+        elif observation['entity_id'] in {s['id'] for s in data['segments']}:active['segments']=observation['basis']
         if observation['kind']=='FY':
             year=str(observation['fiscal_year'])
             role=data['historical'].setdefault(observation['row_id'],dict(values={},sources={},basis={}))
@@ -2258,7 +3060,7 @@ def _bind_mapped_history(data, facts):
             role.setdefault('observation_ids',{})[year]=observation['id']
 
 
-_HISTORY_GATE_VERSION='combined_history_v17'
+_HISTORY_GATE_VERSION='combined_history_v20'
 _HISTORY_GATE_TOPICS=('period_and_cadence_coverage','reporting_bases','segment_lineage','restatement_versions','source_vintage','cross_year_bridges')
 _HISTORY_SOURCE_VINTAGE_FIELDS=('id','sha256','category','published_at','publication_date','publication_evidence','role','declared_role',
     'coverage_kind','reporting_year','reporting_period_evidence','reporting_period_refs','publication_availability',
@@ -2270,7 +3072,8 @@ def _history_review_matrix(observations, *, complete_records=False):
     fields=('row_id','unit','currency','metric_type','entity_id','model_entity_id','basis','definition_id','definition','scope',
         'restatement','restatement_vintage','eligible','status','published_at','compatibility_key','current_basis_compatible',
         'calibration_eligible','model_selection_eligible','cross_basis_comparable','usage_role',
-        'classification_basis','classification_source_refs','source_vintage','source_ids')
+        'classification_basis','classification_source_refs','source_vintage','source_ids',
+        'definition_status','basis_status','financial_role','period_basis','superseded_by','historical_display_eligible','publication_vintage_status','source_arithmetic_checked')
     period_fields=('period_id','start','end','fiscal_year','kind')
     if complete_records:
         saved_fields={field for observation in observations for field in observation}-set(period_fields)-{'id','value'}
@@ -2631,6 +3434,21 @@ def prepare_history_review_context(journal, data, frozen, *, previous=None):
     from ..shared_runtime import _object,_array,_enum,TEXT,digest
     from company_initiation.historic_construction.evidence import _units
     from ..shared_artifacts import integrated_runtime_fingerprint
+    if data.get('model_configuration',{}).get('historical_source_policy')==VA_SOURCE_POLICY:
+        from .evidence import SourceStore
+        store=SourceStore(journal.directory/'sources')
+        for source in frozen:
+            path=Path(source['path']).resolve()
+            if not path.is_relative_to(journal.directory.resolve()):
+                raise ValueError('VA history review source is outside its frozen run')
+            raw=path.read_bytes()
+            if hashlib.sha256(raw).hexdigest()!=source['sha256']:
+                raise ValueError('Frozen VA history review source changed')
+            units,metadata=store._index(raw,source['format'],source['id'],source.get('category'),source.get('dataset_role'))
+            store._units[source['id']]=units;store.sources.append(dict(source,**metadata))
+        evidence=store.read_documents([dict(source_id=s['id'],unit_id=next(iter(store._units[s['id']])))
+            for s in store.sources],historical_years=set(data['history_years'])|{max(data['history_years'])+1})
+        return dict(original_units=evidence)
     sources={source['id']:source for source in frozen if source.get('category')=='financial_reports'}
     if not sources:raise ValueError('Combined-history review requires primary company originals')
     catalog=[]
@@ -2737,7 +3555,8 @@ def prepare_history_review_context(journal, data, frozen, *, previous=None):
 def combined_history_fingerprint(data):
     """Bind source-backed history and its interpretation, not forecast scenarios."""
     from ..shared_runtime import digest,RunJournal,saved_output_limit_matches,response_output_limit
-    from company_initiation.historic_construction.evidence import SourceStore, _vendor_reference_period
+    from company_initiation.historic_construction.evidence import SourceStore, _vendor_reference_period,va_unit_options,va_cell_multiplier,excel_fraction_percent
+    from .model_contract import provisional_history_fact,historical_model,select_revised_observations,_historical_reporting_blocks
     import inspect
     fields=('company','currency','history_years','fiscal_calendar','periods','historical','schedule_controls',
             'observations','segments','corporate','entity_versions','historical_segments','interims',
@@ -2750,7 +3569,11 @@ def combined_history_fingerprint(data):
         'actual_through','current_reporting_basis','forecast_frequency','full_statement_frequency',
         'statement_forecast_frequency','primary_sales_frequency','historical_allocations',
         'functional_expense_structure','preferred_observation_ids','revenue_models',
-        'cash_scope','operating_expense_functions','structural_account_policies')}
+        'cash_scope','operating_expense_functions','structural_account_policies','historical_source_policy',
+        'historical_display_policy','va_mapping_contract','va_reporting_context',
+        'va_unresolved_series','va_scope_source_refs','va_reporting_note_source_ids',
+        'as_of','historical_workflow','historical_layout','historical_coverage_gaps','historical_mapping_issues','va_mapping_plan','native_revenue_rows')}
+    payload['native_import_sha256']=digest(configuration.get('va_source_rows',[]))
     if 'cashflow_presentation' in configuration:payload['historical_policy']['cashflow_presentation']=copy.deepcopy(configuration['cashflow_presentation'])
     sources=data.get('sources',{});sources=sources.values() if isinstance(sources,dict) else sources
     payload['sources']=sorted(({key:source.get(key) for key in _HISTORY_SOURCE_VINTAGE_FIELDS
@@ -2759,7 +3582,13 @@ def combined_history_fingerprint(data):
     payload['gate_implementation']=digest({helper.__name__:inspect.getsource(helper) for helper in (
         RunJournal.ask,RunJournal.review_stage,saved_output_limit_matches,response_output_limit,_combined_history_challenge,_combined_history_challenge_once,_repair_historical_versions,
         _merge_historical_version_revision,_history_revision_equivalence,_materialize_financial_observations,
-        SourceStore.validate_historical_reference,_vendor_reference_period,
+        SourceStore.validate_historical_reference,SourceStore.company_reported_rows,_vendor_reference_period,
+        _va_history_inputs,_review_va_history,_va_schema,_va_assess,_va_apply_patch,_va_patch_contract,_va_required_rows,
+        _va_cohorts,_va_numeric_preflight,va_unit_options,va_cell_multiplier,excel_fraction_percent,RunJournal.patch_stage,
+        _va_reporting_schema,_va_validate_reporting_context,_va_reporting_entities,_va_coverage_gaps,
+        _va_semantic_fingerprint,_va_resolve_evidence,_va_semantic_sections,_va_date_schema,_va_canonical_decision,_va_coverage_roles,
+        _va_scope_view,_va_local_context,_research_va_history,
+        _identity_source_selection,provisional_history_fact,historical_model,select_revised_observations,_historical_reporting_blocks,
         _financial_mapping_schema,_validate_financial_extraction,_validate_financial_role,_FinancialRoleIdentityError,
         _financial_fact_families,_reconstruction_comparison,_source_rounding_bound,
         _observation_classification,_financial_source_classification,_history_review_matrix,_history_version_inventory,
@@ -3514,6 +4343,10 @@ def _repair_historical_versions(journal, data, original_units, gap, *, catalog, 
 
 def _combined_history_challenge(journal, data, original_units, *, source_catalog=None, source_loader=None, coverage=None, resume_version_route=None):
     """Bounded source-supported version revisions, each followed by a new gate."""
+    if data.get('model_configuration',{}).get('historical_source_policy') == VA_SOURCE_POLICY:
+        if _history_financial_obligations(data):
+            raise ValueError('Retained financial findings require explicit resolution before VA history review')
+        return _review_va_history(journal, data, original_units)
     configuration=getattr(journal,'configuration',{})
     limit=min(3,max(0,configuration.get('limits',{}).get('repairs',2)))
     coverage=copy.deepcopy(coverage)
@@ -4197,7 +5030,7 @@ def restore_positive_disclosure_coverage(previous, records, archive, catalog, as
     from company_initiation.historic_construction.periods import build_periods
     if not previous:return dict(obligations=[],audit=[])
     if not previous.get('_reuse_verified'):raise ValueError('Positive coverage restoration requires a verified parent')
-    archive=Path(archive).resolve();outputs=Path(previous['directory']).resolve().parent
+    outputs=Path(previous['directory']).resolve().parent;archive=resolve_data_path(outputs.parent,archive)
     identity=company_key(previous.get('configuration',{}).get('company','unknown'))
     lookup={str(Path(record['directory']).resolve()):record for record in records}
     periods={item['id']:item for item in build_periods(sorted(set(years)|{max(years)+1}),fiscal_calendar)}
@@ -4219,7 +5052,7 @@ def restore_positive_disclosure_coverage(previous, records, archive, catalog, as
         if location in seen or Path(location).parent!=outputs:raise ValueError('Invalid positive coverage research lineage')
         seen.add(location);configuration=record.get('configuration',{})
         compatible=(company_key(configuration.get('company','unknown'))==identity
-            and Path(configuration.get('sources','')).resolve()==archive and configuration.get('as_of')==as_of)
+            and resolve_data_path(outputs.parent,configuration.get('sources',''))==archive and configuration.get('as_of')==as_of)
         names=[name for name in record.get('artifacts',{}) if name.startswith('disclosure_coverage_')
             and name.removeprefix('disclosure_coverage_').removesuffix('.json').isdigit() and name.endswith('.json')]
         if compatible and names:
@@ -4344,38 +5177,179 @@ def _company_year_sources(journal,company,year,as_of,catalog,*,discovery_obligat
     return result
 
 
-def research_company_inputs(root, company, archive, *, as_of, historical_years=10, years=None, provider=None, progress=None,
-                            budget_usd=20, historical_vintage=False, fresh=False):
+def _va_scope_view(store, source_ids, as_of):
+    """Native labels, legends and actual availability; no bulk numeric tables."""
+    import re
+    metadata=[];rows=[];periods=set();annual=set()
+    for source in store.sources:
+        if source['id'] not in source_ids:continue
+        years={c['year'] for h in source['vendor_profile']['header_sets'].values() for c in h['columns'].values()
+            if c['eligible'] and c['year']<=date.fromisoformat(as_of).year}
+        headings=[]
+        for unit in store._vendor_history(source,years):
+            info=unit['vendor_row'];ref=dict(source_id=source['id'],unit_id=unit['unit_id'])
+            if info['role']=='metadata':metadata.append(dict(source_ref=ref,text=unit['text']));continue
+            if info['role']=='heading':headings.append(info['label']);continue
+            if info['role']!='metric' or not unit['numbers']:continue
+            columns=source['vendor_profile']['header_sets'][info['header_id']]['columns']
+            available={(columns[re.sub(r'\d+$','',n['locator'])]['year'],columns[re.sub(r'\d+$','',n['locator'])]['slot']) for n in unit['numbers']}
+            periods.update(available);annual.update(y for y,k in available if k=='FY')
+            rows.append(dict(source_ref=ref,label=info['label'],unit=info['unit'],headings=headings[-2:],
+                first_year=min(y for y,k in available),last_year=max(y for y,k in available),period_kinds=sorted({k for y,k in available})))
+    return dict(metadata=metadata,native_rows=rows,actual_period_labels=sorted(periods),annual_years=sorted(annual))
+
+
+def _va_local_context(journal, company, catalog, documents, questions, *, source_ids=()):
+    """Retrieve complete local sections for a concrete question, never an archive sweep."""
+    from ..shared_runtime import _object,_array,TEXT
+    local={sid:s for sid,s in catalog.items() if s.get('category')=='financial_reports' and s.get('format') in ('pdf','html','txt')}
+    if not local:return []
+    if not source_ids:
+        def validate(answer):
+            if set(answer['source_ids'])-local.keys():raise ValueError('Select exact local original IDs for this question')
+            return answer
+        answer=journal.stage('company_history_sources',
+            'Select only local originals needed to answer these exact historical definition/calendar questions. '
+            'Use the latest applicable statement or reporting-change note. VA owns all numerical history. '
+            'Do not gather numerical restatement appendices, forecast drivers or a historical PDF archive.',
+            dict(company=company,questions=questions,catalog=[{k:s[k] for k in ('id','title','local_path','published_at') if k in s} for s in local.values()]),
+            _object(source_ids=_array(TEXT),reason=TEXT),validate)
+        source_ids=answer['source_ids']
+    if set(source_ids)-local.keys():raise ValueError('Requested historical context must name eligible local originals')
+    originals=documents(source_ids)
+    return construction_evidence(journal,originals,'Answer only these historical questions: '+json.dumps(questions,ensure_ascii=False)+
+        '. Retain the complete relevant statement/table and its explanatory note, including attribution rows. '
+        'The resulting figures will not be extracted as historical model inputs; VA remains their numerical source.')
+
+
+def _research_va_history(journal, company, as_of, store, catalog, source_ids, documents, requested_years, historical_years, start_year, historical_vintage, contract):
+    """VA import -> native company mapping -> one historical review -> checkpoint."""
+    from ..shared_runtime import _object,_array,TEXT,digest
+    from .periods import build_periods,requested_history_years
+    view=_va_scope_view(store,source_ids,as_of);context=[]
+    if not view['annual_years']:raise ValueError('VA has no eligible annual observations')
+    citation=_object(source_id=TEXT,unit_id=TEXT)
+    schema=_object(currency={'type':['string','null']},fiscal_year_end={'type':['string','null']},
+        full_statement_frequency={'type':['string','null'],'enum':['annual','half_year','quarterly',None]},
+        reporting_basis=TEXT,segments=_array(_object(id=TEXT,label=TEXT)),corporate_label=TEXT,
+        historical_reporting_context=_va_reporting_schema(),source_refs=_array(citation),
+        questions=_array(TEXT),source_ids=_array(TEXT))
+    available={(u['source_id'],u['unit_id']) for sid in source_ids for u in store.read_documents([dict(source_id=sid,unit_id=next(iter(store._units[sid])))],historical_years=set(view['annual_years']))}
+    def validate(answer):
+        if answer['currency'] is not None and (len(answer['currency'])!=3 or not answer['currency'].isupper()):raise ValueError('Reporting currency needs its ISO code')
+        if answer['fiscal_year_end'] is not None:date.fromisoformat('2000-'+answer['fiscal_year_end'])
+        if not answer['source_refs']:raise ValueError('Historical scope requires supplied source citations')
+        segment_ids=[segment['id'] for segment in answer['segments']]
+        if len(segment_ids)!=len(set(segment_ids)) or any(not segment_id.strip() for segment_id in segment_ids):raise ValueError('Historical segment IDs must be nonempty and unique')
+        valid=available|{(u['source_id'],u['unit_id']) for u in context}
+        if any((r['source_id'],r['unit_id']) not in valid for r in answer['source_refs']):raise ValueError('Historical scope must cite supplied evidence')
+        units={}
+        for sid,uid in valid:units.setdefault(sid,{})[uid]=True
+        _va_validate_reporting_context(answer['historical_reporting_context'],units,answer['segments'])
+        return answer
+    for attempt in range(3):
+        scope=journal.stage('company_va_scope',
+            'Establish historical company structure from the supplied company-reported VA metadata and native rows. '
+            'Identify reporting currency, actual fiscal year-end MM-DD, full-statement disclosure cadence and current consolidating segments; keep other dimensions supplementary. '
+            'Do not research forecast frequency, drivers, exposures, spending policies or assumptions. Use only supplied evidence. '
+            'If a calendar/cadence or reporting-change definition needs a local original, leave unknown fields null and request the precise question and optional exact local source IDs. '
+            'Otherwise return empty questions/source_ids. Keep current and legacy labels; restated values already exist in VA. '
+            'Financial applicability includes published comparatives and differs from operational change dates. Unknown entity boundaries stay null; do not invent earlier compositions.',
+            dict(company=company,as_of=as_of,va=view,context=_va_semantic_sections(context),
+                local_catalog=[{k:s[k] for k in ('id','title','local_path') if k in s} for s in catalog.values() if s.get('category')=='financial_reports' and s.get('format') in ('pdf','html','txt')]),schema,validate)
+        missing=[k for k in ('currency','fiscal_year_end','full_statement_frequency') if scope[k] is None]
+        if not missing and not scope['questions']:break
+        if attempt==2:raise ValueError('Historical scope unresolved: '+', '.join(missing+scope['questions']))
+        extra=_va_local_context(journal,company,catalog,documents,scope['questions'] or missing,source_ids=scope['source_ids'])
+        seen={(u['source_id'],u['unit_id']) for u in context};context.extend(u for u in extra if (u['source_id'],u['unit_id']) not in seen)
+        if not extra:raise ValueError('No local evidence resolves required historical calendar/structure')
+    calendar=dict(fiscal_year_end=scope['fiscal_year_end'])
+    eligible=[p['fiscal_year'] for p in build_periods(view['annual_years'],calendar) if p['kind']=='FY' and p['end']<=as_of]
+    if not eligible:raise ValueError('VA has no completed annual history by the information date')
+    years=requested_history_years(max(eligible),years=requested_years,historical_years=historical_years,start_year=start_year,
+        as_of=as_of,fiscal_calendar=calendar)
+    periods=build_periods(years+[max(years)+1],calendar)
+    data=dict(company=company,currency=scope['currency'],fiscal_calendar=calendar,history_years=years,
+        forecast_basis=scope['reporting_basis'],segments=scope['segments'],corporate=dict(label=scope['corporate_label']),
+        historical={},observations=[],sources={s['id']:s for s in store.sources},active_basis_by_period={},
+        reporting_changes=[],reporting_bridges=[],entity_versions=[],driver_map=[],
+        source_freshness=dict(mode='local_company_reported_va',model_as_of=as_of,discovery_performed=False,status='local_archive_only'),
+        model_configuration=dict(as_of=as_of,historical_vintage=historical_vintage,historical_source_policy=VA_SOURCE_POLICY,
+            historical_workflow='native_va_v1',historical_layout='company_native_v1',full_statement_frequency=scope['full_statement_frequency'],
+            va_reporting_context=scope['historical_reporting_context'],va_scope_source_refs=scope['source_refs'],
+            forecast_preparation_status='pending',limitations=['Company-reported VA history; independent primary reconstruction and online freshness were not performed.']))
+    def load(questions):
+        used=journal.state.setdefault('historical_context_questions',[])
+        key=digest(questions)
+        if key in used or len(used)>=3:return []
+        used.append(key);journal.save()
+        extra=_va_local_context(journal,company,catalog,documents,questions)
+        data['sources'].update({s['id']:s for s in store.sources})
+        return extra
+    evidence=_va_history_inputs(journal,data,store,catalog,source_ids,periods,contract,supporting_evidence=context,load_evidence=load)
+    data['sources'].update({s['id']:s for s in store.sources})
+    _review_va_history(journal,data,evidence)
+    if data['combined_history_review']['status']!='passed':
+        findings=[c['detail'] for c in data['combined_history_review']['checks'] if c['status']=='error']
+        findings.extend(str(g) for g in data['model_configuration'].get('historical_coverage_gaps',[]))
+        data['model_configuration']['historical_incomplete_reason']='; '.join(findings) or 'Historical review is incomplete'
+        journal.state['issues'].extend(findings)
+    journal.artifact('company_model_inputs.json',data)
+    complete=combined_history_review_current(data)
+    save_historical_output(journal,data,incomplete=not complete)
+    journal.state['status']='research_complete' if complete else 'incomplete';journal.save()
+    return journal.directory/'company_model_inputs.json'
+
+
+def research_company_inputs(root, company, archive, *, as_of, historical_years=None, years=None, start_year=None, provider=None, progress=None,
+                            budget_usd=20, historical_vintage=False, fresh=False, resume=None):
     """Generate company configuration and source bindings from ordinary originals.
 
-    One annual task reads whole selected documents. Numbers are reconstructed
-    only by Python from exact original tokens; no earlier company model is used.
-    Unsupported financial roles stop construction with a retained coverage gap.
+    Company-reported VA exports supply primary numerical history when supplied:
+    AI maps row definitions and Python reads exact actual cells. Local company
+    documents support definitions and accounting notes. Archives without VA keep
+    the original-company research route. No earlier company's model is required.
     """
     from ..shared_ai import OpenAIProvider
-    from ..shared_budget import BudgetLedger, ledger_path, company_key
+    from ..shared_budget import BudgetLedger, ledger_path, company_key, build_record_paths, record_in_build_scope
     from ..shared_runtime import RunJournal, _object, _array, _enum, TEXT, SELECT, SELECT_PROMPT, digest
     from company_initiation.historic_construction.evidence import inventory_local_sources, SourceStore, parse_number
     from company_initiation.historic_construction.initiation import _initiation_lock, NUMBER_REF
     from .model_contract import historical_model
-    from company_initiation.historic_construction.periods import build_periods
+    from company_initiation.historic_construction.periods import build_periods, requested_history_years, DEFAULT_HISTORY_START_YEAR
     root=Path(root).resolve();archive=Path(archive).resolve();outputs=root/'outputs'
+    if fresh and resume is not None:raise ValueError('Choose either a new run or explicit resume')
     date.fromisoformat(as_of)
     requested_years=sorted(set(years)) if years else None
-    if historical_years<1:raise ValueError('History years must be positive')
+    if years is not None:historical_years=None
+    if start_year is None and historical_years is None and years is None:start_year=DEFAULT_HISTORY_START_YEAR
+    # Validate the requested policy before any provider work; the actual upper
+    # bound comes from company evidence below, not a calendar-year assumption.
+    requested_history_years(9998,years=years,historical_years=historical_years,start_year=start_year)
     provider=provider or OpenAIProvider.from_env(root/'.env');provider.max_output_tokens=32000;provider.timeout=max(provider.timeout,300)
     inventory=inventory_local_sources(archive)
+    va_sources=[source for source in inventory['sources'] if source.get('category')=='visible_alpha']
+    va_ids=[source['id'] for source in va_sources if source.get('dataset_role')!='standardized']
+    va_mode=bool(va_sources)
+    if va_mode and not va_ids:
+        raise ValueError('Company-reported VA data is required; standardized workbooks cannot supply primary history')
     with _initiation_lock(outputs,scope=company_key(company)):
         ledger=BudgetLedger(ledger_path(outputs,company),company,budget_usd)
         ancestors=[]
-        for path in outputs.glob('construct_*/record.json'):
+        for path in build_record_paths(outputs,'construct_*/record.json'):
             record=json.loads(path.read_text(encoding='utf-8'))
-            if company_key(record.get('configuration',{}).get('company','unknown'))==company_key(company):
+            if record_in_build_scope(record) and company_key(record.get('configuration',{}).get('company','unknown'))==company_key(company):
                 ledger.import_record(record);ancestors.append(record)
         previous=max(ancestors,key=lambda r:Path(r['directory']).stat().st_mtime_ns) if ancestors and not fresh else None
+        if resume is not None:
+            selected=Path(resume).resolve()
+            previous=next((item for item in ancestors if Path(item['directory']).resolve()==selected),None)
+            if previous is None:raise ValueError('Explicit resume must select a saved run for this company and budget')
         directory=outputs/('construct_research_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'_'+uuid4().hex[:8]);directory.mkdir()
         configuration=dict(company=company,sources=str(archive),as_of=as_of,mode='company_research_v1',manifest=inventory['manifest_sha256'],
-            provider=provider.metadata(),historical_years=historical_years,limits=dict(usd=budget_usd,calls=None,repairs=2,retries=0,generated_tokens=None))
+            historical_source_policy=VA_SOURCE_POLICY if va_mode else 'company_originals',
+            provider=provider.metadata(),historical_years=historical_years,start_year=start_year,years=requested_years,
+            limits=dict(usd=budget_usd,calls=None,repairs=2,retries=0,generated_tokens=None))
         if previous:
             from ..shared_artifacts import verified_integrated_record
             previous=verified_integrated_record(previous['directory'],outputs)
@@ -4397,40 +5371,54 @@ def research_company_inputs(root, company, archive, *, as_of, historical_years=1
             journal.state['sources']=store.sources;journal.save()
         def documents(ids,years=None,purpose=None):
             add(ids)
-            complete=store.read_documents([dict(source_id=sid,unit_id=next(iter(store._units[sid]))) for sid in ids],historical_years=years)
+            complete=[]
+            for sid in ids:
+                history_years=years
+                if catalog[sid]['category']=='visible_alpha' and history_years is None:
+                    source=next(s for s in store.sources if s['id']==sid)
+                    history_years={column['year'] for header in source.get('vendor_profile',{}).get('header_sets',{}).values()
+                        for column in header['columns'].values() if column['eligible'] and column['year']<=date.fromisoformat(as_of).year}
+                    if not history_years:raise ValueError('VA spreadsheet has no eligible historical columns')
+                complete.extend(store.read_documents([dict(source_id=sid,unit_id=next(iter(store._units[sid])))],historical_years=history_years))
             return construction_evidence(journal,complete,purpose,limitations=research_limitations) if purpose else complete
         try:
             catalog,metadata_reuse=restore_discovered_metadata(inventory,ancestors,outputs)
             catalog,selection_eligibility=research_catalogue_as_of(catalog,as_of)
+            if va_mode:
+                catalog={sid:source for sid,source in catalog.items() if source.get('dataset_role')!='standardized'}
+                va_ids=[sid for sid in va_ids if sid in catalog]
+                if not va_ids:raise ValueError('No company-reported VA export is eligible at the information cutoff')
+                add(va_ids)
+                preflight=_va_numeric_preflight(store,va_ids)
+                journal.artifact('va_numeric_preflight.json',preflight)
+                if preflight['issues']:raise ValueError('VA numeric preflight failed; no AI mapping can repair a source parser defect')
             metadata_reuse['selection_eligibility']=selection_eligibility
             journal.artifact('discovery_metadata_reuse.json',metadata_reuse)
             journal.artifact('research_source_eligibility.json',selection_eligibility)
             if not catalog:raise ValueError('No local originals are eligible at the information cutoff; see research_source_eligibility.json')
-            selection=journal.stage('company_identity_sources',SELECT_PROMPT+' Select the latest annual statements, interim results and reporting-structure disclosures needed to establish identity and the fiscal calendar.',
-                dict(company=company,as_of=as_of,catalog=list(catalog.values())),SELECT)
+            if va_mode:
+                return _research_va_history(journal,company,as_of,store,catalog,va_ids,documents,
+                    requested_years,historical_years,start_year,historical_vintage,engine_contract)
+            identity_prompt=(SELECT_PROMPT+' Select the supplied company-reported VA workbook and, where needed, concise local company disclosures establishing identity, fiscal calendar and reporting definitions. Start with the latest eligible reported actuals and most recent reporting definitions available by as_of, then inspect predecessor structures as needed. Future fiscal-period columns and consensus cannot establish the current model. Do not select standardized VA datasets. Do not plan historical number extraction from PDFs when company-reported VA is supplied.' if va_mode else
+                SELECT_PROMPT+' Select the latest annual statements, interim results and reporting-structure disclosures needed to establish identity and the fiscal calendar.')
+            selection=_identity_source_selection(journal,company,as_of,catalog,identity_prompt)
             if not selection['source_ids']:raise ValueError('No company originals selected')
             identity_originals=documents(selection['source_ids'])
             url_catalog=official_url_catalog(identity_originals,[source for source in store.sources if source['id'] in selection['source_ids']])
             journal.artifact('official_url_catalog.json',url_catalog)
             identity_docs=construction_evidence(journal,identity_originals,
-                'Company reporting scope and driver selection: fiscal calendar, currency, current consolidating segments, separately disclosed revenue growth definitions and causal operating-cost categories. '
-                'Include complete original sections and associated notes supporting every required driver-map category: material revenue; causal operating costs; working capital, capex and depreciation/amortisation; financing and tax; and portfolio events, acquisitions, disposals and reporting reorganisations. '
-                'For each category retain evidence for the affected financial lines, mechanism, reporting frequency, timing/lag, estimation feasibility and materiality. '
-                'Select the necessary statements and notes even where a scope-only summary would omit them; record genuinely absent evidence in gaps. '
-                'Official URL discovery has a separate catalogue from the whole originals. This task selects economic drivers and reporting definitions, not future numerical assumptions or full numerical statement extraction.',limitations=research_limitations)
+                'Historical currency, fiscal calendar, primary reporting hierarchy, historical accounting definitions and reporting changes only. '
+                'Do not gather forecast drivers, exposures, future assumptions or policy configuration.',limitations=research_limitations)
             identity_units={}
             for unit in identity_docs:
                 identity_units.setdefault(unit['source_id'],{})[unit['unit_id']]=unit
             scope_citation=_object(source_id=TEXT,unit_id=TEXT)
             frequency={'type':'string','enum':['annual','half_year','quarterly']}
-            scope_schema=_object(currency={'type':'string','pattern':'^[A-Z]{3}$'},fiscal_year_end={'type':'string','pattern':'^[0-9]{2}-[0-9]{2}$'},latest_completed_year={'type':'integer'},forecast_frequency=frequency,full_statement_frequency=frequency,
+            scope_schema=_object(currency={'type':'string','pattern':'^[A-Z]{3}$'},fiscal_year_end={'type':'string','pattern':'^[0-9]{2}-[0-9]{2}$'},latest_completed_year={'type':'integer'},full_statement_frequency=frequency,
                 reporting_basis=TEXT,segments=_array(_object(id=TEXT,label=TEXT)),corporate_label=TEXT,
                 primary_hierarchy=TEXT,supplementary_dimensions=_array(TEXT),
-                revenue_models=_array(_object(entity_id=TEXT,method=TEXT,definition=TEXT,source_refs=_array(scope_citation))),
-                driver_map=_array(_object(id=TEXT,category=TEXT,entity_id=TEXT,economic_meaning=TEXT,
-                    affected_lines=_array(TEXT),mechanism=TEXT,frequency=TEXT,lag=TEXT,
-                    evidence_and_feasibility=TEXT,materiality=TEXT,status=TEXT,source_refs=_array(scope_citation))),
                 official_indexes=_array(TEXT),source_references=_array(scope_citation),gaps=_array(TEXT))
+            if va_mode:scope_schema['properties']['historical_reporting_context']=_va_reporting_schema();scope_schema['required'].append('historical_reporting_context')
             def validate_scope(answer):
                 import re
                 errors=[]
@@ -4439,14 +5427,20 @@ def research_company_inputs(root, company, archive, *, as_of, historical_years=1
                 else:
                     try:date.fromisoformat('2000-'+answer['fiscal_year_end'])
                     except ValueError:errors.append('fiscal_year_end must be a valid MM-DD date')
-                for field in ('forecast_frequency','full_statement_frequency'):
+                for field in ('full_statement_frequency',):
                     if answer[field] not in ('annual','half_year','quarterly'):errors.append(field+' must be exactly annual, half_year or quarterly')
                 if not answer['segments']:errors.append('At least one current consolidating segment is required')
                 if errors:raise ValueError('; '.join(errors))
                 _validate_driver_references(answer,identity_units)
+                if va_mode:_va_validate_reporting_context(answer['historical_reporting_context'],identity_units,answer['segments'])
                 return answer
-            scope=journal.stage('company_reporting_scope','Establish the company reporting currency, actual fiscal calendar and latest completed fiscal year from the complete company originals. Return currency as exactly its three-letter ISO code (for example GBP); fiscal_year_end as exactly MM-DD (for example 06-30), without prose in either field. Identify current operating segment IDs and labels; preserve reporting reorganisations rather than relabeling old results. Choose one primary consolidation hierarchy supported by segment profit; other overlapping divisions/geographies are supplementary dimensions, never additional consolidating businesses. Forecast frequency must be annual, half_year or quarterly according to useful disclosure coverage; retain full_statement_frequency separately when sales and financial statements differ. Both frequency fields must contain exactly one enum value, without explanation. Select revenue_models per segment: additive_contributions only for disclosed pricing plus activity/mix contributions, or aggregate_organic when only like-for-like/organic growth is quantified; do not invent a price-volume split. Before finalising equations, provide a concise company-specific driver_map covering material revenue, causal operating costs, working capital/capex, financing/tax and portfolio events, with affected lines, mechanism, frequency/lag, evidence, estimation feasibility and materiality. Identify what should be forecast separately from estimating its future value. Prefer a few distinct drivers, a blended input-cost assumption when commodity/labour/energy/logistics detail is unavailable, and independent marketing budgets. Locate the official investor financial results/publications index URLs from the evidence and source metadata. Do not invent facts; unresolved scope belongs in gaps.',
-                dict(company=company,as_of=as_of,evidence=identity_docs,research_limitations=list(research_limitations),source_metadata=[catalog[sid] for sid in selection['source_ids']],
+            scope=journal.stage('company_reporting_scope',
+                'Establish only historical currency, fiscal calendar, latest completed year, reporting cadence, '
+                'native segment hierarchy and reported accounting definitions from these originals. '
+                'Preserve historical reporting versions. Do not research forecast drivers, exposures, future policies or assumptions.',
+                dict(company=company,as_of=as_of,evidence=_va_semantic_sections(identity_docs) if va_mode else identity_docs,
+                    research_limitations=list(research_limitations),source_metadata=[{k:v for k,v in catalog[sid].items()
+                        if k in ('id','title','format','category','published_at','sha256','url','local_path')} for sid in selection['source_ids']] if va_mode else [catalog[sid] for sid in selection['source_ids']],
                     official_url_catalog=url_catalog,official_url_policy='Choose exact cited catalogue URLs. An explicitly derived official origin may seed observed homepage navigation; never guess investor paths.'),scope_schema,validate_scope)
             # Missing detail or an unavailable price/volume split is a research
             # limitation, not a missing company identity. Concrete prerequisites
@@ -4454,20 +5448,22 @@ def research_company_inputs(root, company, archive, *, as_of, historical_years=1
             # publish before constructing the supported model.
             if not scope['segments'] or not scope['currency'] or not scope['fiscal_year_end']:
                 raise ValueError('Company reporting currency, calendar and consolidating segments are required')
-            segment_ids={s['id'] for s in scope['segments']}
-            revenue_models={item['entity_id']:item for item in scope['revenue_models']}
-            if set(revenue_models)!=segment_ids or any(item['method'] not in ('aggregate_organic','additive_contributions') for item in revenue_models.values()):
-                raise ValueError('Each consolidating segment needs its own supported revenue definition')
-            _validate_driver_references(scope,identity_units)
             research_limitations.extend(scope['gaps'])
-            journal.artifact('company_driver_map.json',dict(company=company,as_of=as_of,
-                primary_hierarchy=scope['primary_hierarchy'],supplementary_dimensions=scope['supplementary_dimensions'],
-                revenue_models=revenue_models,drivers=scope['driver_map'],
-                purpose='Construction driver selection, not researched future forecasts. Created before numerical mapping and final equations.'))
-            years=requested_years or list(range(scope['latest_completed_year']-historical_years+1,scope['latest_completed_year']+1))
-            if years[-1]>scope['latest_completed_year']:raise ValueError('Requested completed history includes an incomplete fiscal year')
-            calendar=dict(fiscal_year_end=scope['fiscal_year_end']);periods=build_periods(years+[years[-1]+1],calendar)
-            if historical_vintage:
+            calendar=dict(fiscal_year_end=scope['fiscal_year_end'])
+            years=requested_history_years(scope['latest_completed_year'],years=requested_years,
+                historical_years=historical_years,start_year=start_year,as_of=as_of,fiscal_calendar=calendar)
+            periods=build_periods(years+[years[-1]+1],calendar)
+            if va_mode:
+                from urllib.parse import urlsplit
+                observed_urls={item['url'] for item in url_catalog['entries']}
+                fresh=dict(mode='local_company_reported_va',status='local_archive_only',checked_as_of=None,
+                    model_as_of=as_of,official_indexes=[dict(url=url,status='unvisited_candidate')
+                        for url in scope['official_indexes'] if url in observed_urls
+                        and not urlsplit(url).path.lower().endswith(('.pdf','.xlsx','.xls','.csv'))],
+                    releases=[],discovery_performed=False,
+                    limitations=['Historical values come from the supplied company-reported VA snapshot. Online freshness and independent primary numeric verification were not performed.'])
+                research_limitations.extend(fresh['limitations'])
+            elif historical_vintage:
                 fresh=dict(checked_as_of=as_of,official_indexes=[dict(url=u,mode='historical_vintage') for u in scope['official_indexes']],releases=[])
             else:
                 official_indexes=recover_official_indexes(journal,company,as_of,scope,url_catalog)
@@ -4479,16 +5475,18 @@ def research_company_inputs(root, company, archive, *, as_of, historical_years=1
                     restored_coverage=restored_coverage,checkpoint=checkpoint)
                 catalog.update({s['id']:s for s in discovered})
                 research_limitations.extend(item for item in fresh.get('limitations',[]) if item not in research_limitations)
-            positive_coverage=restore_positive_disclosure_coverage(previous,ancestors,archive,catalog,as_of,years,calendar)
+            positive_coverage=(dict(obligations=[],audit=[]) if va_mode else
+                restore_positive_disclosure_coverage(previous,ancestors,archive,catalog,as_of,years,calendar))
             fresh['coverage_obligations']=_merge_coverage_obligations(fresh.get('coverage_obligations',[]),positive_coverage['obligations'])
             fresh['positive_coverage_restoration']=positive_coverage['audit']
             journal.artifact('source_freshness.json',fresh)
             data=dict(company=company,currency=scope['currency'],history_years=years,forecast_basis=scope['reporting_basis'],
                 fiscal_calendar=calendar,segments=scope['segments'],corporate=dict(label=scope['corporate_label']),historical={},sources={},observations=[],
                 reporting_changes=[],reporting_bridges=[],entity_versions=[],review_evidence={},source_freshness=fresh,
-                driver_map=scope['driver_map'],consolidation_hierarchy=dict(primary=scope['primary_hierarchy'],supplementary=scope['supplementary_dimensions']),
-                model_configuration=dict(as_of=as_of,historical_vintage=historical_vintage,forecast_frequency=scope['forecast_frequency'],
-                    full_statement_frequency=scope['full_statement_frequency'],current_reporting_basis=scope['reporting_basis'],fx_currencies=[],revenue_models=revenue_models,limitations=research_limitations),active_basis_by_period={})
+                driver_map=[],consolidation_hierarchy=dict(primary=scope['primary_hierarchy'],supplementary=scope['supplementary_dimensions']),
+                model_configuration=dict(as_of=as_of,historical_vintage=historical_vintage,
+                    historical_source_policy=VA_SOURCE_POLICY if va_mode else 'company_originals',
+                    full_statement_frequency=scope['full_statement_frequency'],current_reporting_basis=scope['reporting_basis'],fx_currencies=[],limitations=research_limitations),active_basis_by_period={})
             mapping_schema=_financial_mapping_schema()
             # The financial role definitions are project-owned code, supplied as
             # a contract only. No company values, row coordinates or example
@@ -4671,248 +5669,90 @@ def research_company_inputs(root, company, archive, *, as_of, historical_years=1
                 fresh['coverage_dispositions']=_validate_discovery_coverage(fresh,data.get('disclosure_coverage',[]))
                 fresh['coverage_status']='resolved_by_cited_primary_dispositions'
                 journal.artifact('source_freshness.json',fresh)
-            # Interpret company accounting scope separately from numeric extraction.
-            # Bridges refer to independently reconstructed facts, never AI numbers.
-            citation=_object(source_id=TEXT,unit_id=TEXT)
-            fact_key=_object(row_id=TEXT,entity_id=TEXT,period_id=TEXT)
-            fx_weight=_object(currency=TEXT,weight={'type':'number'},rate_currency=TEXT,proxy_reason=TEXT,
-                exposure_status=TEXT,effective_date=TEXT,source_refs=_array(citation),allocation=TEXT,
-                evidence_basis=TEXT,scenario_neutral={'type':'boolean'},label=TEXT)
-            fx_basket=_object(weights=_array(fx_weight),method=TEXT,limitations=TEXT,status=TEXT,
-                effective_date=TEXT,source_refs=_array(citation),proxy_materiality_threshold={'type':'number'})
-            nullable_number={'type':['number','null']}
-            amount_role=_object(row_id=TEXT,amount={'type':'number'})
-            event_estimation=_object(method=TEXT,annual_revenue=nullable_number,revenue_anchor=nullable_number,
-                revenue_share=nullable_number,annual_operating_profit=nullable_number,operating_margin=nullable_number,
-                annual_da=nullable_number,da_intensity=nullable_number,cost_weights=_array(amount_role),
-                closing=_object(consideration=nullable_number,cash_transferred=nullable_number,cash_transferred_in_asset_roles={'type':'boolean'},
-                    assets=_array(amount_role),liabilities=_array(amount_role),retained_investment=nullable_number,
-                    cta_recycling=nullable_number,previous_interest_fair_value=nullable_number,
-                    previous_interest_carrying_value=nullable_number,net_assets_check=nullable_number,
-                    gain_tax_rate=nullable_number,gain_nci_share=nullable_number,held_for_sale_cash=nullable_number))
-            cost_fx=_object(translation=fx_basket,transaction=_object(
-                components=_array(_object(weight={'type':'number'},functional_currency=TEXT,invoice_currency=TEXT,
-                    lag_months={'type':'integer'},hedge_coverage={'type':'number'},hedge_rate=nullable_number,
-                    prior_hedge_coverage={'type':'number'},prior_hedge_rate=nullable_number,
-                    source_refs=_array(citation),status=TEXT)),method=TEXT,source_refs=_array(citation),status=TEXT))
-            financial_contracts=_object(
-                source_rounding_tolerance={'type':'number'},
-                cost_pools=_array(_object(id=TEXT,label=TEXT,destination=TEXT,baseline_role=TEXT,
-                    baseline_amount=nullable_number,baseline_share={'type':'number'},variable_share={'type':'number'},
-                    method=TEXT,effective_activity_sensitivity={'type':'number'},input_cost_includes_transaction_fx={'type':'boolean'},
-                    activity_driver=TEXT,elasticity={'type':'number'},unit_cost_change={'type':'number'},
-                    spending_change={'type':'number'},behaviour=TEXT,currency_basis=TEXT,lag_months={'type':'integer'},
-                    source_refs=_array(citation),effective_date=TEXT,definition=TEXT,status=TEXT,fx=cost_fx)),
-                scope_events=_array(_object(id=TEXT,entity_id=TEXT,type=TEXT,effective_date=TEXT,accounting_date={'type':['string','null']},
-                    operating_wc_excluded_from={'type':['string','null']},status=TEXT,
-                    enabled={'type':'boolean'},accounting_enabled={'type':'boolean'},source_refs=_array(citation),
-                    estimation={'anyOf':[event_estimation,{'type':'null'}]},
-                    annual_revenue=nullable_number,annual_cash_costs=_array(amount_role),annual_da=nullable_number,
-                    annual_da_by_role=_array(amount_role),da_already_in_baseline={'type':'boolean'},
-                    depreciation_stop_date={'type':['string','null']},
-                    entity_scope_fraction=nullable_number,
-                    amount_basis=TEXT,baseline_includes_from={'type':['string','null']},cash_flows=_array(amount_role),
-                    balance_movements=_array(amount_role),gain_loss=nullable_number,limitations=_array(TEXT))),
-                normalisation=_object(**{key:_object(annual_amount={'type':'number'},reason=TEXT,source_refs=_array(citation))
-                    for key in ('net_other_trading','net_other_operating')}),
-                dividends=_object(**{key:_object(annual_amount={'type':'number'},
-                    payment_weights=_array(_object(period_kind=TEXT,weight={'type':'number'})),reason=TEXT,source_refs=_array(citation))
-                    for key in ('parent','nci')}),
-                sbc=_object(annual_amount=nullable_number,allocations=_array(_object(entity_id=TEXT,pool_id=TEXT,weight={'type':'number'})),source_refs=_array(citation)),
-                adjusted_earnings=_object(label=TEXT,adjustments=_array(_object(id=TEXT,label=TEXT,source_row=TEXT,sign={'type':'number'},annual_amount=nullable_number,
-                    tax_rate={'type':'number'},nci_share={'type':'number'},associate_after_tax={'type':'boolean'},source_refs=_array(citation))),
-                    basic_earnings_adjustment={'anyOf':[_object(annual_amount={'type':'number'},method=TEXT,source_refs=_array(citation),
-                        amounts_by_period=_array(_object(period_id=TEXT,amount={'type':'number'})),
-                        historical=_array(_object(period_id=TEXT,amount={'type':'number'},source_refs=_array(citation)))),{'type':'null'}]},
-                    dilution=_object(incremental_shares={'type':'number'},earnings_adjustment={'type':'number'},method=TEXT,source_refs=_array(citation))),
-                financing=_object(repurchase_price=nullable_number,repurchase_elapsed_fraction={'type':'number'},issuance_nominal_price=nullable_number,
-                    historical_closing_shares=_array(_object(period_id=TEXT,value={'type':'number'},source_refs=_array(citation))),
-                    schedule=_array(_object(period_id=TEXT,borrowing={'type':'number'},repayment={'type':'number'},maturities={'type':'number'},refinancing={'type':'number'},
-                        borrowing_elapsed_fraction={'type':'number'},repayment_elapsed_fraction={'type':'number'})),
-                    reason=TEXT,source_refs=_array(citation)),
-                fx_accounting=_object(exposures=_array(_object(id=TEXT,type=TEXT,role=TEXT,currency=TEXT,functional_currency=TEXT,
-                    opening_share={'type':'number'},effective_from=TEXT,status=TEXT,source_refs=_array(citation),method=TEXT,
-                    net_movement_native_by_period=_array(_object(period_id=TEXT,amount={'type':'number'})))),policy=TEXT),limitations=_array(TEXT))
-            structure_schema=_object(
-                structural_account_policies=_array(_object(role=TEXT,treatment=TEXT,included_in=_array(TEXT),definition=TEXT,source_refs=_array(citation))),
-                cashflow_presentation={'anyOf':[_object(components=_array(_object(role=TEXT,label=TEXT,
-                    cashflow_section=_enum(['cfi','cff']),classification=_enum(['ordinary_equity_issuance','noncommon_equity_issuance','noncommon_equity_distribution','investment_movement']),
-                    equity_role={'anyOf':[_enum(['share_capital','reserves','retained_earnings']),{'type':'null'}]},
-                    asset_role={'anyOf':[_enum(['short_investments']),{'type':'null'}]},
-                    forecast_policy=_enum(['existing_issuance_controls','no_new_transaction','hold_latest_annual']),definition=TEXT,source_refs=_array(citation))),
-                    method=TEXT,source_refs=_array(citation),noncommon_equity_claim_role={'type':['string','null']}),{'type':'null'}]},
-                cash_scope={'anyOf':[_object(components=_array(_object(id=TEXT,role=TEXT,coefficient={'type':'number'},
-                    included_in_debt={'type':'boolean'},source_refs=_array(citation),definition=TEXT)),method=TEXT,source_refs=_array(citation)),{'type':'null'}]},
-                operating_expense_functions=_array(_object(id=TEXT,label=TEXT,definition=TEXT,source_refs=_array(citation))),
-                functional_expense_structure=_array(_object(role=TEXT,treatment=TEXT,included_in=_array(TEXT),source_refs=_array(citation))),
-                historical_allocations=_array(_object(row_id=TEXT,year={'type':'integer'},amount={'type':'number'},method=TEXT,status=TEXT,source_refs=_array(citation))),
-                fx_exposures=_array(_object(entity_id=TEXT,revenue_bridge=TEXT,revenue=fx_basket,cost=fx_basket)),
-                financial_contracts=financial_contracts,
-                asset_scope=_array(_object(reported_role=TEXT,owned_role=TEXT,rou_role=TEXT,reported_scope=TEXT,
-                    owned_expression=TEXT,definition=TEXT,source_refs=_array(citation))),
-                entity_versions=_array(_object(id=TEXT,model_entity_id=TEXT,label=TEXT,period_ids=_array(TEXT),
-                    bases=_array(TEXT),scope=TEXT,current_basis_compatible={'type':'boolean'},source_refs=_array(citation))),
-                reporting_bridges=_array(_object(id=TEXT,effective_date=TEXT,published_at=TEXT,period_id=TEXT,metric=TEXT,unit=TEXT,
-                    predecessor_basis=TEXT,successor_basis=TEXT,predecessors=_array(fact_key),successors=_array(fact_key),
-                    relationships=_array(_object(predecessor=TEXT,successor=TEXT,fact=fact_key)),
-                    limitations=_array(TEXT),source_refs=_array(citation))),gaps=_array(TEXT))
-            structure_docs=documents([sid for sid in store._units if catalog[sid]['category']=='financial_reports'],purpose='Current company accounting and model configuration: asset/lease inclusion, balance-sheet versus cash-flow cash definitions and overdraft/debt scope, segment definitions and reorganisations, all recurring operating expense functions, currencies and hedges, business combinations/disposals and effective dates, SBC, dividends, adjusted earnings and dilution, financing and tax. Include cash-flow presentation of ordinary share issuance, noncommon equity principal and cash distributions, the separate net-of-tax EPS coupon, the equity carrying claim and investment cash movements. Complete relevant notes with definitions; numeric statement facts have already been extracted separately.')
-            structure=journal.stage('company_accounting_structure',
-                'Establish cited asset inclusion definitions and versioned reporting entities from the complete originals. '
-                'Explain whether the reported PPE role includes ROU or is already owned-only; never subtract leases twice. '
-                'Define cash_scope only from a cited cash reconciliation: cash-flow closing cash equals balance-sheet cash plus the sum of coefficient times each component stock. Coefficients are +1 or -1, never fitted ratios; each role must retain its separate mapped original amount. A supplied cash_scope fully replaces the legacy held-for-sale-only bridge, so include every applicable component once. Use included_in_debt true only for a negative component already included in reported debt, such as a bank overdraft; this prevents counting it again in financing and valuation. A cited empty components list states matching cash scopes; null means no new scope definition was established and does not assert undisclosed balances are zero. '
-                'Use cashflow_presentation for separately mapped, cited ordinary/noncommon equity transactions and investment movements that require explicit statement placement. Every component keeps its signed original flow role and is counted once in cfi or cff. Ordinary equity issuance uses role issuance_cash, section cff and existing_issuance_controls; it links historical proceeds to the existing forecast issuance controls without a second transaction. Noncommon equity issuance/distributions belong in cff with their cited equity_role, never debt or statutory profit. Investment movements name asset_role short_investments and their disclosed cfi/cff section; relocation must not count them in both. Use no_new_transaction as an explicit future scenario, not a reported historical zero; hold_latest_annual is an editable policy based on the last sourced annual flow, requiring cited support for a recurring distribution. '
-                'A noncommon equity component requires noncommon_equity_claim_role: a separately sourced closing claim already included in its equity account, retained as a memorandum for common-equity valuation, never added to the balance sheet twice. Paid hybrid coupons, accrued coupons net of tax used for EPS, and the outstanding senior equity claim are different concepts. Configure the EPS numerator independently in financial_contracts.adjusted_earnings.basic_earnings_adjustment; never copy paid cash into it or deduct the coupon from statutory profit. Missing amounts or unclear classification belong in gaps, not invented zeros or borrowing rows. Null cashflow_presentation retains the existing presentation. '
-                'Preserve historical segment labels, scopes and bases. A numerical reorganisation bridge must reference already reconstructed observation keys; '
-                'never invent numerical allocations. Use a separately reported predecessor or restatement when available. '
-                'If no numerical bridge exists, retain separate incompatible entity versions and name that comparability limitation. '
-                'Each scope or bridge requires original source/page references. Unresolved asset inclusion or current entity scope belongs in gaps. '
-                'Build separate revenue and cost currency exposure hypotheses with cited sources and effective dates. '
-                'Respect the company functional expense presentation. If a scaffold expense role is included within other reported functions, specify functional_expense_structure with treatment included_in_other_functions and the containing role IDs; do not fabricate a separately reported zero or cost split. '
-                'Use structural_account_policies only for affirmative cited presentation classifications in the supported optional scaffold stages: other_revenue may be included_in_role sales; net_other_trading/net_other_operating may be included in the other active net adjustment stage or explicitly inactive_stage; exceptional_associate_distribution may be an explicitly inactive_stage. Supply the containing roles and exact definition. These create internal calibration-ineligible structural parameters, never reported zero observations. Do not apply them to unknown amounts, contradict an existing nonzero fact, infer absence merely because a note was not retrieved, or create circular inclusion. '
-                'Additional recurring operating expense categories belong in operating_expense_functions with a distinct id, company label, definition and original citations. The id must equal the previously mapped historical role and its cost-pool destination; these functions extend the existing four destinations rather than replace them. Reconcile their total to the company recurring operating profit. Never relabel a recurring expense as exceptional or bury it in another function merely to fit the scaffold. '
-                'Where segment/corporate pure D&A is absent but group pure D&A and segment combined DAP are disclosed, supply historical_allocations with status estimated, an explicit allocation method and citations. Preserve the reported DAP separately; allocate group pure D&A by segment DAP proportions only as a stated estimate, including corporate and reconciling exactly to group pure D&A. Never overwrite reported pure D&A. '
-                'Customer-country sales are not disclosed functional/invoice currency exposures: mark those weights estimated. '
-                'Do not allocate residual revenue by factory counts or copy revenue weights into every cost category. '
-                'Do not assume geographically adjacent currencies move together. A different rate_currency is a currency proxy, never a cross-rate. '
-                'When evidence cannot allocate a residual, preserve its full weight explicitly as exposure_status unresolved, '
-                'scenario_neutral true, label Unallocated exposure - neutral scenario, using reporting currency only as the stated zero-shock scenario. '
-                'This is not evidence that the residual is denominated in reporting currency; report its materiality and avoid tiny invented rows. '
-                'Include reporting currency at its explicit weight (zero allowed); each basket must sum to one without renormalising available currencies. '
-                'Distinguish reported, estimated, scenario and unresolved exposure_status on every component. '
-                'Choose revenue_bridge as translation_of_constant_currency or additive_reported_growth_contribution according to the disclosed bridge; keep calibration at provisional 1.0. '
-                'Do not fit a historical near-zero impact by division. If support is insufficient omit that basket and state the exact limitation. '
-                'Define one authoritative cash operating cost build from reported expense categories, without double counting distribution or marketing. '
-                'Each cost pool names its baseline_role, destination, evidence and one method: activity_cost, budget_delta, budget_growth or absolute_budget. '
-                'Use one effective_activity_sensitivity for activity_cost; legacy variable_share/elasticity are initialization metadata, not two independently estimated overlapping drivers. Budget methods must not carry activity or unit-cost controls. '
-                'Set input_cost_includes_transaction_fx true when input inflation already includes invoice-currency movements; do not apply the same FX shock twice. '
-                'If baseline_amount is null Python uses the original historical role times baseline_share. Multiple pools sharing a role must exhaust its baseline once. '
-                'COGS and marketing must not be forecast from sales ratios or backwards from predetermined profit. A rounded reported historical marketing ratio may initialise an absolute spending base only. '
-                'RIG includes mix: explicitly identify its use as an activity proxy and do not make fixed costs scale automatically. '
-                'Use cost functional-currency translation separately from invoice-to-functional transaction FX; same currency has no transaction effect. '
-                'Resolve hedge_coverage/hedge_rate for current purchases separately from prior_hedge_coverage/prior_hedge_rate for comparable purchases; absent coverage is zero with null rate, never copy current terms to the prior period. If procurement currency, lags or hedges are undisclosed, components may be empty with status unmodelled; never invent hedge contracts. '
-                'Record completed and sufficiently defined portfolio changes as regional scope_events, with effective dates, signed annual revenue/cost amounts, cashflows and balance movements. '
-                'Distinguish timing scenarios from confirmed closing dates; preserve already-included actual contributions and annualisation, and never use a reorganisation as acquisition growth. '
-                'Use effective_date for the first included/excluded operating day and accounting_date for the balance-sheet/cash/gain closing date; a transaction closing on June30 may first exclude operations on July1. '
-                'For an already reported held-for-sale classification, operating_wc_excluded_from identifies the cited date when the business left operating inventory/receivables/payables. Keep those balances excluded while its income remains consolidated, and dispose of held-for-sale asset/liability buckets only; never remove its operating working capital twice. Forecast classifications need a separate transfer bridge. '
-                'Set closing.cash_transferred_in_asset_roles true only when transferred cash is already included in a supplied aggregate asset bucket, so net assets do not count it twice. '
-                'An event with incomplete closing accounting may have operating effects enabled and accounting_enabled false with precise material limitations. '
-                'Where disclosures leave material event amounts unknown, provide an explicit provisional estimation method using positive annual revenue/profit/D&A magnitudes, supported revenue shares or margins and cost-pool weights. The engine applies acquisition/disposal signs. '
-                'Optional closing estimates must independently specify consideration, transferred cash, each material asset/liability and retained/prior interest; derived gain or goodwill is not an invented balancing asset. Leave unestimated closing fields null and arrays empty. '
-                'Assess recurring restructuring separately from exceptional adjustments; explicit normalisation annual amounts must not erase every adjustment without evidence. '
-                'Separate annual dividend pools from their payment period weights and prior-year policy. Repurchase price may be null for inactive buybacks; book value per share is not an execution price. '
-                'Identify SBC embedded in historical operating expenses, its noncash addback and equity treatment; do not add an expense twice. Source annual_amount where disclosed, otherwise null preserves the mapped historical anchor. '
-                'For adjusted earnings use the company definition, explicitly distinguishing pretax adjustments, their tax/NCI effects and after-tax associate items; never substitute UTOP for statutory earnings. Derive a supported incremental diluted share count or disclose uncertainty. '
-                'Any hybrid or preferred coupon deducted only from the EPS numerator belongs in signed basic_earnings_adjustment with cited historical periods, not a reduction of statutory parent profit. Leave this policy null if no such adjustment is disclosed. '
-                'Financing schedules use actual maturities/refinancing/discretionary decisions and dated execution fractions; empty schedules mean no researched new transactions, not proof of zero obligations. Missing legal nominal issue price remains null. '
-                'Preserve cited period-end outstanding ordinary shares separately from weighted-average shares in financing.historical_closing_shares, using shares in millions and subtracting treasury shares only where the source definition requires it. '
-                'Research material FX accounting exposures separately from revenue/cost baskets: foreign_operation balance/cash translation versus monetary cash/debt remeasurement in the reporting functional currency. Give cited or explicitly estimated opening shares, dates and net native-currency movements; do not infer geographic sales weights as asset shares. Empty exposures mean unresolved accounting coverage, never known zero. '
-                'Every non-reported policy must be clearly provisional with a reason, source references and any unresolved limitation. Evidence is not permission to fabricate a detailed cost or exposure matrix.',
-                dict(company=company,scope=scope,evidence=structure_docs,observations=data['observations'],research_limitations=list(research_limitations)),structure_schema,
-                lambda answer:(_accounting_extension_configuration(answer,data['observations'],structure_docs,company_data=data,role_contract=contract['roles']),answer)[1])
-            data['model_configuration'].update(_accounting_extension_configuration(structure,data['observations'],structure_docs,company_data=data,role_contract=contract['roles']))
-            data['model_configuration'].setdefault('limitations',[]).extend(structure['gaps'])
-            def checked_refs(item):
-                if not item['source_refs']:raise ValueError('Company accounting structure requires original citations')
-                for ref in item['source_refs']:
-                    if ref['source_id'] not in store._units or ref['unit_id'] not in store._units[ref['source_id']]:
-                        raise ValueError('Accounting scope cites an unavailable original unit')
-            for item in structure['asset_scope']+structure['entity_versions']+structure['reporting_bridges']:checked_refs(item)
-            data['asset_scope']=structure['asset_scope'];data['entity_versions']=structure['entity_versions']
-            for item in structure.get('functional_expense_structure',[]):checked_refs(item)
-            data['model_configuration']['functional_expense_structure']={item['role']:{k:v for k,v in item.items() if k!='role'} for item in structure.get('functional_expense_structure',[])}
-            for item in structure.get('historical_allocations',[]):
-                checked_refs(item)
-                if item['status']!='estimated':raise ValueError('Historical allocation must be explicitly estimated, never reported')
-            data['model_configuration']['historical_allocations']=structure.get('historical_allocations',[])
-            data['model_configuration']['fx_exposures']={item['entity_id']:{k:v for k,v in item.items() if k!='entity_id'} for item in structure.get('fx_exposures',[])}
-            for exposure in data['model_configuration']['fx_exposures'].values():
-                for role in ('revenue','cost'):
-                    checked_refs(exposure[role]);exposure[role]['multiplier']=1.0
-            proposed_contracts=structure.get('financial_contracts')
-            if proposed_contracts:
-                contracts=copy.deepcopy(proposed_contracts)
-                for pool in contracts['cost_pools']:
-                    checked_refs(pool)
-                    if pool.get('baseline_amount') is None:pool.pop('baseline_amount',None)
-                for event in contracts['scope_events']:
-                    checked_refs(event)
-                    estimate=event.get('estimation')
-                    if estimate is None:event.pop('estimation',None)
-                    else:
-                        for key in list(estimate):
-                            if estimate[key] is None:estimate.pop(key)
-                        estimate['cost_weights']={item['row_id']:item['amount'] for item in estimate.get('cost_weights',[])}
-                        closing=estimate.get('closing',{})
-                        for key in list(closing):
-                            if closing[key] is None:closing.pop(key)
-                        for key in ('assets','liabilities'):
-                            closing[key]={item['row_id']:item['amount'] for item in closing.get(key,[])}
-                        if not any(value not in ({},None) for value in closing.values()):estimate.pop('closing',None)
-                    for key in ('annual_cash_costs','annual_da_by_role','cash_flows','balance_movements'):
-                        event[key]={item['row_id']:item['amount'] for item in event[key]}
-                    for key in ('annual_revenue','annual_da','gain_loss','entity_scope_fraction'):
-                        if event.get(key) is None:event.pop(key,None)
-                for policy in contracts['normalisation'].values():checked_refs(policy)
-                for policy in contracts['dividends'].values():
-                    checked_refs(policy)
-                    policy['payment_weights']={item['period_kind']:item['weight'] for item in policy['payment_weights']}
-                checked_refs(contracts['financing'])
-                for item in contracts['financing'].get('historical_closing_shares',[]):checked_refs(item)
-                contracts['financing']['schedule']={item['period_id']:{k:v for k,v in item.items() if k!='period_id'} for item in contracts['financing']['schedule']}
-                checked_refs(contracts['sbc'])
-                if contracts['sbc']['annual_amount'] is None:contracts['sbc'].pop('annual_amount')
-                for item in contracts['adjusted_earnings']['adjustments']:
-                    checked_refs(item)
-                    if item.get('annual_amount') is None:item.pop('annual_amount')
-                checked_refs(contracts['adjusted_earnings']['dilution'])
-                earnings_adjustment=contracts['adjusted_earnings'].get('basic_earnings_adjustment')
-                if earnings_adjustment is None:contracts['adjusted_earnings'].pop('basic_earnings_adjustment',None)
-                else:
-                    checked_refs(earnings_adjustment)
-                    earnings_adjustment['amounts_by_period']={item['period_id']:item['amount'] for item in earnings_adjustment['amounts_by_period']}
-                    for item in earnings_adjustment['historical']:checked_refs(item)
-                    earnings_adjustment['historical']={item['period_id']:{k:v for k,v in item.items() if k!='period_id'} for item in earnings_adjustment['historical']}
-                for exposure in contracts.get('fx_accounting',{}).get('exposures',[]):
-                    checked_refs(exposure)
-                    exposure['net_movement_native_by_period']={item['period_id']:item['amount'] for item in exposure['net_movement_native_by_period']}
-                data['model_configuration']['financial_contracts']=contracts
-            if not data['asset_scope']:raise ValueError('Owned PPE / ROU scope must be established before schedule construction')
-            versions={v['id']:v for v in data['entity_versions']}
-            for observation in data['observations']:
-                version=versions.get(observation['entity_id'])
-                if version:
-                    observation['model_entity_id']=version['model_entity_id']
-                    observation['current_basis_compatible']=version['current_basis_compatible']
-            def fact(key):
-                matches=[o for o in data['observations'] if all(o[k]==v for k,v in key.items())]
-                if len(matches)!=1:raise ValueError('Reporting bridge requires an unambiguous reconstructed observation: '+str(key))
-                o=matches[0]
-                return dict(entity_id=o['entity_id'],value=o['value'],observation_id=o['id'])
-            for proposed in structure['reporting_bridges']:
-                bridge=copy.deepcopy(proposed)
-                bridge['predecessors']=[fact(k) for k in proposed['predecessors']]
-                bridge['successors']=[fact(k) for k in proposed['successors']]
-                bridge['relationships']=[dict(predecessor=r['predecessor'],successor=r['successor'],value=fact(r['fact'])['value']) for r in proposed['relationships']]
-                bridge['residual']=sum(i['value'] for i in bridge['predecessors'])-sum(i['value'] for i in bridge['successors'])
-                if abs(bridge['residual'])>1e-6:raise ValueError('Reconstructed reporting bridge does not reconcile')
-                bridge['status']='exact_published_split';data['reporting_bridges'].append(bridge)
-            from .model_contract import asset_scope_context
-            asset_scope_context(data)
-            _bind_research_anchors(data,revenue_models)
+            data['model_configuration']['forecast_preparation_status']='pending'
             data['sources']={sid:catalog[sid] for sid in store._units}
             _combined_history_challenge(journal,data,history_evidence,coverage=history_coverage)
             # Save a historical-only handoff. Later stages consume these facts
             # and declarations without changing the retained source evidence.
             journal.artifact('company_model_inputs.json',data)
-            journal.artifact('historical_model.json',historical_model(data))
+            save_historical_output(journal,data)
             journal.state['status']='research_complete';journal.save()
             return directory/'company_model_inputs.json'
+        except Exception as exc:
+            if va_mode and (journal.directory/'va_mapping_progress.json').is_file():
+                try:_va_incomplete_output(journal,json.loads((journal.directory/'va_mapping_progress.json').read_text(encoding='utf-8'))['company_inputs'],exc)
+                except Exception as export_error:exc.add_note('Incomplete workbook export failed: '+str(export_error))
+            journal.state['status']='incomplete';journal.state['issues'].append(str(exc));journal.save();raise
+
+
+def complete_historical_model(root, company, archive, inputs_file, *, budget_usd=20, progress=None):
+    """Verify and export the historical stage without any downstream imports or AI.
+
+    Research and the combined-history review must already be complete. This new
+    checkpoint preserves its parent and owns source, date and derivation checks
+    which full construction also enforces before forecasting.
+    """
+    from ..shared_artifacts import verified_integrated_record,freeze_model_sources
+    from ..shared_budget import BudgetLedger,ledger_path,company_key
+    from ..shared_runtime import RunJournal
+    from .evidence import inventory_local_sources,verify_model_input_sources
+    from .initiation import _initiation_lock
+    root=Path(root).resolve();outputs=root/'outputs';archive=Path(archive).resolve()
+    inputs_file=Path(inputs_file).resolve()
+    data=json.loads(inputs_file.read_text(encoding='utf-8'))
+    if company_key(data['company'])!=company_key(company):raise ValueError('Historical company differs from saved inputs')
+    parent=None
+    if (inputs_file.parent/'record.json').is_file():
+        parent=verified_integrated_record(inputs_file.parent,outputs)
+        if parent['artifacts'].get(inputs_file.name)!=hashlib.sha256(inputs_file.read_bytes()).hexdigest():
+            raise ValueError('Historical inputs are not a hashed artifact of the selected parent')
+    with _initiation_lock(outputs,scope=company_key(company)):
+        ledger=BudgetLedger(ledger_path(outputs,company),company,budget_usd)
+        if parent:ledger.import_record(parent)
+        inventory=inventory_local_sources(archive)
+        configuration=copy.deepcopy((parent or {}).get('configuration',{}))
+        configuration.update(company=company,sources=str(archive),mode='historical_only_v1',
+            as_of=data['model_configuration']['as_of'],years=data['history_years'],historical_years=None,start_year=None,
+            manifest=inventory['manifest_sha256'],limits=dict(usd=budget_usd,calls=None,repairs=2,retries=0,generated_tokens=None))
+        directory=outputs/('construct_history_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'_'+uuid4().hex[:8])
+        directory.mkdir()
+        # No provider is needed: the journal records only deterministic checks.
+        journal=RunJournal(directory,None,configuration,progress,previous=parent,ledger=ledger)
+        journal.artifact('inventory.json',inventory)
+        journal.artifact('company_model_inputs.json',data)
+        try:
+            current_review=combined_history_review_current(data)
+            if not current_review and data['model_configuration'].get('historical_workflow')!='native_va_v1':
+                raise ValueError('Historical combined review is incomplete or stale')
+            source_folder=directory/'sources';source_folder.mkdir()
+            frozen,reused=freeze_model_sources(data,archive,source_folder,previous=parent,outputs=outputs)
+            journal.state['sources']=frozen
+            journal.artifact('source_freeze_audit.json',dict(reused_missing_originals=reused,ai_calls=0))
+            verification=dict(data,sources={s['id']:dict(s,local_path=Path(s['path']).name) for s in frozen})
+            checks=verify_model_input_sources(verification,source_folder)+freshness_checks(verification,source_folder,
+                historical_vintage=data['model_configuration'].get('historical_vintage',False))
+            from .model_contract import historical_model
+            checks.extend(c for c in historical_model(data)['derivation_checks'] if c.get('area')=='reporting_structure')
+            if not current_review:checks.append(dict(area='historical_review',name='financial_review',status='MISSING',detail=data['model_configuration'].get('historical_incomplete_reason','Historical review incomplete or stale')))
+            journal.artifact('source_validation.json',checks)
+            output=save_historical_output(journal,data,incomplete=any(c['status'] in ('FAIL','MISSING') for c in checks))
+            validation=dict(status='historical_complete_provisional',checks=checks,
+                source_review=data.get('historical_source_review',{}),
+                combined_history_review=data['combined_history_review']['status'],
+                forecast_started=False,dcf_started=False,ai_calls_in_finalization=0,
+                acceptance='Provisional historical construction; independent primary verification and desktop Excel acceptance are separate gates.')
+            if any(check['status'] in ('FAIL','MISSING') for check in checks):
+                validation['status']='incomplete'
+                journal.state['issues'].append('Historical source/date checks remain incomplete; inspect source_validation.json')
+            journal.artifact('historical_validation.json',validation)
+            journal.state['status']=validation['status'];journal.state['completion_scope']='historical_only';journal.save()
+            if progress:progress('Historical workbook: '+str(output))
+            return directory
         except Exception as exc:
             journal.state['status']='incomplete';journal.state['issues'].append(str(exc));journal.save();raise
 
 
-def update_company_inputs(root, run, *, as_of, provider=None, progress=None):
+def update_company_inputs(root, run, *, as_of, provider=None, progress=None, online=False):
     """Discover newer releases and merge verified actuals into saved company data."""
     from ..shared_artifacts import verified_integrated_record, freeze_model_sources
     from ..shared_ai import OpenAIProvider
@@ -4923,9 +5763,15 @@ def update_company_inputs(root, run, *, as_of, provider=None, progress=None):
     if not parent.is_absolute():parent=outputs/parent if not parent.exists() else parent.resolve()
     previous=verified_integrated_record(parent,outputs)
     data=json.loads((parent/'company_model_inputs.json').read_text(encoding='utf-8'))
-    archive=Path(previous['configuration']['sources'])
+    archive=resolve_data_path(root,previous['configuration']['sources'])
+    va_mode=data.get('model_configuration',{}).get('historical_source_policy') == VA_SOURCE_POLICY
+    if va_mode and not online:
+        config=previous['configuration']
+        return research_company_inputs(root,data['company'],archive,as_of=as_of,provider=provider,progress=progress,
+            years=config.get('years'),historical_years=config.get('historical_years'),start_year=config.get('start_year'),
+            budget_usd=config['limits']['usd'],historical_vintage=data.get('model_configuration',{}).get('historical_vintage',False))
     provider=provider or OpenAIProvider.from_env(root/'.env');provider.max_output_tokens=24000;provider.timeout=max(provider.timeout,300)
-    configuration=copy.deepcopy(previous['configuration']);configuration.update(as_of=as_of,provider=provider.metadata(),mode='source_update_v1')
+    configuration=copy.deepcopy(previous['configuration']);configuration.update(sources=str(archive),as_of=as_of,provider=provider.metadata(),mode='source_update_v1')
     configuration['limits'].update(calls=None,generated_tokens=None)
     configuration['escalations']={}
     directory=outputs/('construct_update_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'_'+uuid4().hex[:8]);directory.mkdir()
@@ -4935,7 +5781,8 @@ def update_company_inputs(root, run, *, as_of, provider=None, progress=None):
         try:
             indexes=data.get('source_freshness',{}).get('official_indexes',[])
             indexes=[item['url'] if isinstance(item,dict) else item for item in indexes]
-            freshness,discovered=discover_releases(journal,archive,indexes,as_of,latest_completed_year=max(data['history_years']),historical_years=data['history_years'],fiscal_calendar=data.get('fiscal_calendar'))
+            freshness,discovered=discover_releases(journal,archive,indexes,as_of,latest_completed_year=max(data['history_years']),
+                historical_years=() if va_mode else data['history_years'],fiscal_calendar=data.get('fiscal_calendar'))
             sources=data['sources']
             if isinstance(sources,list):sources={s['id']:s for s in sources}
             known={s['sha256']:sid for sid,s in sources.items()};new=[]
@@ -4946,6 +5793,7 @@ def update_company_inputs(root, run, *, as_of, provider=None, progress=None):
                         if release['source_id']==source['id']:release['source_id']=sid
                 else:sources[source['id']]=source;new.append(source['id'])
             data['sources']=sources;data['source_freshness']=freshness;data['model_configuration']['as_of']=as_of
+            if va_mode:data['model_configuration']['online_freshness_requested']=True
             if new:data=disclosure_update(journal,data,archive,new)
             source_folder=directory/'sources';source_folder.mkdir(exist_ok=True)
             frozen,reused_originals=freeze_model_sources(data,archive,source_folder,previous=previous,outputs=outputs)
@@ -4960,6 +5808,7 @@ def update_company_inputs(root, run, *, as_of, provider=None, progress=None):
                 historical_context=prepare_history_review_context(journal,data,frozen,previous=previous)
                 ensure_combined_history_review(journal,data,**historical_context)
             journal.artifact('company_model_inputs.json',data)
+            save_historical_output(journal,data)
             journal.state.update(sources=frozen,status='research_complete');journal.save()
             return directory/'company_model_inputs.json'
         except Exception as exc:
@@ -5082,8 +5931,18 @@ def freshness_checks(data, archive, *, as_of=None, historical_vintage=False):
     checks=[]
     def add(name,okay,detail,area='freshness'):
         checks.append(dict(area=area,name=name,status='PASS' if okay else 'FAIL',detail=detail))
-    add('official_release_inventory',bool(checked and checked>=as_of and coverage.get('official_indexes')),
-        'Official release discovery must cover '+as_of+'; last checked '+str(checked))
+    local_va=config.get('historical_source_policy')==VA_SOURCE_POLICY and not config.get('online_freshness_requested')
+    if local_va:
+        add('local_va_source_policy',coverage.get('mode')=='local_company_reported_va'
+            and coverage.get('discovery_performed') is False and coverage.get('model_as_of')==as_of,
+            'Local VA snapshot policy must be explicit and match the model information date')
+        checks.append(dict(area='freshness',name='official_release_inventory',status='WARNING',
+            detail='Local company-reported VA build: online release discovery was not performed; latest-release completeness is unverified.'))
+        checks.append(dict(area='source_review',name='independent_primary_verification',status='WARNING',
+            detail='Historical numbers are company-reported VA cells, not independently reconstructed company-original observations.'))
+    else:
+        add('official_release_inventory',bool(checked and checked>=as_of and coverage.get('official_indexes')),
+            'Official release discovery must cover '+as_of+'; last checked '+str(checked))
     sources=data.get('sources',{})
     if isinstance(sources,list):sources={s['id']:s for s in sources}
     covered=set()
@@ -5152,7 +6011,7 @@ def ensure_company_history_research(root, company, archive, inputs_file, *, budg
     failed evidence review never becomes a completed cached construction input.
     """
     from ..shared_ai import OpenAIProvider
-    from ..shared_budget import BudgetLedger,ledger_path,company_key
+    from ..shared_budget import BudgetLedger,ledger_path,company_key,build_record_paths,record_in_build_scope
     from ..shared_runtime import RunJournal,digest
     from company_initiation.historic_construction.evidence import inventory_local_sources, _units
     from company_initiation.historic_construction.initiation import _initiation_lock
@@ -5160,12 +6019,20 @@ def ensure_company_history_research(root, company, archive, inputs_file, *, budg
     root=Path(root).resolve();archive=Path(archive).resolve();outputs=root/'outputs';inputs_file=Path(inputs_file).resolve()
     data=json.loads(inputs_file.read_text(encoding='utf-8'))
     if company_key(data['company'])!=company_key(company):raise ValueError('Historical review company differs from saved model inputs')
+    if (data.get('model_configuration',{}).get('historical_source_policy')==VA_SOURCE_POLICY
+            and data['model_configuration'].get('va_mapping_contract')!=VA_MAPPING_CONTRACT):
+        raise ValueError('Saved VA mappings predate the current period/unit/patch contract. Start a new construct-history run; prior evidence and charges remain preserved.')
     parent=None
     if (inputs_file.parent/'record.json').is_file():
         parent=verified_integrated_record(inputs_file.parent,outputs)
         if parent['artifacts'].get(inputs_file.name)!=hashlib.sha256(inputs_file.read_bytes()).hexdigest():
             raise ValueError('Historical review input is not a hashed artifact of its parent')
     if as_of:data['model_configuration']['as_of']=date.fromisoformat(as_of).isoformat()
+    review=data.get('combined_history_review',{})
+    if (data['model_configuration'].get('historical_workflow')=='native_va_v1'
+            and review.get('input_fingerprint')==combined_history_fingerprint(data)):
+        if progress:progress('Historical review already recorded as '+review.get('status','unknown')+'; preserving its result without another AI review.')
+        return inputs_file
     if combined_history_review_current(data):
         if not as_of or json.loads(inputs_file.read_text(encoding='utf-8'))['model_configuration']['as_of']==as_of:
             if progress:progress('Reusing combined-history review for identical historical inputs; no AI calls.')
@@ -5176,9 +6043,9 @@ def ensure_company_history_research(root, company, archive, inputs_file, *, budg
         ledger=BudgetLedger(ledger_path(outputs,company),company,budget_usd)
         if parent:ledger.import_record(parent)
         previous=parent;candidates=[]
-        for path in outputs.glob('construct_history_review_*/record.json'):
+        for path in build_record_paths(outputs,'construct_history_review_*/record.json'):
             saved=json.loads(path.read_text(encoding='utf-8'));config=saved.get('configuration',{})
-            if company_key(config.get('company','unknown'))==company_key(company) and config.get('history_input_hash')==identity:
+            if record_in_build_scope(saved) and company_key(config.get('company','unknown'))==company_key(company) and config.get('history_input_hash')==identity:
                 candidates.append(saved)
         if candidates:
             previous=verified_integrated_record(max(candidates,key=lambda item:Path(item['directory']).stat().st_mtime_ns)['directory'],outputs)
@@ -5208,6 +6075,7 @@ def ensure_company_history_research(root, company, archive, inputs_file, *, budg
             ensure_combined_history_review(journal,data,**historical_context,
                 **(dict(resume_version_route=resume_version_route) if resume_version_route else {}))
             journal.artifact('company_model_inputs.json',data)
+            save_historical_output(journal,data)
             journal.state['status']='research_complete';journal.save()
             return directory/'company_model_inputs.json'
         except Exception as exc:

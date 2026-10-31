@@ -215,7 +215,7 @@ def fx_command(root,args):
     import tomllib
     from uuid import uuid4
     defaults=tomllib.loads((root/'pyproject.toml').read_text(encoding='utf-8')).get('tool',{}).get('research-platform',{})
-    database=Path(args.database or defaults.get('fx-database','local_store/FX/fx.sqlite'))
+    database=Path(args.database or defaults.get('fx-database','data_store/FX/fx.sqlite'))
     if not database.is_absolute():database=root/database
     directory=root/'outputs'/('fx_'+args.command.removeprefix('fx-')+'_'+datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'_'+uuid4().hex[:8])
     directory.mkdir(parents=True)

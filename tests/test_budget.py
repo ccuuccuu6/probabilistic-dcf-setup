@@ -12,7 +12,9 @@ import unittest
 from unittest.mock import patch, Mock
 
 from company_initiation.shared_ai import AIError, OpenAIProvider, response_usage
-from company_initiation.shared_budget import BudgetLedger, company_key, ledger_path, reconstruct_allowance, company_budget_migration_plan
+from company_initiation.shared_budget import (BudgetLedger, company_key, ledger_path, reconstruct_allowance,
+    company_budget_migration_plan, reset_company_allowance, construction_command_budget, current_build_scope,
+    build_record_paths, record_in_build_scope)
 
 
 SCHEMA = {"type": "object", "properties": {"ok": {"type": "boolean"}},
@@ -297,6 +299,279 @@ class BudgetTests(unittest.TestCase):
         with self.assertRaisesRegex(AIError,'missing'):ledger_path(outputs,'First company')
         path.write_bytes(original);legacy.write_text(json.dumps(dict(state,limit_usd=19)),encoding='utf-8')
         with self.assertRaisesRegex(AIError,'legacy budget changed'):ledger_path(outputs,'First company')
+
+
+class AllowanceResetTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.outputs = Path(self.temp.name)
+        self.company = 'Synthetic reset company'
+        self.ledger = BudgetLedger(ledger_path(self.outputs, self.company), self.company)
+        self.provider = OpenAIProvider(api_key='SYNTHETIC-TEST-KEY')
+
+    def reset(self):
+        return reset_company_allowance(self.outputs, self.company,
+            reason='User explicitly authorized a fresh $20 allowance for this fixture')
+
+    def record(self, calls):
+        return dict(configuration=dict(company=self.company, provider=self.provider.metadata()),
+            calls=calls, pending_call=None, directory='saved-fixture-run')
+
+    def test_reset_retains_costs_unknowns_ownership_and_immutable_snapshot(self):
+        self.ledger.reserve(entry('paid', 4.))
+        paid = response_usage(response(), 'gpt-6-luna')
+        self.ledger.settle('paid', paid)
+        self.ledger.reserve(entry('unknown', 3.))
+        self.ledger.settle('unknown', response_usage(None, 'gpt-6-luna'))
+        before = json.loads(self.ledger.path.read_text())
+        summary = self.reset()
+        self.assertEqual(summary['known_cost_usd'], 0)
+        self.assertEqual(summary['unresolved_reservations_usd'], 0)
+        self.assertEqual(summary['remaining_usd'], 20)
+        self.assertEqual(summary['lifetime']['known_cost_usd'], paid['estimated_cost_usd'])
+        self.assertEqual(summary['lifetime']['unresolved_reservations_usd'], 3)
+        after = json.loads(self.ledger.path.read_text())
+        self.assertEqual(after['lineage_id'], before['lineage_id'])
+        for cid, request in before['requests'].items():
+            self.assertEqual({k: v for k, v in after['requests'][cid].items()
+                              if k != 'allowance_period_id'}, request)
+        self.assertEqual(after['closed_allowance_periods'][0]['request_ids'], ['paid', 'unknown'])
+        closed = copy.deepcopy(after['closed_allowance_periods'])
+        self.ledger.settle('unknown', paid)
+        settled = self.ledger.summary()
+        self.assertEqual(settled['remaining_usd'], 20)
+        self.assertEqual(settled['lifetime']['unresolved_reservations_usd'], 0)
+        self.assertEqual(json.loads(self.ledger.path.read_text())['closed_allowance_periods'], closed)
+        self.assertEqual(len(json.loads((self.outputs / 'construction_request_ownership.json').read_text())['requests']), 2)
+
+    def test_old_imports_do_not_recharge_new_period_or_erase_unknowns(self):
+        old = entry('old', 3.)
+        self.ledger.import_record(self.record([old]))
+        self.reset()
+        replay = self.ledger.import_record(self.record([old]))
+        self.assertEqual(replay['committed_usd'], 0)
+        self.assertEqual(replay['lifetime']['unresolved_reservations_usd'], 3.)
+        # Previously unseen original calls are classified by dispatch time too.
+        late = entry('late-old', 2.)
+        imported = self.ledger.import_record(self.record([old, late]))
+        self.assertEqual(imported['remaining_usd'], 20.)
+        self.assertEqual(imported['lifetime']['unresolved_reservations_usd'], 5.)
+        old['usage'] = response_usage(response(), 'gpt-6-luna')
+        settled = self.ledger.import_record(self.record([old, late]))
+        self.assertEqual(settled['committed_usd'], 0)
+        self.assertEqual(settled['lifetime']['known_cost_usd'], old['usage']['estimated_cost_usd'])
+        self.assertEqual(settled['lifetime']['unresolved_reservations_usd'], 2.)
+
+    def test_new_dispatches_use_new_allowance_and_repeat_reset_is_explicit(self):
+        first = self.reset()
+        # Newly dispatched requests belong to the active period even if a clock
+        # is old; only saved-record imports use original timestamp classification.
+        self.ledger.reserve(entry('new', 19.))
+        with self.assertRaisesRegex(AIError, 'exceeds cumulative'):
+            self.ledger.reserve(entry('over', 1.01))
+        reopened = BudgetLedger(self.ledger.path, self.company)
+        self.assertEqual(reopened.summary()['remaining_usd'], 1.)
+        actual = response_usage(response(), 'gpt-6-luna')
+        reopened.settle('new', actual)
+        self.assertEqual(reopened.summary()['known_cost_usd'], actual['estimated_cost_usd'])
+        second = self.reset()
+        self.assertNotEqual(first['allowance_period_id'], second['allowance_period_id'])
+        self.assertEqual(second['closed_allowance_periods'], 2)
+        self.assertEqual(second['remaining_usd'], 20.)
+        self.assertEqual(second['lifetime']['known_cost_usd'], actual['estimated_cost_usd'])
+        with self.assertRaisesRegex(AIError, 'already reserved'):
+            reopened.reserve(entry('new', 1.))
+
+    def test_reset_is_company_specific_and_preserves_legacy_migration(self):
+        outputs = self.outputs / 'legacy'
+        legacy, _ = legacy_fixture(outputs)
+        original = legacy.read_bytes()
+        first = BudgetLedger(ledger_path(outputs, 'First company'), 'First company')
+        second = BudgetLedger(ledger_path(outputs, 'Second company'), 'Second company')
+        second_before = second.summary()
+        reset_company_allowance(outputs, 'First company', reason='Explicit test authorization')
+        ledger_path(outputs, 'First company')
+        self.assertEqual(first.summary()['remaining_usd'], 20.)
+        self.assertEqual(first.summary()['lifetime']['total_requests'], 2)
+        self.assertEqual(second.summary(), second_before)
+        self.assertEqual(legacy.read_bytes(), original)
+
+    def test_active_build_prevents_reset_and_failed_reset_changes_nothing(self):
+        from company_initiation.historic_construction.initiation import _initiation_lock
+        before = self.ledger.path.read_bytes()
+        with _initiation_lock(self.outputs, scope=company_key(self.company)):
+            with self.assertRaisesRegex(AIError, 'Another construction'):
+                self.reset()
+        self.assertEqual(self.ledger.path.read_bytes(), before)
+        with _initiation_lock(self.outputs):
+            with self.assertRaisesRegex(AIError, 'Another initiation'):
+                self.reset()
+        self.assertEqual(self.ledger.path.read_bytes(), before)
+        with self.assertRaisesRegex(ValueError, 'authorization reason'):
+            reset_company_allowance(self.outputs, self.company, reason=' ')
+        with self.assertRaises(ValueError):
+            reset_company_allowance(self.outputs, self.company, reason='Explicit', limit=21)
+        self.assertEqual(self.ledger.path.read_bytes(), before)
+
+    def test_missing_import_dispatch_date_cannot_hide_unallocated_cost(self):
+        self.reset()
+        ambiguous = entry('ambiguous')
+        ambiguous.pop('started_at')
+        with self.assertRaisesRegex(AIError, 'original dispatch timestamp'):
+            self.ledger.import_record(self.record([ambiguous]))
+        self.assertEqual(self.ledger.summary()['lifetime']['total_requests'], 0)
+
+
+class CommandBudgetTests(unittest.TestCase):
+    """Fresh public commands and explicit continuations, without a provider call."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.outputs=Path(self.temp.name)/'outputs';self.company='SYNTHETIC independent builds'
+
+    def ledger(self,limit=20):
+        return BudgetLedger(ledger_path(self.outputs,self.company),self.company,limit)
+
+    def journal(self,name,ledger):
+        from company_initiation.shared_runtime import RunJournal
+        directory=self.outputs/name;directory.mkdir()
+        return RunJournal(directory,OpenAIProvider(api_key='SYNTHETIC-OFFLINE-KEY'),
+            dict(company=self.company,limits=dict(usd=ledger.limit)),ledger=ledger)
+
+    def test_fresh_budget_ignores_old_commitments_and_keeps_lifetime_evidence(self):
+        with construction_command_budget(self.outputs,self.company,20) as first:
+            ledger=self.ledger();ledger.reserve(entry('known',5))
+            usage=response_usage(response(),'gpt-6-luna');usage['estimated_cost_usd']=4.
+            ledger.settle('known',usage);ledger.reserve(entry('unknown',3))
+            journal=self.journal('construct_first',ledger)
+            first_record=copy.deepcopy(journal.state)
+        with construction_command_budget(self.outputs,self.company,20) as second:
+            self.assertNotEqual(first['allowance_period_id'],second['allowance_period_id'])
+            self.assertEqual(second['remaining_usd'],20)
+            self.assertEqual(second['total_requests'],0)
+            self.assertEqual(second['lifetime']['known_cost_usd'],4)
+            self.assertEqual(second['lifetime']['unresolved_reservations_usd'],3)
+            self.assertEqual(list(build_record_paths(self.outputs,'construct_*/record.json')),[])
+            self.assertFalse(record_in_build_scope(first_record))
+            self.ledger().reserve(entry('second',2))
+        self.assertEqual(self.ledger().summary()['remaining_usd'],18)
+        self.assertIsNone(current_build_scope())
+
+    def test_older_resume_uses_original_remaining_budget_after_a_newer_fresh_build(self):
+        with construction_command_budget(self.outputs,self.company,10) as first:
+            ledger=self.ledger(10);ledger.reserve(entry('old-unknown',7))
+            original=self.journal('construct_first',ledger).state
+        with construction_command_budget(self.outputs,self.company,20):
+            self.ledger().reserve(entry('new-unknown',5))
+        newest=self.ledger().summary()
+        with construction_command_budget(self.outputs,self.company,None,previous=original) as resumed:
+            self.assertEqual(resumed['allowance_period_id'],first['allowance_period_id'])
+            self.assertEqual(resumed['remaining_usd'],3)
+            self.assertEqual(resumed['limit_usd'],10)
+            ledger=self.ledger(10)
+            with self.assertRaisesRegex(AIError,'exceeds cumulative'):
+                ledger.reserve(entry('too-much',3.01))
+            saved=ledger.reserve(entry('continued',2))
+            self.assertEqual(saved['allowance_period_id'],first['allowance_period_id'])
+            self.assertEqual(ledger.summary()['remaining_usd'],1)
+            self.assertEqual(list(build_record_paths(self.outputs,'construct_*/record.json')),
+                             [Path(original['directory'])/'record.json'])
+        after=self.ledger().summary()
+        self.assertEqual(after['allowance_period_id'],newest['allowance_period_id'])
+        self.assertEqual(after['remaining_usd'],newest['remaining_usd'])
+        self.assertEqual(after['lifetime']['unresolved_reservations_usd'],14)
+        with self.assertRaisesRegex(ValueError,'original run budget'):
+            with construction_command_budget(self.outputs,self.company,20,previous=original):pass
+
+    def test_stages_share_one_cap_and_only_current_build_records(self):
+        with construction_command_budget(self.outputs,self.company,20) as first:
+            history=self.ledger();history.reserve(entry('history',12))
+            historic=self.journal('construct_research_first',history)
+            forecast=self.ledger();self.assertEqual(forecast.summary()['remaining_usd'],8)
+            forecast.reserve(entry('forecast',7))
+            dcf=self.ledger()
+            with self.assertRaisesRegex(AIError,'exceeds cumulative'):dcf.reserve(entry('dcf',2))
+            dcf.reserve(entry('dcf',1))
+            self.assertEqual(dcf.summary()['remaining_usd'],0)
+            self.assertEqual(historic.state['configuration']['budget_session_id'],first['allowance_period_id'])
+            self.assertTrue(record_in_build_scope(historic.state))
+            self.assertEqual(list(build_record_paths(self.outputs,'construct_*/record.json')),
+                             [historic.directory/'record.json'])
+
+    def test_company_lock_is_shared_by_stages_but_blocks_other_threads(self):
+        from company_initiation.historic_construction.initiation import _initiation_lock
+        with construction_command_budget(self.outputs,self.company,20):
+            with _initiation_lock(self.outputs,scope=company_key(self.company)):pass
+            def competing_command():
+                with construction_command_budget(self.outputs,self.company,20):pass
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                with self.assertRaisesRegex(AIError,'Another construction'):
+                    pool.submit(competing_command).result(timeout=10)
+
+    def test_cli_default_fresh_and_explicit_resume_preserve_selected_budget(self):
+        from company_initiation.__main__ import main,_run
+        root=self.outputs.parent;records=[];calls=[]
+        def dispatch(arguments):
+            scope=current_build_scope(self.outputs,self.company)
+            before=self.ledger(arguments.budget_usd).summary()
+            calls.append((arguments.fresh,arguments.resume,before['remaining_usd'],arguments.years,arguments.as_of))
+            ledger=self.ledger(arguments.budget_usd)
+            ledger.reserve(entry('command-'+str(len(calls)),2))
+            journal=self.journal('construct_command_'+str(len(calls)),ledger)
+            journal.configuration.update(as_of='2026-10-01',years=[2024,2025])
+            journal.save();records.append(copy.deepcopy(journal.state))
+            return 0
+        argv=['company_initiation','construct',self.company,'--sources','fixture']
+        with patch('company_initiation.__main__.find_project_root',return_value=root), \
+             patch('company_initiation.__main__._logged_construct',side_effect=_run), \
+             patch('company_initiation.__main__._dispatch',side_effect=dispatch), \
+             patch('company_initiation.shared_artifacts.verified_integrated_record',side_effect=lambda path,outputs:next(
+                 record for record in records if Path(record['directory'])==Path(path))), \
+             patch('builtins.print'),patch('company_initiation.shared_ai.urlopen',side_effect=AssertionError('No network')):
+            for _ in range(2):
+                with patch('sys.argv',argv):self.assertEqual(main(),0)
+            with patch('sys.argv',argv+['--resume',records[0]['directory']]):self.assertEqual(main(),0)
+        self.assertEqual([item[0] for item in calls],[True,True,False])
+        self.assertEqual([item[2] for item in calls],[20,20,18])
+        self.assertEqual(calls[-1][3:],([2024,2025],'2026-10-01'))
+        self.assertEqual(records[0]['budget']['allowance_period_id'],records[2]['budget']['allowance_period_id'])
+        self.assertNotEqual(records[0]['budget']['allowance_period_id'],records[1]['budget']['allowance_period_id'])
+        self.assertEqual(self.ledger().summary()['remaining_usd'],18)
+
+    def test_initiate_default_is_fresh_and_resume_flag_is_explicit(self):
+        from company_initiation.__main__ import main,_run
+        root=self.outputs.parent
+        argv=['company_initiation','initiate',self.company,'--sources','fixture']
+        with patch('company_initiation.__main__.find_project_root',return_value=root), \
+             patch('company_initiation.__main__._dispatch',return_value=0) as dispatch:
+            with patch('sys.argv',argv):self.assertEqual(main(),0)
+            self.assertTrue(dispatch.call_args.args[0].fresh)
+            saved=root/'outputs/initiate_saved';saved.mkdir(parents=True)
+            request=dict(years=[2024],historical_years=None,start_year=None,max_cost_usd=8.)
+            (saved/'record.json').write_text(json.dumps(dict(request=request)),encoding='utf-8')
+            with patch('sys.argv',argv+['--resume',str(saved)]):self.assertEqual(main(),0)
+            args=dispatch.call_args.args[0]
+            self.assertFalse(args.fresh);self.assertEqual(args.budget_usd,8.)
+            self.assertEqual(args.years,[2024])
+        for command in ('construct','initiate'):
+            with patch('sys.argv',['company_initiation',command,self.company,'--sources','fixture','--fresh','--resume','saved']), \
+                 patch('sys.stderr',io.StringIO()),self.assertRaises(SystemExit):main()
+
+    def test_initiate_can_resume_an_older_independent_run_but_not_branch_its_continuation(self):
+        from company_initiation.historic_construction.initiation import _saved_run
+        self.outputs.mkdir()
+        request=dict(company_query=self.company,historical_years=None,years=[2024],forecast_years=5,start_year=None)
+        def save(name,started,parent=None):
+            path=self.outputs/name;path.mkdir()
+            record=dict(request=request,started_at=started,parent_run=str(parent) if parent else None)
+            (path/'record.json').write_text(json.dumps(record),encoding='utf-8');return path
+        first=save('initiate_first','2026-10-01T00:00:00+00:00')
+        save('initiate_second','2026-10-02T00:00:00+00:00')
+        self.assertEqual(_saved_run(self.outputs,request,first,False)[0],first)
+        self.assertEqual(_saved_run(self.outputs,request,None,True),(None,None))
+        child=save('initiate_first_child','2026-10-03T00:00:00+00:00',first)
+        with self.assertRaisesRegex(ValueError,'newer continuation'):_saved_run(self.outputs,request,first,False)
+        self.assertEqual(_saved_run(self.outputs,request,child,False)[0],child)
 
 
 class ProviderRecoveryTests(unittest.TestCase):

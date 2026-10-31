@@ -471,6 +471,112 @@ _SEGMENT_ROW_METADATA = [('pricing', 'Pricing contribution', 'ratio', 'ratio'),
  ('utop', 'Underlying trading operating profit', 'money', 'flow'),
  ('margin', 'Underlying trading margin', 'ratio', 'ratio')]
 
+def provisional_history_fact(observation):
+    """A source-checked vendor fact may display without calibration acceptance."""
+    return ((observation.get('historical_display_eligible') is True or observation.get('native_history_display') is True)
+        and observation.get('source_provider')=='visible_alpha' and observation.get('source_dataset')=='company_reported'
+        and observation.get('source_arithmetic_checked') is True and bool(observation.get('source_refs'))
+        and (observation.get('definition_status')=='source_defined' or observation.get('native_history_display') is True)
+        and observation.get('basis_status')=='period_defined'
+        and observation.get('restatement') in ('original','restated','unknown')
+        and observation.get('status') in ('reported','actual','derived_actual'))
+
+
+def select_revised_observations(observations):
+    """Prefer a revised value only within the same financial definition and entity."""
+    result=copy.deepcopy(observations);groups={}
+    for item in result:
+        if not item.get('model_selection_eligible',True):continue
+        key=tuple(item.get(k) for k in ('row_id','period_id','entity_id','definition_id','scope','unit','metric_type'))
+        groups.setdefault(key,[]).append(item)
+    for choices in groups.values():
+        revisions=[o for o in choices if o.get('restatement')=='restated' and o.get('status','reported') in ('reported','actual','derived_actual')
+            and isinstance(o.get('value'),(int,float)) and not isinstance(o['value'],bool) and math.isfinite(o['value']) and o.get('source_refs') and
+            (o.get('eligible',True) or provisional_history_fact(o))]
+        if not revisions:continue
+        def vintage(item):return item.get('restatement_vintage') or item.get('published_at') or ''
+        latest=max(map(vintage,revisions));selected=[o for o in revisions if vintage(o)==latest]
+        if len({o.get('value') for o in selected})!=1:continue
+        selected_ids={o['id'] for o in selected}
+        for item in choices:
+            if item['id'] not in selected_ids:
+                item['model_selection_eligible']=False
+                item['calibration_eligible']=False
+                item['superseded_by']=sorted(selected_ids)
+    return result
+
+
+def _historical_reporting_blocks(data, rows, periods):
+    """Group current/legacy partitions separately; totals never combine structures."""
+    context=data.get('model_configuration',{}).get('va_reporting_context',{})
+    current=[s['id'] for s in data.get('segments',[])]
+    labels={s['id']:s['label'] for s in data.get('segments',[])}
+    labels.update({v['entity_id']:v['label'] for v in context.get('entity_versions',[])})
+    structures=[];seen=set()
+    for entities in [current]+[h['entity_ids'] for h in reversed(context.get('hierarchies',[]))]:
+        identity=frozenset(entities)
+        if entities and identity not in seen:structures.append(entities);seen.add(identity)
+    legacy={o.get('entity_id') for o in data.get('observations',[]) if o.get('entity_kind')=='legacy_segment'}
+    legacy.update(v['entity_id'] for v in context.get('entity_versions',[]) if v['entity_kind']=='legacy_segment')
+    # Unassigned legacy rows remain together, without inventing a consolidation equation.
+    assigned=set().union(*(set(s) for s in structures)) if structures else set()
+    extra=sorted(legacy-assigned)
+    if extra:structures.append(extra)
+    # Missing entities still need one stable row before display aliases are built.
+    for entity in assigned|set(extra):
+        if not any(row.get('entity_id')==entity for row in rows.values()):
+            rid=entity+'_sales'
+            rows[rid]=dict(id=rid,label='Sales',entity_id=entity,unit=data['currency']+'m',metric_type='flow',
+                kind='reported',cells={},show_when_missing=True)
+    ordered=[];used=set();checks=[]
+    for index,entities in enumerate(structures):
+        title='Current reporting structure' if index==0 else 'Historical reporting structure '+str(index)
+        block='reporting_current' if index==0 else 'reporting_historical_'+str(index)
+        declared=index==0 or frozenset(entities) in {frozenset(h['entity_ids']) for h in context.get('hierarchies',[])}
+        display_ids={rid:(block+'__'+rid if rid in used else rid) for rid,row in rows.items() if row.get('entity_id') in entities}
+        totals=[]
+        for suffix,label,unit,kind in _SEGMENT_ROW_METADATA:
+            if unit!='money' or kind!='flow' or not declared:continue
+            dependencies=[entity+'_'+suffix for entity in entities]
+            total=dict(id=block+'_'+suffix,label=title+' — '+('Group sales' if suffix=='sales' else 'Segment total: '+label),unit=data['currency']+'m',metric_type='flow',
+                section=title+' — group totals',kind='derived',cells={},show_when_missing=suffix=='sales')
+            for period in periods:
+                pid=period['id'];parts=[rows.get(rid,{}).get('cells',{}).get(pid) for rid in dependencies]
+                if not all(part and part.get('value') is not None for part in parts):continue
+                expression=' + '.join('component_'+str(i) for i in range(len(parts)))
+                total['cells'][pid]=dict(value=sum(part['value'] for part in parts),status='derived_segment_total',
+                    model_expression=expression,model_bindings={'component_'+str(i):display_ids.get(rid,rid) for i,rid in enumerate(dependencies)},
+                    source_refs=[ref for part in parts for ref in part.get('source_refs',[])],editable=False)
+                candidates=([suffix,'total_revenue']+data.get('model_configuration',{}).get('native_revenue_rows',[])) if suffix=='sales' else [suffix]
+                reported=next((rows.get(rid,{}).get('cells',{}).get(pid) for rid in candidates if rows.get(rid,{}).get('cells',{}).get(pid)),None)
+                if index==0 and suffix=='sales' and reported and reported.get('value') is not None:
+                    difference=total['cells'][pid]['value']-reported['value']
+                    tolerance=max(1e-8,sum(part.get('rounding_increment',0)/2 for part in parts)+reported.get('rounding_increment',0)/2)
+                    checks.append(dict(area='reporting_structure',name=block+'_'+suffix+':'+pid,
+                        status='PASS' if abs(difference)<=tolerance else 'FAIL',
+                        detail='Current segment sum compared with the separately sourced group value; no balancing plug.',difference=difference,tolerance=tolerance))
+            if total['cells'] or total['show_when_missing']:totals.append(total)
+        ordered.extend(totals)
+        for entity in entities:
+            prefix=entity+'_'
+            matched=[r for rid,r in rows.items() if r.get('entity_id')==entity]
+            if not matched:
+                matched=[dict(id=prefix+'sales',label='Sales',unit=data['currency']+'m',metric_type='flow',kind='reported',cells={},show_when_missing=True)]
+            for row in matched:
+                original_id=row['id']
+                if original_id in used:
+                    row=copy.deepcopy(row);row['id']=display_ids[original_id]
+                    for cell in row['cells'].values():
+                        if cell.get('value') is not None:cell.update(model_expression='source',model_bindings=dict(source=original_id))
+                if row['id']==prefix+'sales':row['show_when_missing']=True
+                row['section']=title+' — '+labels.get(entity,entity.replace('_',' '))
+                ordered.append(row);used.add(original_id)
+        if declared and not any(t['cells'] for t in totals):
+            checks.append(dict(area='reporting_structure',name=block,status='MISSING',detail='No complete source-backed segment sum is available for '+title,difference=None,tolerance=None))
+    ordered.extend(row for rid,row in rows.items() if rid not in used)
+    return ordered,checks
+
+
 def historical_model(data, *, include_unreported_periods=False):
     """Project sourced history without constructing assumptions or forecasts.
 
@@ -481,7 +587,12 @@ def historical_model(data, *, include_unreported_periods=False):
     """
     from .periods import build_periods, derive_observations
 
+    data=copy.deepcopy(data);data['observations']=select_revised_observations(data.get('observations',[]))
     data=functional_structure_inputs(historical_eligibility_inputs(data))
+    provisional=data.get('model_configuration',{}).get('historical_display_policy')=='provisional_vendor_v1'
+    def visible(observation):
+        return observation.get('model_selection_eligible',True) and (observation.get('eligible',True)
+                or provisional and provisional_history_fact(observation))
     if not data.get('fiscal_calendar'):
         raise ValueError('Historical construction requires the company fiscal calendar')
     years=sorted(set(int(year) for year in data['history_years']))
@@ -496,9 +607,10 @@ def historical_model(data, *, include_unreported_periods=False):
     calendar=build_periods(calendar_years,data['fiscal_calendar'])
     annual={p['fiscal_year']:p for p in calendar if p['kind']=='FY'}
     reported_statuses={'reported','actual','derived','derived_actual'}
-    latest=max([annual[year]['end'] for year in years]+[
+    imported_dates=[c['period_metadata']['end'] for r in config.get('va_source_rows',[]) for c in r['cells']]
+    latest=max([annual[year]['end'] for year in years]+imported_dates+[
         o['end'] for o in observations if o.get('end') and o.get('status','reported') in reported_statuses
-        and o.get('eligible',True) and (not as_of or o['end']<=as_of)])
+        and visible(o) and (not as_of or o['end']<=as_of)])
     through=as_of if include_unreported_periods and as_of else min(latest,as_of) if as_of else latest
     periods=[dict(p,status='actual' if p['end']<=latest else 'not_disclosed') for p in calendar if p['end']<=through]
     period_map={p['id']:p for p in periods}
@@ -519,7 +631,7 @@ def historical_model(data, *, include_unreported_periods=False):
         for suffix,label,unit,metric_type in _SEGMENT_ROW_METADATA:
             rid=segment['id']+'_'+suffix
             rows[rid]=dict(id=rid,label=label,unit=unit_name(unit),metric_type=metric_type,
-                          section='segment_'+segment['id'],kind='reported',cells={})
+                          section='segment_'+segment['id'],entity_id=segment['id'],kind='reported',cells={})
     for item in operating_expense_functions(data):
         rows.setdefault(item['id'],dict(id=item['id'],label=item['label'],unit=money,
                                        metric_type='flow',section='income',kind='reported',cells={}))
@@ -529,6 +641,11 @@ def historical_model(data, *, include_unreported_periods=False):
         rows.setdefault(rid,dict(id=rid,label=observation.get('label',rid.replace('_',' ').capitalize()),
             unit=observation.get('unit',money),metric_type=observation.get('metric_type','flow'),
             section=section,kind='reported',cells={}))
+        rows[rid]['entity_id']=observation.get('entity_id','group')
+        if config.get('historical_layout')=='company_native_v1':
+            rows[rid]['label']=observation.get('label',rows[rid]['label'])
+            if observation.get('statement_section') and observation.get('entity_id') in ('group','corporate'):
+                rows[rid]['section']=observation['statement_section']
     existing={(o['row_id'],o['period_id']) for o in observations}
     for rid,source in dict(data.get('historical',{}),**data.get('schedule_controls',{})).items():
         row=rows.setdefault(rid,dict(id=rid,label=rid.replace('_',' ').capitalize(),unit=money,
@@ -579,10 +696,12 @@ def historical_model(data, *, include_unreported_periods=False):
     # Keep unsupported facts visible in the original input artifact, never turn
     # them into historical cells or silently manufacture missing amounts.
     applicable=[o for o in observations if o['period_id'] in period_map and o.get('status','reported') in reported_statuses]
-    derived=derive_observations(applicable,periods)
+    selected=[o for o in applicable if o.get('model_selection_eligible',True)]
+    derived=derive_observations(selected,periods)
+    derived['observations'].extend(o for o in applicable if not o.get('model_selection_eligible',True))
     candidates={}
     for observation in derived['observations']:
-        if not observation.get('eligible',True) or not observation.get('model_selection_eligible',True):continue
+        if not visible(observation):continue
         candidates.setdefault((observation['row_id'],observation['period_id']),[]).append(observation)
     preferred=config.get('preferred_observation_ids',{})
     for (rid,pid),choices in candidates.items():
@@ -591,21 +710,30 @@ def historical_model(data, *, include_unreported_periods=False):
         if not selected:
             active=data.get('active_basis_by_period',{}).get(pid,{})
             entity_scope='segments' if rows[rid]['section'].startswith('segment_') else 'group'
-            basis=active.get(entity_scope) if isinstance(active,dict) else active
+            entity=rows[rid].get('entity_id','group')
+            legacy=entity not in {'group','corporate'}|{s['id'] for s in data.get('segments',[])}
+            basis=active.get(entity if legacy else entity_scope) if isinstance(active,dict) else None if legacy else active
             selected=[o for o in choices if basis in (o.get('basis'),o.get('compatibility_key'))] if basis else choices
         direct=[o for o in selected if o.get('status') in ('actual','reported')]
         if direct:selected=direct
         if not selected:continue
         values={o.get('value') for o in selected}
-        if len(values)>1:
+        bases={(o.get('basis'),o.get('entity_id'),o.get('restatement'),o.get('restatement_vintage')) for o in selected}
+        if len(values)>1 or len(bases)>1 and any(not o.get('eligible',True) for o in selected):
             rows[rid]['cells'][pid]=dict(value=None,status='conflict',observation_ids=[o['id'] for o in selected],editable=False)
         else:
             chosen=selected[0]
-            rows[rid]['cells'][pid]=dict(value=chosen.get('value'),status=chosen.get('status','actual'),
-                observation_id=chosen['id'],source_refs=copy.deepcopy(chosen.get('source_refs',[])),editable=False)
+            rows[rid]['cells'][pid]=dict(value=chosen.get('value'),status='provisional_vendor' if not chosen.get('eligible',True) else chosen.get('status','actual'),
+                observation_id=chosen['id'],rounding_increment=chosen.get('rounding_increment',0),
+                source_refs=copy.deepcopy(chosen.get('source_refs',[])),editable=False)
+    ordered,reporting_checks=_historical_reporting_blocks(data,rows,periods)
+    reporting_checks.extend(dict(area='unresolved_alternate',name=item['row_key'],status='WARNING',
+        detail=item['label']+': '+item['reason']+' Values retained outside active selection in va_unresolved_series.json.',difference=None,tolerance=None)
+        for item in config.get('va_unresolved_series',[]))
     return dict(company=data['company'],currency=data['currency'],historical_years=years,
-        latest_reporting_date=latest,as_of=as_of,periods=periods,rows=list(rows.values()),
-        observations=derived['observations'],derivation_checks=derived['checks'],
+        latest_reporting_date=latest,as_of=as_of,periods=periods,rows=ordered,
+        observations=derived['observations'],derivation_checks=derived['checks']+reporting_checks,
+        native_source_rows=copy.deepcopy(config.get('va_source_rows',[])),
         entity_versions=copy.deepcopy(data.get('entity_versions',[])),
         reporting_bridges=copy.deepcopy(data.get('reporting_bridges',[])))
 

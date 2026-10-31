@@ -27,43 +27,15 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.pagebreak import Break
 
 from company_initiation.shared_runtime import dependencies, expression_tree, formula_excel, formula_value
-
-
-STYLE_VERSION = "financial-model-5"
-NAVY = "183B56"
-INK = "111827"
-PINK = "D63384"
-BLUE = "0000FF"
-GREEN = "008000"
-YELLOW = "FFFFCC"
-PALE = "E4EFF3"
-GREY = "64748B"
-NUMBER = '#,##0.0;(#,##0.0);"–"'
-RATE = '0.0%;(0.0%);"–"'
-BOX = Border(*(Side(style="thin", color="B2B2B2") for _ in range(4)))
-TOTAL = Border(top=Side(style="thin", color="AABAC6"), bottom=Side(style="thin", color="AABAC6"))
-
-
-def _text(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, (dict, list)) else value
+from company_initiation.shared_excel import (
+    STYLE_VERSION, NAVY, INK, PINK, BLUE, GREEN, YELLOW, PALE, GREY,
+    NUMBER, RATE, BOX, TOTAL, _text, _number, _format, _display_unit,
+    _style_sheet, _cell, _bar, _table,
+)
 
 
 def _lookup(mapping, year):
     return mapping.get(str(year), mapping.get(year))
-
-
-def _number(value):
-    return type(value) in (int, float) and math.isfinite(value)
-
-
-def _format(unit):
-    if unit == "exchange_rate":
-        return '0.000000;(0.000000);"–"'
-    if unit in ("ratio", "%", "rate"):
-        return RATE
-    if unit == "bps":
-        return '0;[Red](0);"–"'
-    return NUMBER
 
 
 def _model_format(row):
@@ -79,66 +51,6 @@ def _model_format(row):
     places = max(1, min(12, math.ceil(-math.log10(tolerance)) + 1))
     numeric = "#,##0." + "0" * places
     return f'{numeric};({numeric});"–"'
-
-
-def _display_unit(unit):
-    if unit.endswith("m/shares_m"):
-        return unit.replace("m/shares_m", "/share")
-    return {"ratio": "%", "shares_m": "m shares", "exchange_rate": "quote / unit"}.get(unit, unit)
-
-
-def _style_sheet(sheet, freeze="D6"):
-    sheet.sheet_view.showGridLines = False
-    sheet.sheet_view.zoomScale = 70
-    sheet.freeze_panes = freeze
-    sheet.sheet_properties.pageSetUpPr.fitToPage = True
-    sheet.page_setup.orientation = "landscape"
-    sheet.page_setup.paperSize = sheet.PAPERSIZE_A3
-    sheet.page_setup.fitToWidth = 1
-    sheet.page_setup.fitToHeight = 0
-    sheet.print_options.horizontalCentered = False
-    sheet.sheet_properties.outlinePr.summaryRight = False
-    sheet.print_title_rows = "1:5"
-    sheet.sheet_format.defaultRowHeight = 15
-    sheet.sheet_format.defaultColWidth = 14
-    sheet.oddFooter.center.text = "Page &P of &N"
-    sheet.page_margins.bottom = 0.5
-    sheet.page_margins.footer = 1 / 6
-
-
-def _cell(sheet, row, column, value=None, *, color=INK, bold=False, fill=None, number_format=None):
-    cell = sheet.cell(row, column, value)
-    cell.font = Font(name="Aptos", size=10, color=color, bold=bold)
-    cell.alignment = Alignment(vertical="center")
-    if fill:
-        cell.fill = PatternFill("solid", fgColor=fill)
-    if number_format:
-        cell.number_format = number_format
-    return cell
-
-
-def _bar(sheet, row, label, last_column):
-    for column in range(2, last_column + 1):
-        cell = _cell(sheet, row, column, label if column == 2 else None,
-                     color="FFFFFF", bold=True, fill=NAVY)
-        cell.font = Font(name="Aptos", size=11, color="FFFFFF", bold=True)
-    sheet.row_dimensions[row].height = 27
-
-
-def _table(workbook, name, columns, records, widths=None):
-    sheet = workbook.create_sheet(name)
-    _style_sheet(sheet, "B6")
-    _cell(sheet, 2, 2, name, bold=True)
-    for column, label in enumerate(columns, 1):
-        _cell(sheet, 5, column, label, bold=True, color="FFFFFF", fill=NAVY)
-        sheet.column_dimensions[get_column_letter(column)].width = (widths or {}).get(column, 24)
-    for row, record in enumerate(records, 6):
-        for column, value in enumerate(record, 1):
-            c = _cell(sheet, row, column, _text(value))
-            c.alignment = Alignment(vertical="top", wrap_text=True)
-        sheet.row_dimensions[row].height = 30
-    sheet.auto_filter.ref = f"A5:{get_column_letter(len(columns))}{max(5, sheet.max_row)}"
-    return sheet
 
 
 def _supporting(workbook, name, data):
@@ -510,7 +422,7 @@ def export_integrated(path, spec, values, checks, *, valuation=None):
                     if cell.data_type == "f" and ("#REF!" in cell.value or "[" in cell.value):
                         raise ValueError(f"Broken/external formula: {sheet.title}!{cell.coordinate}")
         saved.close()
-    return dict(status="structure_and_formula_syntax_checked", recalculation="not_run", formula_count=formula_count,
+    return dict(status="structure_and_formula_syntax_checked", recalculation=dict(status="not_run"), formula_count=formula_count,
                 expected_model_cells=expected_model, expected_check_cells=expected_checks,
                 model_rows=positions, year_columns={str(year): get_column_letter(column) for year, column in columns.items()},
                 section_rows=section_positions, assumption_count=len(assumptions), assumption_cells=assumption_cells, **valuation_inspection)
@@ -1315,7 +1227,7 @@ def _export_periodic(path, spec, values, checks, *, valuation=None):
             key=item.get('area','review')+': '+item['status']
             finding_counts[key]=finding_counts.get(key,0)+1
     model.cell(summary_row,2).comment=Comment(_text(dict(gaps=spec.get('gaps',[]),finding_counts=finding_counts,
-        full_findings='Every finding and its evidence is preserved in model.audit.json under checks.',
+        full_findings='Every finding and its evidence is preserved in '+path.with_suffix('.audit.json').name+' under checks.',
         fx='Rates and exposure matrices on FX; provisional weights and adjustment factors on Assumptions. Historical reported FX is preserved.')),'Refractive')
     valuation_inspection = _valuation_sheet(workbook, spec, values, valuation, resolve) if valuation is not None else {}
     audit = dict(style_version=STYLE_VERSION, dependencies=dependency_rows, drivers=driver_rows, sources=source_rows, checks=checks, reporting_bridges=spec.get("reporting_bridges", []), missing_value_audit=spec.get("missing_value_audit", {}), fx_metadata=spec.get("fx_metadata", {}),fx_currency_coverage=spec.get('fx_currency_coverage',[]),fx_exposure_quality=spec.get('fx_exposure_quality',[]),financial_contracts=spec.get('financial_contracts',{}), valuation=valuation)
@@ -1325,7 +1237,7 @@ def _export_periodic(path, spec, values, checks, *, valuation=None):
                 if cell.comment and len(cell.comment.text)>32767:
                     reference=sheet.title+'!'+cell.coordinate
                     audit.setdefault('extended_cell_comments',{})[reference]=cell.comment.text
-                    cell.comment=Comment('This commentary exceeds the Excel comment size supported by this exporter. The complete text is preserved in model.audit.json under extended_cell_comments['+reference+']. No source evidence has been discarded.','Refractive')
+                    cell.comment=Comment('This commentary exceeds the Excel comment size supported by this exporter. The complete text is preserved in '+path.with_suffix('.audit.json').name+' under extended_cell_comments['+reference+']. No source evidence has been discarded.','Refractive')
     path.parent.mkdir(parents=True, exist_ok=True)
     path.with_suffix(".audit.json").write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
     workbook._sheets.sort(key=lambda sh: {"Model": 0, "Valuation": 1, "Assumptions": 2, "Historics": 3, "FX": 4, "Historical Segments": 5}.get(sh.title, 6))
@@ -1341,7 +1253,7 @@ def _export_periodic(path, spec, values, checks, *, valuation=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(path)
     workbook.close()
-    return dict(style_version=STYLE_VERSION, status="structure_and_formula_syntax_checked", recalculation="not_run", formula_count=formula_count,
+    return dict(style_version=STYLE_VERSION, status="structure_and_formula_syntax_checked", recalculation=dict(status="not_run"), formula_count=formula_count,
                 expected_model_cells=expected_model, expected_check_cells=expected_checks, expected_assumption_cells=expected_assumptions, expected_fx_cells=expected_fx,expected_history_cells=expected_history,hidden_assumption_rows=hidden_assumption_rows,
                 model_rows=positions, fx_rows=fx_positions, period_columns={pid: get_column_letter(c) for pid, c in columns.items()},
                 internal_period_columns={pid:get_column_letter(c) for pid,c in internal_columns.items()},history_rows=history_positions,

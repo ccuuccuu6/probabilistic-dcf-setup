@@ -862,3 +862,123 @@ class FrozenOriginalReuseTests(unittest.TestCase):
             saved.write_bytes(b'changed frozen original')
             with self.assertRaisesRegex(ValueError,'changed before freezing'):
                 freeze_model_sources(data,archive,target,previous=parent,outputs=outputs)
+
+
+class ConstructionStageWorkbookTests(unittest.TestCase):
+    """Small synthetic handoff checks; no source research or real company build."""
+
+    def run_stages(self, *, dcf_failure=False, include_valuation=True):
+        from contextlib import ExitStack
+        from openpyxl import load_workbook
+        from tests.test_valuation import fixture
+        from company_initiation.dcf_construction.workflow import valuation_snapshot
+        from company_initiation.forecast_construction.integrated import construct_integrated
+
+        spec, values, valuation_inputs = fixture()
+        spec.update(historical_years=[2024], forecast_years=[2025],
+            sections=[dict(id='income',label='SYNTHETIC financial statements')],
+            identities=[], sources=[], gaps=[], policies={}, observation_selection=[],
+            derivation_checks=[], missing_value_audit={})
+        for row in spec['rows']:
+            row.update(label=row['id'].replace('_',' ').capitalize(), section='income', kind='reported')
+        data=dict(company=spec['company'], currency='GBP', history_years=[2024],
+            fiscal_calendar={'fiscal_year_end':'12-31'}, forecast_basis='SYNTHETIC original basis',
+            model_configuration={'as_of':'2024-12-31'}, segments=[], corporate={}, sources=[],
+            historical={row['id']:dict(values={'2024':values[row['id']]['2024-FY']},
+                sources={'2024':[dict(source_id='synthetic_primary',unit_id='table:1')]},
+                basis='SYNTHETIC original basis') for row in spec['rows']})
+        temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup)
+        root=Path(temporary.name);archive=root/'archive';archive.mkdir()
+        inputs=root/'inputs.json';inputs.write_text(json.dumps(data),encoding='utf-8')
+        provider=OpenAIProvider(api_key='SYNTHETIC-TEST-KEY')
+        events=[];checkpoints={}
+
+        def workbook_sheets(path):
+            with path.open('rb') as stream:
+                book=load_workbook(stream,read_only=True,data_only=False)
+                try:return book.sheetnames
+                finally:book.close()
+
+        def compile_model(*args,**kwargs):
+            runs=list((root/'outputs').glob('construct_integrated_*'))
+            self.assertEqual(len(runs),1)
+            run=runs[0];history=run/'historical_model.xlsx'
+            self.assertTrue(history.is_file(),'History must be exported before forecast construction')
+            self.assertNotIn('Assumptions',workbook_sheets(history))
+            self.assertNotIn('Valuation',workbook_sheets(history))
+            checkpoints[history.name]=hashlib.sha256(history.read_bytes()).hexdigest()
+            events.append('forecast_compile')
+            return copy.deepcopy(spec)
+
+        def dcf(journal, actual_spec, actual_values, actual_data, *args, **kwargs):
+            forecast=journal.directory/'forecast_model.xlsx'
+            self.assertTrue(forecast.is_file(),'Forecast must be exported before DCF construction')
+            self.assertIn('Assumptions',workbook_sheets(forecast))
+            self.assertNotIn('Valuation',workbook_sheets(forecast))
+            checkpoints[forecast.name]=hashlib.sha256(forecast.read_bytes()).hexdigest()
+            saved=json.loads((journal.directory/'record.json').read_text(encoding='utf-8'))
+            for name,sha in checkpoints.items():self.assertEqual(saved['artifacts'][name],sha)
+            events.append('dcf')
+            if dcf_failure:raise ValueError('SYNTHETIC DCF evidence unavailable')
+            result=valuation_snapshot(actual_spec,actual_values,actual_data,
+                valuation_date='2024-12-31',previous_inputs=valuation_inputs)
+            result['company_inputs']=copy.deepcopy(actual_data)
+            return result
+
+        with ExitStack() as stack:
+            stack.enter_context(patch('company_initiation.forecast_construction.integrated.inventory_local_sources',
+                return_value={'manifest_sha256':'synthetic_stage_inventory'}))
+            stack.enter_context(patch('company_initiation.historic_construction.evidence.verify_model_input_sources',return_value=[]))
+            stack.enter_context(patch('company_initiation.historic_construction.workflow.freshness_checks',return_value=[]))
+            stack.enter_context(patch('company_initiation.forecast_construction.integrated.build_periodic_spec',side_effect=compile_model))
+            stack.enter_context(patch('company_initiation.forecast_construction.periods.calculate_periodic',return_value=values))
+            stack.enter_context(patch('company_initiation.forecast_construction.periods.validate_periodic',return_value=[]))
+            stack.enter_context(patch('company_initiation.forecast_construction.integrated.periodic_sensitivities',return_value=([],[])))
+            reviews=stack.enter_context(patch.object(RunJournal,'review_stage',return_value={'findings':[]}))
+            complete=stack.enter_context(patch.object(provider,'complete',side_effect=AssertionError('Stage exports must not call AI')))
+            network=stack.enter_context(patch('company_initiation.shared_ai.urlopen',side_effect=AssertionError('No live provider in fixture')))
+            if dcf_failure:
+                with self.assertRaisesRegex(ValueError,'SYNTHETIC DCF evidence unavailable'):
+                    construct_integrated(root,data['company'],archive,inputs,provider=provider,recalculate=False,
+                        include_valuation=True,valuation_stage=dcf,forecast_years=1)
+                run=next((root/'outputs').glob('construct_integrated_*'))
+            else:
+                run=construct_integrated(root,data['company'],archive,inputs,provider=provider,recalculate=False,
+                    include_valuation=include_valuation,valuation_stage=dcf if include_valuation else None,forecast_years=1)
+            self.assertEqual(reviews.call_count,5,'Exporting checkpoints must not duplicate financial review')
+            complete.assert_not_called();network.assert_not_called()
+        record=json.loads((run/'record.json').read_text(encoding='utf-8'))
+        self.assertEqual(record['calls'],[])
+        for name,sha in checkpoints.items():
+            self.assertEqual(hashlib.sha256((run/name).read_bytes()).hexdigest(),sha,
+                'Later stages must preserve the earlier workbook bytes')
+            self.assertEqual(record['artifacts'][name],sha)
+        return run,record,events,workbook_sheets
+
+    def test_separate_workbooks_are_saved_in_stage_order_with_audited_hashes(self):
+        run,record,events,sheets=self.run_stages()
+        self.assertEqual(events,['forecast_compile','dcf'])
+        self.assertIn('Valuation',sheets(run/'dcf_model.xlsx'))
+        self.assertIn('Valuation',sheets(run/'model.xlsx'))
+        self.assertEqual((run/'dcf_model.xlsx').read_bytes(),(run/'model.xlsx').read_bytes())
+        for name in ('historical_model.xlsx','forecast_model.xlsx','dcf_model.xlsx','model.xlsx'):
+            self.assertEqual(record['artifacts'][name],hashlib.sha256((run/name).read_bytes()).hexdigest())
+        declared={stage['workbook'] for stage in record['stage_outputs'].values()}
+        self.assertEqual(declared,{'historical_model.xlsx','forecast_model.xlsx','dcf_model.xlsx'})
+
+    def test_dcf_failure_preserves_finished_history_and_forecast_workbooks(self):
+        run,record,events,sheets=self.run_stages(dcf_failure=True)
+        self.assertEqual(events,['forecast_compile','dcf'])
+        self.assertEqual(record['status'],'incomplete')
+        self.assertTrue((run/'historical_model.xlsx').is_file())
+        self.assertTrue((run/'forecast_model.xlsx').is_file())
+        self.assertFalse((run/'dcf_model.xlsx').exists())
+        self.assertNotIn('Valuation',sheets(run/'forecast_model.xlsx'))
+
+    def test_forecast_only_run_keeps_its_checkpoint_and_legacy_output_without_dcf(self):
+        run,record,events,sheets=self.run_stages(include_valuation=False)
+        self.assertEqual(events,['forecast_compile'])
+        for name in ('forecast_model.xlsx','model.xlsx'):
+            self.assertNotIn('Valuation',sheets(run/name))
+            self.assertEqual(record['artifacts'][name],hashlib.sha256((run/name).read_bytes()).hexdigest())
+        self.assertFalse((run/'dcf_model.xlsx').exists())

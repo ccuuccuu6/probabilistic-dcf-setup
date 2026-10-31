@@ -14,7 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from company_initiation.shared_ai import OpenAIProvider, AIError
-from company_initiation.shared_budget import BudgetLedger, ledger_path, company_key
+from company_initiation.shared_budget import BudgetLedger, ledger_path, company_key, build_record_paths, record_in_build_scope
 from company_initiation.shared_runtime import RunJournal, write_json, digest, check
 from company_initiation.forecast_construction.construction import calculate_integrated, validate_integrated, recalculate_workbook, _object, _array, TEXT, _enum
 from company_initiation.historic_construction.evidence import inventory_local_sources
@@ -3340,6 +3340,10 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
     """
     root=Path(root).resolve();outputs=root/'outputs';archive=Path(archive).resolve()
     data=json.loads(Path(inputs_file).read_text(encoding='utf-8'))
+    if data.get('model_configuration',{}).get('forecast_preparation_status')=='pending':
+        from .workflow import prepare_forecast_inputs
+        inputs_file=prepare_forecast_inputs(root,company,archive,inputs_file,budget_usd=budget_usd,provider=provider,progress=progress)
+        data=json.loads(Path(inputs_file).read_text(encoding='utf-8'))
     data.setdefault('model_configuration',{})['as_of']=as_of or data.get('model_configuration',{}).get('as_of') or datetime.now(timezone.utc).date().isoformat()
     data['model_configuration']['historical_vintage']=bool(historical_vintage)
     valuation_configuration=dict(enabled=bool(include_valuation),
@@ -3376,16 +3380,16 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
     with _initiation_lock(outputs,scope=company_key(company)):
         ledger=BudgetLedger(ledger_path(outputs,company),company,budget_usd)
         prior=[]
-        for file in outputs.glob('construct_*/record.json'):
+        for file in build_record_paths(outputs,'construct_*/record.json'):
             saved=json.loads(file.read_text(encoding='utf-8'))
-            if company_key(saved.get('configuration',{}).get('company','unknown'))==company_key(company):
+            if record_in_build_scope(saved) and company_key(saved.get('configuration',{}).get('company','unknown'))==company_key(company):
                 ledger.import_record(saved);prior.append(saved)
         previous,continuation_recovery=select_integrated_previous(prior,outputs,company,resume)
         runtime=integrated_runtime_fingerprint()
         cache_key=integrated_source_cache_key(data,inventory,runtime)
         configuration=dict(company=company,sources=str(archive),manifest=inventory['manifest_sha256'],
             provider=provider.metadata(),mode='integrated_periodic_v2' if periodic else 'integrated_v1',input_hash=digest(dict(data=data,fx=fx_identity)) if fx_identity else digest(data),forecast_years=forecast_years,
-            runtime=runtime,source_cache_key=cache_key,valuation=valuation_configuration,
+            runtime=runtime,source_cache_key=cache_key,valuation=valuation_configuration,stage_workbooks=1,
             limits=dict(usd=budget_usd,calls=None,repairs=2,retries=0,generated_tokens=None),escalations=escalations,
             review_policy=dict(cheap_repairs=data['model_configuration'].get('cheap_review_repairs',defaults.get('cheap-review-repairs',1))))
         if previous and continuation_recovery is None and compatible_integrated_result(previous,configuration,runtime,cache_key):
@@ -3438,6 +3442,9 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
             journal.artifact('source_validation.json',source_checks)
             if any(c['status']=='FAIL' for c in source_checks):
                 raise ValueError('Source validation has discrepancies; inspect source_validation.json before model acceptance')
+            from company_initiation.historic_construction.model_excel import save_historical_output
+            save_historical_output(journal,data)
+            if progress:progress('Historical workbook: '+str(directory/'historical_model.xlsx'))
             from company_initiation.forecast_construction.periods import calculate_periodic, validate_periodic
             from shared_FX.fx import load_fx_source
             fx=fx_snapshot or (load_fx_source(source_folder/('shared_fx'+fx_file.suffix),
@@ -3521,6 +3528,10 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
                     review_scope='AI reviews target this final causal period graph; deterministic checks independently test its stated financial contracts.'))
                 journal.artifact('model_specification.json',spec);journal.artifact('forecast.json',values)
                 journal.artifact('drivers.json',[r for r in spec['rows'] if r['kind']=='assumption'])
+            from company_initiation.forecast_construction.workflow import save_forecast_output
+            from company_initiation.shared_artifacts import register_stage_output
+            register_stage_output(journal,'forecast',save_forecast_output(directory,spec,values,checks))
+            if progress:progress('Forecast workbook: '+str(directory/'forecast_model.xlsx'))
             valuation=None
             if include_valuation:
                 if valuation_stage is not None:
@@ -3543,6 +3554,10 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
             status='complete_provisional' if not any(c['status'] in ('FAIL','MISSING') for c in checks) else 'incomplete_model'
             journal.artifact('validation.json',dict(status=status,financial_completeness=spec['financial_completeness'],checks=checks,gaps=spec['gaps']))
             inspection=export_integrated(directory/'model.xlsx',spec,values,checks,**({'valuation':valuation['result']} if valuation else {}))
+            if valuation:
+                from company_initiation.dcf_construction.workflow import save_dcf_output
+                register_stage_output(journal,'dcf',save_dcf_output(directory,directory/'model.xlsx',inspection,checks))
+                if progress:progress('DCF workbook: '+str(directory/'dcf_model.xlsx'))
             if recalculate:
                 inspection['recalculation']=recalculate_workbook(directory/'model.xlsx',inspection)
                 if inspection['recalculation'].get('status')=='passed':
@@ -3550,6 +3565,8 @@ def construct_integrated(root, company, archive, inputs_file, *, reference_workb
                     inspection['sensitivities']=verify_excel_sensitivities(directory/'model.xlsx',spec,inspection,output_directory=directory)
             from company_initiation.forecast_construction.model_excel import validate_workbook_layout
             inspection['layout']=validate_workbook_layout(directory/'model.xlsx',inspection)
+            if valuation:
+                register_stage_output(journal,'dcf',save_dcf_output(directory,directory/'model.xlsx',inspection,checks))
             journal.artifact('workbook_validation.json',inspection)
             if inspection.get('recalculation',{}).get('status')!='passed' or inspection.get('sensitivities',{}).get('status')!='passed' or inspection['layout']['status']!='passed':status='incomplete_model'
             journal.state['artifacts']['model.xlsx']=hashlib.sha256((directory/'model.xlsx').read_bytes()).hexdigest()
@@ -3638,11 +3655,17 @@ def compatible_integrated_result(record, configuration, runtime, source_cache_ke
         return False
     if old.get('valuation')!=configuration.get('valuation'):
         return False
+    if old.get('stage_workbooks')!=configuration.get('stage_workbooks'):
+        return False
     if old.get('runtime')!=runtime or old.get('source_cache_key')!=source_cache_key:
         return False
     artifacts=record.get('artifacts',{})
     if not {'model.xlsx','model_specification.json','forecast.json','validation.json','workbook_validation.json'}<=artifacts.keys():
         return False
+    if configuration.get('stage_workbooks'):
+        required_outputs={'historical_model.xlsx','forecast_model.xlsx'}
+        if configuration.get('valuation',{}).get('enabled'):required_outputs.add('dcf_model.xlsx')
+        if not required_outputs<=artifacts.keys():return False
     directory=Path(record['directory'])
     validation=json.loads((directory/'validation.json').read_text(encoding='utf-8'))
     inspection=json.loads((directory/'workbook_validation.json').read_text(encoding='utf-8'))

@@ -836,8 +836,10 @@ def construct_company(root, company, source_directory, *, years=None, historical
         previous = None
         matching = []
         company_runs = []
-        for file in outputs.glob("construct_*/record.json"):
+        from ..shared_budget import build_record_paths, record_in_build_scope
+        for file in build_record_paths(outputs,"construct_*/record.json"):
             saved = json.loads(file.read_text(encoding="utf-8"))
+            if not record_in_build_scope(saved):continue
             config = saved.get("configuration", {})
             if config.get("company", "").strip().casefold() == company.strip().casefold():
                 company_runs.append((file, saved))

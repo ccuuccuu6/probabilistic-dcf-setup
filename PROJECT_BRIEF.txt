@@ -40,6 +40,71 @@ Do not create unsupported quarterly financial statements to serve a shared facto
 The saved backend owns observations, company structure, dated inputs, equations,
 events, FX and scenario evaluation. Excel Assumptions and Model boxes are audit
 projections of those inputs and the same equation definitions used by Python.
+
+Historical source priority clarified on 31 October 2026: supplied company-reported
+Visible Alpha exports provide the numerical foundation for construction. Python
+reads the eligible actual cells; company-specific row meanings, reporting bases
+and entity versions are research inputs. Local company disclosures explain notes,
+accounting scope, reporting changes and missing policies. Online discovery is a
+separate update action, not a prerequisite for reconstructing a supplied archive.
+Vendor-delivered actuals are distinct from independent primary verification and
+historical publication availability; unverified status remains explicit. This
+does not relax the stricter historical-only initiation acceptance standard.
+The 31 October mapping revision makes AI responsible for cited financial concepts,
+entities and reporting-version intervals. Python owns source-cell/period expansion,
+native numeric and unit conventions, validation and bounded patch application.
+Preserve validated progress and inspectable incomplete outputs separately from
+completed financial review; corrections must retain unaffected source bindings.
+The same-day display clarification separates source arithmetic, financial meaning,
+period basis, original/restated provenance, publication vintage and calibration.
+Company-reported vendor facts with clear definitions and dated bases can appear
+in a labelled provisional historical projection despite unknown provenance; this
+does not confer independent verification, cross-basis comparability, calibration
+eligibility or strict historical-initiation acceptance. Ambiguities and conflicting
+versions remain visible rather than being repaired by blanket eligibility changes.
+The approved semantic revision keeps physical source row keys separate from typed
+financial roles. Python supplies fiscal intervals and binds immutable source values;
+AI interprets financial definitions and cited dated reporting hierarchies. Essential
+coverage and an early semantic challenge precede detailed mapping. A targeted Luna
+task may inspect original notes to resolve a specific evidence gap, while genuinely
+unresolved questions remain explicit. These extra tasks share the build's existing
+allowance; they do not replace final historical review or create independent source
+acceptance. Rewording an unresolved finding is not progress.
+
+The 31 October restatement instruction distinguishes structural redefinitions from
+numerical revisions. Redefined regions or businesses keep distinct identities and
+complete presentation blocks: current structure first, historical structure below,
+each with its own constituent-linked group totals. Published comparatives on the
+new basis can overlap the old presentation before the operational change date.
+Revised amounts on an unchanged financial definition replace earlier displayed
+amounts within the same identity; original observations remain in the audit record.
+Company disclosures determine these structures and dates. Unresolved definitions
+and conflicting revision vintages remain explicit, without invented historical
+values or financial bridges.
+The subsequent clarification keeps both original and restated numerical observations
+in the supplied company-reported VA data. PDFs support reporting definitions and
+comparative applicability; the construction workflow does not reconstruct their
+restated tables. An unresolved alternate vendor series remains auditable outside
+active financial selection when the essential concept has supported coverage, and
+both early and final financial reviews inspect that decision. Unresolved essentials
+and material definitional conflicts still prevent completion.
+
+The user subsequently affirmed the simplified construction boundary: import the
+supplied company-reported VA history, establish a coherent company-native mapping
+and layout, apply source/arithmetic/financial checks and export the historical
+backend and Excel. Local originals address specific unresolved definitions or
+reporting changes. Forecast-driver, exposure and prospective policy research belong
+to forecast construction. Retain supported facts and explicit limitations through
+repairs; source import and common-concept mapping failures are different questions.
+This approved boundary is implemented for VA historical construction. One focused
+review follows assembled history; mandatory early proof loops are superseded.
+Common-role uncertainty does not erase source-native audit facts or justify
+fabricated economic meaning. Material financial ambiguity still prevents a
+completed model. README records current verification and the live-validation gap.
+
+Each historical, forecast-framework and DCF construction stage emits its own
+inspectable Excel checkpoint; later stages consume the saved backend inputs and
+results, not edits to an earlier workbook.
 Workbook edits remain local unless a validated import explicitly updates backend
 inputs. Stable business identifiers, typed periods and dated scenario payloads
 provide the interface for a future forecasting agent; evaluation needs neither
@@ -56,8 +121,9 @@ options valuation remain future work. The user now authorizes Nestle, L'Oreal an
 Danone builds from their own raw sources through the public CLI, including supplied
 VA exports and application-retrieved primary disclosures. The application must
 create company mappings/configuration; Codex improves shared code rather than
-manually constructing each company. Each company has an independent cumulative
-$20 application budget, preserving its attributable prior costs and reservations.
+manually constructing each company. Each new terminal build has an independent
+$20 application allowance by default; its stages and explicit continuations share
+that allowance. Preserve attributable prior costs and reservations as lifetime evidence.
 The primary consolidation hierarchy remains separate from overlapping geography
 or product analyses. Synthetic fixtures do not substitute for these real builds.
 
@@ -351,7 +417,8 @@ runs as incomplete without asking a human to pilot each stage. Zero errors canno
 be guaranteed: source quality, model mistakes and correlated reviewer errors remain.
 
 Initiation must preserve completed work through interruptions and resume compatible
-progress on the next matching request, without repaying for saved AI responses.
+progress only when explicitly selected by the command, without repaying for saved AI
+responses. An ordinary terminal command starts new research with a new allowance.
 Keep earlier runs and original sources intact, reconstruct independent review
 contexts, and carry one cumulative token/cost history and spending allowance across
 continuations. Freeze the research date and verify code, settings, parsers and
@@ -370,8 +437,8 @@ review. Overlapping durations must not be added together; any later cross-period
 derivation needs compatible definitions and reporting vintages and must be labelled
 calculated. Cash continuity follows actual balance dates, not column position.
 
-The standard historical request is ten completed fiscal years and their reported
-interims; the initial two-year Nestlé example remains a validation slice. On 11 October
+The standard historical request is fiscal 2018 through the latest evidenced
+completed fiscal year, with reported interims (25 October 2026 instruction); the initial two-year Nestlé example remains a validation slice. On 11 October
 2026 the user authorized local Visible Alpha exports and manually collected company
 documents in place of wide browser discovery. This changes evidence acquisition,
 not the reusable modelling/checking engine or the need for independent company
@@ -516,7 +583,12 @@ requirements describe the separate historical-initiation workflow, not a mandato
 gate before making this real company model useful. Actual source comparisons,
 financial identities, independent expectations, sensitivity behaviour and Excel
 inspection remain required; balanced statements and synthetic tests are insufficient.
-Each company's construction budget follows its own cumulative attempt ledger. Unknown requests
+Each company's durable construction ledger retains separate build allowances.
+The 31 October 2026 user instruction authorizes a new allowance for every default
+terminal build. Explicit resume retains the selected build's original cap and
+remaining budget, including after newer independent builds. No new allowance erases
+lifetime charges or unresolved earlier requests. Within-build retries and stage
+transitions never reset its allowance. Unknown requests
 retain conservative reservations and may coexist with further work inside the
 authorized allowance; they are never assumed free or silently reset by migration.
 
@@ -559,9 +631,9 @@ Code and storage:
   setup configs and synthetic FX demo were removed to keep the active code focused.
   Discovered identity and reporting definitions are frozen in the run. A later maintained baseline needs explicit versioning and
   promotion rules. Evolving estimates and observations are not editable equations.
-- A proposed later local_store/research.sqlite design could hold source identity/availability,
+- A proposed later data_store/research.sqlite design could hold source identity/availability,
   extracted facts, distribution versions and company mappings in distinct records.
-  Current originals use local_store/<company>/ with source categories; do not create
+  Current originals use data_store/company_data/<company>/ with source categories; do not create
   a second raw_sources archive or database merely to implement this future proposal.
   Use one storage-access boundary if needed later; financial equations must not query
   storage directly. Create new infrastructure only for an implemented requirement.

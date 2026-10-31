@@ -31,7 +31,7 @@ from openpyxl.workbook.properties import CalcProperties
 
 from company_initiation.shared_ai import AIError, AIProvider, OpenAIProvider, aggregate_usage, format_usage, has_known_pricing, response_usage
 from company_initiation.historic_construction.evidence import SourceStore
-from company_initiation.shared_project import read_json
+from company_initiation.shared_project import read_json, resolve_data_path
 
 
 SECTIONS = ("segments", "income_statement", "balance_sheet", "cash_flow",
@@ -188,8 +188,9 @@ Use web search to resolve the requested legal entity and find accessible origina
 annual and interim financial statements, quarterly trading/sales releases, segment
 notes, supporting schedules and official machine-readable tables. Decide which
 sources are authoritative and why. Use the
-requested historical years, or the requested count of latest fully reported annual
-periods as of the supplied date, including all their published interim periods.
+requested explicit historical years or latest-year count when supplied. Otherwise
+include every fiscal year from start_year through the latest fully reported
+annual year evidenced as of the supplied date, including their published interims.
 Do not assume calendar years. Prefer comparative
 figures on one clearly stated reporting basis. Find enough sources for income,
 balance sheet, cash flow, operating segments, working capital, debt, equity and
@@ -596,10 +597,14 @@ def validate_discovery(discovery, request):
     periods = discovery["periods"]
     annuals = [period for period in periods if period["kind"] == "annual"]
     years = [period["year"] for period in annuals]
-    if len(years) != request["historical_years"] or years != sorted(set(years)):
+    if not years or years != sorted(set(years)) or (request.get("historical_years") is not None and len(years) != request["historical_years"]):
         raise ValueError("Wrong count, duplicate or unordered historical years")
     if request["years"] and years != request["years"]:
         raise ValueError("Discovered periods differ from requested historical years")
+    if not request["years"] and request.get("start_year") is not None:
+        from .periods import requested_history_years
+        if years != requested_history_years(years[-1],start_year=request["start_year"]):
+            raise ValueError("Discovered history must cover every fiscal year from the requested start year")
     by_id = {period["id"]: period for period in periods}
     if len(by_id) != len(periods):
         raise ValueError("Duplicate historical period IDs")
@@ -1804,6 +1809,11 @@ def _initiation_lock(outputs, *, scope=None):
     """
     if scope is not None and (not isinstance(scope,str) or not re.fullmatch(r'[0-9a-f]{24}',scope)):
         raise ValueError('Construction lock scope must be a stable hexadecimal company key')
+    if scope is not None:
+        from ..shared_budget import command_owns_company_lock
+        if command_owns_company_lock(outputs,scope):
+            yield
+            return
     outputs.mkdir(parents=True, exist_ok=True)
     filename='.construction_'+scope+'.lock' if scope is not None else '.initiation.lock'
     with (outputs / filename).open("a+b") as handle:
@@ -1850,8 +1860,10 @@ non-disclosure. Required missing evidence is a blocking issue, not a zero/waiver
 Use search_query for a short literal local phrase, or read_requests to open whole
 documents, returning discovery=null while navigating. Finish with both navigation
 fields empty and a DISCOVERY object. Choose exactly the requested fiscal years,
-or the requested number of latest fully reported annual years evidenced in the
-archive. Do not silently shorten ten years to the two years easiest to read.
+or the requested number of latest fully reported annual years when supplied.
+Otherwise include every fiscal year from start_year through the latest fully
+reported annual year evidenced in the archive as of the supplied date. Do not
+silently shorten the requested scope to the years easiest to read.
 Include each actually reported quarter, half-year and cumulative 9M in those years.
 Annual IDs equal the year (e.g. 2025); interim IDs append -Q1,-Q2,-Q3,-Q4,-H1,-H2,-9M.
 Use annual/quarter/half_year/year_to_date kinds with actual start/end dates. Q1,H1,9M
@@ -2005,7 +2017,7 @@ def _scope_model(candidate, rows, period_ids):
 
 def _request_identity(request):
     return (" ".join(request["company_query"].casefold().split()),
-            request["historical_years"], request["years"], request["forecast_years"])
+            request["historical_years"], request["years"], request["forecast_years"], request.get("start_year"))
 
 
 def _saved_run(outputs, request, resume, fresh):
@@ -2038,8 +2050,24 @@ def _saved_run(outputs, request, resume, fresh):
             raise ValueError("The requested resume run was not found")
         return None, None
     _, _, latest, saved = max(matches, key=lambda match: (match[0], match[1]))
-    if selected is not None and selected != latest:
-        raise ValueError(f"A newer matching run exists; resume {latest} to avoid branching the spending budget")
+    if selected is not None:
+        # A later fresh command owns another budget and cannot supersede this
+        # one. Only descendants of the selected run can have spent its budget.
+        records={item[2]:item[3] for item in matches}
+        descendants=[]
+        for started,name,path,record in matches:
+            cursor=path;seen=set()
+            while cursor in records and cursor not in seen:
+                seen.add(cursor)
+                parent=records[cursor].get('parent_run')
+                if not parent:break
+                cursor=Path(parent).resolve()
+                if cursor==selected:
+                    descendants.append((started,name,path));break
+        if descendants:
+            newest=max(descendants)[2]
+            raise ValueError(f'A newer continuation exists; resume {newest} to avoid branching this run budget')
+        return selected,selected_record
     return latest, saved
 
 
@@ -2107,8 +2135,8 @@ def _resume_history(directory, saved, outputs, code, environment, provider_metad
     return entries
 
 
-def initiate_company(root: Path, company: str, *, historical_years: int = 10,
-                     years: list[int] | None = None, forecast_years: int = 5,
+def initiate_company(root: Path, company: str, *, historical_years: int | None = None,
+                     years: list[int] | None = None, start_year: int | None = None, forecast_years: int = 5,
                      provider: AIProvider | None = None, fetcher=None,
                      max_cost_usd: float = 20.0, progress=None,
                      resume: Path | None = None, fresh: bool = False,
@@ -2126,11 +2154,15 @@ def initiate_company(root: Path, company: str, *, historical_years: int = 10,
     """
     if not isinstance(company, str) or not company.strip() or len(company) > 300:
         raise ValueError("Supply a company name, preferably with ticker/exchange/country")
+    from .periods import requested_history_years, DEFAULT_HISTORY_START_YEAR
+    if start_year is None and historical_years is None and years is None:start_year=DEFAULT_HISTORY_START_YEAR
+    requested_history_years(9998,years=years,historical_years=None if years is not None else historical_years,start_year=start_year)
     if years is not None:
         if not isinstance(years, list) or not years or any(type(year) is not int for year in years) or years != sorted(set(years)):
             raise ValueError("Historical years must be distinct and increasing")
         historical_years = len(years)
     for name, value, high in (("historical_years", historical_years, 30), ("forecast_years", forecast_years, 10)):
+        if name=="historical_years" and value is None:continue
         if type(value) is not int or not 1 <= value <= high:
             raise ValueError(f"{name} must be an integer from 1 to {high}")
     if type(max_cost_usd) not in (int, float) or not math.isfinite(max_cost_usd) or not 0 < max_cost_usd <= 20:
@@ -2142,7 +2174,7 @@ def initiate_company(root: Path, company: str, *, historical_years: int = 10,
     if any(not has_known_pricing(provider_metadata.get("models", {}).get(role))
            for role in ("researcher", "extractor", "reviewer")):
         raise AIError("The spending guard needs known pricing for every configured research, extraction and review model")
-    request = {"company_query": company, "historical_years": historical_years, "years": years,
+    request = {"company_query": company, "historical_years": historical_years, "years": years, "start_year": start_year,
                "forecast_years": forecast_years, "as_of": date.today().isoformat(),
                "max_cost_usd": max_cost_usd}
     root = Path(root).resolve()
@@ -2158,7 +2190,7 @@ def initiate_company(root: Path, company: str, *, historical_years: int = 10,
         request.update(source_directory=str(source_directory.resolve()),
                        source_manifest_sha256=local_inventory["manifest_sha256"], input_mode="local")
     elif fetcher is None:
-        raise ValueError("Supply --sources with the company archive folder, for example --sources local_store/company. Initiation no longer starts a browser search")
+        raise ValueError("Supply --sources with the company archive folder, for example --sources data_store/company_data/company. Initiation no longer starts a browser search")
     else:
         # Explicit injected acquisition adapters remain available for offline
         # regression fixtures; the CLI never exposes this former network route.
@@ -2181,7 +2213,11 @@ def _run_initiation(root, request, provider, provider_metadata, fetcher, progres
     parent, previous = _saved_run(outputs, request, resume, fresh)
     replay, source_events = [], []
     if parent is not None:
-        if request.get("source_directory") != previous["request"].get("source_directory"):
+        prior_directory=previous['request'].get('source_directory')
+        current_directory=request.get('source_directory')
+        if ((prior_directory is None)!=(current_directory is None)
+                or (current_directory is not None
+                    and resolve_data_path(root,current_directory)!=resolve_data_path(root,prior_directory))):
             raise ValueError("Source archive or intake mode differs from the saved run. Use --fresh explicitly to start a new budget; no AI request was sent")
         if request.get("source_manifest_sha256") != previous["request"].get("source_manifest_sha256"):
             raise ValueError("Local source files or source inventory changed. Restore the frozen archive or use --fresh explicitly; no AI request was sent")
@@ -2603,8 +2639,8 @@ files cannot be fixed by browser calls. Include meaningful gaps, never invented 
     try:
         save()
         # Export settings are not requests for future financial evidence.
-        discovery_request = {key: request[key] for key in
-                             ("company_query", "historical_years", "years", "as_of")}
+        discovery_request = {key: request.get(key) for key in
+                             ("company_query", "historical_years", "years", "start_year", "as_of")}
         if local_inventory is not None:
             if progress:
                 progress(f"Archiving {len(local_inventory['sources'])} local originals; no browser searches or source-download API calls.")

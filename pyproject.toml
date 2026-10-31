@@ -13,11 +13,11 @@ dependencies = ["openpyxl==3.1.5", "pypdf[crypto]==6.20.0", "xlrd==2.0.2", "font
 ibkr = ["ib_async==2.1.0"]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["forecasting_engine"]
 
 [tool.research-platform]
-fx-source = "local_store/FX/FX model.xlsx"
-fx-database = "local_store/FX/fx.sqlite"
+fx-source = "data_store/FX/FX model.xlsx"
+fx-database = "data_store/FX/fx.sqlite"
 cheap-review-repairs = 1
 
 [tool.research-platform.ibkr]

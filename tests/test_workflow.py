@@ -2480,17 +2480,17 @@ class FreshnessTests(unittest.TestCase):
                     revised=copy.deepcopy(data);revised['source_freshness']['releases'][0].update(change)
                     self.assertTrue(any(item['status']=='FAIL' for item in freshness_checks(revised,root)))
 
-    def test_disclosure_update_reuses_withdrawn_original_but_rejects_changed_live_bytes(self):
+    def test_disclosure_update_resolves_relocated_archive_and_rejects_changed_live_bytes(self):
         from company_initiation.shared_ai import OpenAIProvider
         from company_initiation.historic_construction.evidence import inventory_local_sources
         from company_initiation.historic_construction.workflow import update_company_inputs
         with tempfile.TemporaryDirectory() as temporary:
-            root=Path(temporary);archive=root/'company';reports=archive/'financial_reports';reports.mkdir(parents=True)
+            root=Path(temporary);archive=root/'local_store'/'synthetic';reports=archive/'financial_reports';reports.mkdir(parents=True)
             original=reports/'original.txt';original.write_text('Synthetic original annual revenue 30.',encoding='utf-8')
             inventory=inventory_local_sources(archive);source=inventory['sources'][0]
             parent=root/'outputs'/'construct_original';frozen=parent/'sources';frozen.mkdir(parents=True)
             frozen_file=frozen/(source['id']+'.txt');frozen_file.write_bytes(original.read_bytes())
-            data=dict(company='SYNTHETIC update',history_years=[2025],sources={source['id']:source},observations=[],
+            data=dict(company='SYNTHETIC update',currency='GBP',fiscal_calendar={'fiscal_year_end':'12-31'},history_years=[2025],sources={source['id']:source},observations=[],
                 model_configuration={'as_of':'2026-10-23'},source_freshness={'official_indexes':['https://synthetic.invalid/results']})
             inputs=parent/'company_model_inputs.json';inputs.write_text(json.dumps(data),encoding='utf-8')
             (parent/'calls.jsonl').write_text('',encoding='utf-8')
@@ -2499,18 +2499,25 @@ class FreshnessTests(unittest.TestCase):
                 sources=[dict(source,path=str(frozen_file))],calls=[],status='research_complete',
                 artifacts={inputs.name:hashlib.sha256(inputs.read_bytes()).hexdigest()})
             (parent/'record.json').write_text(json.dumps(record),encoding='utf-8')
+            parent_bytes=(parent/'record.json').read_bytes()
+            relocated=root/'data_store'/'company_data'/'synthetic';relocated.parent.mkdir(parents=True)
+            archive.rename(relocated);archive=relocated;original=archive/'financial_reports'/'original.txt'
             original.unlink()
             freshness=dict(checked_as_of='2026-10-25',official_indexes=['https://synthetic.invalid/results'],
                 releases=[dict(id='original_release',source_id=source['id'],published_at='2026-01-01',requires_observations=False)])
             provider=OpenAIProvider(api_key='SYNTHETIC-NOT-A-CREDENTIAL')
-            with patch('company_initiation.historic_construction.workflow.discover_releases',return_value=(freshness,[])), \
+            with patch('company_initiation.historic_construction.workflow.discover_releases',return_value=(freshness,[])) as discovery, \
+                 patch.object(provider,'complete',side_effect=AssertionError('No AI in relocation regression')), \
                  patch('company_initiation.historic_construction.workflow.combined_history_review_current',return_value=False), \
                  patch('company_initiation.historic_construction.workflow.ensure_combined_history_review') as review:
                 result=update_company_inputs(root,parent,as_of='2026-10-25',provider=provider)
+                self.assertEqual(discovery.call_args.args[1],relocated.resolve())
                 review.assert_called_once()
                 self.assertIn('Synthetic original annual revenue 30.',review.call_args.kwargs['original_units'][0]['text'])
                 saved=json.loads((result.parent/'record.json').read_text(encoding='utf-8'))
                 self.assertEqual(saved['status'],'research_complete');self.assertEqual(saved['calls'],[])
+                self.assertEqual(saved['configuration']['sources'],str(relocated.resolve()))
+                self.assertEqual((parent/'record.json').read_bytes(),parent_bytes)
                 audit=json.loads((result.parent/'source_freeze_audit.json').read_text(encoding='utf-8'))
                 self.assertEqual(audit['reused_missing_originals'][0]['source_id'],source['id'])
                 checks=json.loads((result.parent/'freshness_validation.json').read_text(encoding='utf-8'))
@@ -2619,7 +2626,8 @@ class SavedScenarioArtifactTests(unittest.TestCase):
         apply_assumption_payload(spec,payload)
         snapshot=dict(schema='shared_fx_snapshot_v1',source={'snapshot_id':'synthetic-pinned'},metadata={'daily_end':'2026-01-01'},policy={},findings=[])
         snapshot_bytes=(json.dumps(snapshot,indent=1)+'\n').encode()
-        data=dict(company=spec['company'],sources={},model_configuration={'as_of':'2026-01-01'})
+        data=dict(company=spec['company'],currency='GBP',sources={},history_years=[2025],
+            fiscal_calendar={'fiscal_year_end':'12-31'},model_configuration={'as_of':'2026-01-01'})
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);parent=root/'outputs'/'parent';parent.mkdir(parents=True)
             for name,value in [('company_model_inputs.json',data),('model_specification.json',spec),
@@ -6041,6 +6049,1705 @@ class MonetarySalesIdentityTests(unittest.TestCase):
                         {k:v for k,v in before['observations'][1].items() if k!='row_id'})
                     self.assertEqual(materialize(revised)[1]['value'],.025)
                 self.assertEqual(answer,before)
+
+
+class CompanyReportedVAConstructionTests(unittest.TestCase):
+    """Fresh synthetic archives exercise the same VA compiler, without providers."""
+
+    def fixture(self, root, *, currency='USD', year_end='12-31', reorganized=False):
+        from openpyxl import Workbook
+        from company_initiation.historic_construction.evidence import SourceStore,inventory_local_sources
+        from company_initiation.historic_construction.periods import build_periods
+        archive=root/'company';folder=archive/'visible_alpha';folder.mkdir(parents=True)
+        path=folder/'Company Reported.xlsx';book=Workbook();sheet=book.active;sheet.title='Reported'
+        sheet['B1']='SYNTHETIC reported company; fiscal year ends '+year_end
+        sheet['D3']='Company Reported'
+        labels=['FY-2024','FY-2024','1HFY-2024','FY-2025','FY-2025E','FY-2026']
+        series=['VA Actuals','Filings','Filings','VA Actuals','Consensus','Filings']
+        for col,(label,kind) in enumerate(zip(labels,series),7):
+            sheet.cell(4,col,label);sheet.cell(5,col,kind)
+        sheet.cell(5,5,'Units')
+        metrics=[('Group sales',[99,100,40,110,9999,8888]),('Group cash',[8,None,4,9,9999,8888])]
+        metrics+=([('Legacy division sales',[99,100,40,None,None,None]),
+                   ('Equipment sales',[None,None,None,70,None,None]),('Services sales',[None,None,None,40,None,None])]
+                  if reorganized else [('Manufacturing sales',[99,100,40,110,9999,8888])])
+        for row,(label,values) in enumerate(metrics,7):
+            sheet.cell(row,4,label);sheet.cell(row,5,currency+'M');sheet.cell(row,6,'Analytics')
+            for col,value in enumerate(values,7):
+                if value is not None:sheet.cell(row,col,value)
+        book.save(path);book.close()
+        standard=Workbook();standard.active.title='Unclassified';standard.active['A1']='STANDARDIZED MUST NOT BE USED'
+        standard.save(folder/'Standardised.xlsx');standard.close()
+        inventory=inventory_local_sources(archive);source=next(s for s in inventory['sources'] if s.get('dataset_role')=='company_reported')
+        store=SourceStore(root/'parsed');store.add_local(source,root=archive)
+        periods=build_periods([2024,2025,2026],dict(fiscal_year_end=year_end))
+        from company_initiation.historic_construction.workflow import VA_SOURCE_POLICY
+        segments=([dict(id='equipment',label='Equipment'),dict(id='services',label='Services')] if reorganized
+                  else [dict(id='manufacturing',label='Manufacturing')])
+        data=dict(company='SYNTHETIC '+currency,currency=currency,history_years=[2024] if year_end=='12-31' else [2024,2025],fiscal_calendar=dict(fiscal_year_end=year_end),
+            forecast_basis='reported',segments=segments,corporate={},historical={},observations=[],sources={source['id']:source},
+            reporting_changes=[],reporting_bridges=[],entity_versions=[],active_basis_by_period={},
+            model_configuration=dict(as_of='2025-10-01',historical_source_policy=VA_SOURCE_POLICY,limitations=[]),
+            source_freshness=dict(mode='local_company_reported_va',model_as_of='2025-10-01',discovery_performed=False))
+        return archive,source,store,periods,data
+
+    def journal(self, data, *, tamper=False):
+        from types import SimpleNamespace
+        from company_initiation.historic_construction.initiation import validate_shape
+        from company_initiation.shared_runtime import write_json
+        temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup)
+        directory=Path(temporary.name);artifacts={};calls=[]
+        def artifact(name,value):
+            artifacts[name]=copy.deepcopy(value);write_json(directory/name,value)
+        def stage(name,prompt,payload,schema,validator):
+            calls.append(name)
+            if name=='company_va_row_mapping':
+                decisions=[]
+                for row in payload['target_rows']:
+                    label=row['label'];entity={'Legacy':'legacy','Equipment':'equipment','Services':'services','Manufacturing':'manufacturing'}.get(label.split()[0],'group')
+                    role='cash' if 'cash' in label.lower() else 'sales'
+                    if entity!='group':role=entity+'_'+role
+                    version=dict(row_id=role,label=label,entity_id=entity,
+                        statement_section='balance' if role=='cash' else 'income' if entity=='group' else 'segment',
+                        financial_role=role if entity=='group' else role[len(entity)+1:],
+                        entity_kind='group' if entity=='group' else 'legacy_segment' if entity=='legacy' else 'current_segment',
+                        measure='money',metric_type='stock' if role=='cash' else 'flow',basis='legacy' if entity=='legacy' else 'reported',
+                        definition_id=role,scope=entity,restatement='original',restatement_vintage=None,
+                        classification_basis='Synthetic company-reported labelled historical data; no publication-date claim',
+                        definition_status='source_defined',basis_status='period_defined',
+                        period_basis='closing' if role=='cash' else 'source_period',period_kinds=[],
+                        effective_from=None,effective_to='2024-05-31' if tamper else None,
+                        version_refs=[row['source_ref']] if tamper else [],polarity=1)
+                    decisions.append(dict(row_key=row['row_key'],action='map',versions=[version]))
+                answer=dict(decisions=decisions,gaps=[])
+            elif name=='company_va_core_review':
+                answer=dict(checks=[dict(row_key=row['row_key'],status='pass',detail='Synthetic semantic review',
+                    source_refs=[row['source_ref']]) for row in payload['target_rows']],summary='Synthetic essential review')
+            elif name=='company_va_history_review':
+                from company_initiation.historic_construction.workflow import _HISTORY_GATE_TOPICS
+                ref={k:payload['evidence'][0][k] for k in ('source_id','unit_id')}
+                answer=dict(checks=[dict(topic=topic,status='pass',detail='Synthetic review of '+topic,source_refs=[ref]) for topic in _HISTORY_GATE_TOPICS],summary='Synthetic scoped review')
+            else:raise AssertionError('Unexpected PDF/online research: '+name)
+            validate_shape(answer,schema);validator(answer);return answer
+        journal=SimpleNamespace(stage=stage,artifact=artifact,artifacts=artifacts,calls=calls,directory=directory,
+            state={'artifacts':{}},save=lambda:None,progress=None)
+        def patch_stage(name,prompt,payload,schema,*,assess,patch_contract,apply_patch,checkpoint,initial_candidate=None,**kwargs):
+            answer=copy.deepcopy(initial_candidate) if initial_candidate is not None else journal.stage(name,prompt,payload,schema,lambda a:a)
+            report=assess(answer)
+            checkpoint(answer,report)
+            if report['issues']:raise ValueError('; '.join(i['detail'] for i in report['issues']))
+            return answer
+        journal.patch_stage=patch_stage
+        return journal
+
+    def test_prefer_filing_fallback_missing_and_reject_estimates_standardized_and_future(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _,source,store,periods,data=self.fixture(Path(temp))
+            rows=store.company_reported_rows([source['id']],periods,as_of=data['model_configuration']['as_of'])
+            sales=next(row for row in rows if row['label']=='Group sales')
+            actual=next(cell for cell in sales['cells'] if cell['period_id']=='2024-FY')
+            self.assertEqual(actual['source_raw'],'100');self.assertEqual(actual['series'],'Filings')
+            cash=next(row for row in rows if row['label']=='Group cash')
+            actual=next(cell for cell in cash['cells'] if cell['period_id']=='2024-FY')
+            self.assertEqual(actual['source_raw'],'8');self.assertEqual(actual['series'],'VA Actuals')
+            self.assertFalse(any(cell['source_raw'] in ('9999','8888') for row in rows for cell in row['cells']))
+            self.assertFalse(any('STANDARDIZED' in row['label'] for row in rows))
+
+    def test_fresh_same_compiler_two_currencies_calendars_and_segment_reorganisation(self):
+        from company_initiation.historic_construction.workflow import _va_history_inputs,_review_va_history,combined_history_review_current
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        from company_initiation.historic_construction.model_excel import write_historical_output
+        for currency,end,reorg in [('USD','12-31',False),('JPY','03-31',True)]:
+            with self.subTest(currency=currency),tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);_,source,store,periods,data=self.fixture(root,currency=currency,year_end=end,reorganized=reorg)
+                journal=self.journal(data)
+                with patch('urllib.request.urlopen',side_effect=AssertionError('No network')):
+                    evidence=_va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,dict(roles=integrated_role_contract()))
+                    _review_va_history(journal,data,evidence)
+                    out=root/'export';out.mkdir();written=write_historical_output(out,data)
+                self.assertTrue((out/written['workbook']).is_file())
+                self.assertTrue(combined_history_review_current(data))
+                self.assertFalse(data['combined_history_review']['independent_primary_verification'])
+                self.assertEqual(data['historical']['sales']['values']['2024'],100.)
+                self.assertTrue(all(o['source_refs'][0].get('cell') for o in data['observations']))
+                self.assertTrue(all(o['source_dataset']=='company_reported' for o in data['observations']))
+                half=next(o for o in data['observations'] if o['row_id']=='sales' and o['period_id']=='2024-H1')
+                self.assertEqual(half['end'],'2024-06-30' if end=='12-31' else '2023-09-30')
+                if reorg:
+                    self.assertIn('legacy_sales',data['historical']);self.assertIn('equipment_sales',data['historical'])
+                    self.assertNotIn('2024',data['historical']['equipment_sales']['values'])
+                    self.assertEqual(data['historical']['services_sales']['values']['2025'],40.)
+
+    def test_row_mapping_cannot_silently_drop_interim_or_annual_cells(self):
+        from company_initiation.historic_construction.workflow import _va_history_inputs
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        with tempfile.TemporaryDirectory() as temp:
+            _,source,store,periods,data=self.fixture(Path(temp))
+            _va_history_inputs(self.journal(data,tamper=True),data,store,data['sources'],[source['id']],periods,dict(roles=integrated_role_contract()))
+            self.assertTrue(data['model_configuration']['historical_mapping_issues'])
+            self.assertTrue(data['model_configuration']['va_source_rows'])
+
+    def test_va_mapping_starts_with_latest_actuals_and_retains_legacy_bases(self):
+        from company_initiation.historic_construction.workflow import _va_history_inputs
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        with tempfile.TemporaryDirectory() as temp:
+            _,source,store,periods,data=self.fixture(Path(temp),currency='JPY',year_end='03-31',reorganized=True)
+            rows=store.company_reported_rows([source['id']],periods,as_of=data['model_configuration']['as_of'])
+            self.assertEqual(rows[-1]['label'],'Legacy division sales')
+            self.assertTrue(all(row['cells'][0]['period_id']=='2025-FY' for row in rows[:-1]))
+            journal=self.journal(data);original=journal.stage;requests=[]
+            def stage(name,prompt,payload,*args):
+                requests.append((prompt,copy.deepcopy(payload)))
+                return original(name,prompt,payload,*args)
+            journal.stage=stage
+            _va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,dict(roles=integrated_role_contract()))
+            prompt,payload=requests[0]
+            self.assertIn('work backwards',prompt)
+            self.assertEqual(payload['historical_anchor']['latest_actual_period_id'],'2025-FY')
+            self.assertEqual(payload['historical_anchor']['latest_annual_period_id'],'2025-FY')
+            self.assertEqual(payload['historical_anchor']['current_segment_ids'],['equipment','services'])
+            self.assertEqual(payload['target_rows'][0]['representation_examples'][0]['period_id'],'2025-FY')
+            self.assertEqual(data['historical']['legacy_sales']['values'],{'2024':100.})
+            self.assertNotIn('2024',data['historical']['equipment_sales']['values'])
+            self.assertTrue(all(not row['latest_period_id'].startswith('2026') for row in payload['target_rows']))
+            self.assertEqual(journal.artifacts['va_history_bindings.json']['historical_anchor'],
+                             data['model_configuration']['historical_anchor'])
+
+    def test_history_command_exports_stops_and_only_explicit_resume_reuses_inputs(self):
+        import builtins
+        from openpyxl import load_workbook
+        from company_initiation.__main__ import main
+        from company_initiation.historic_construction.workflow import _va_history_inputs,_review_va_history
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);archive,source,store,periods,data=self.fixture(root,currency='JPY',year_end='03-31',reorganized=True)
+            journal=self.journal(data)
+            evidence=_va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,dict(roles=integrated_role_contract()))
+            _review_va_history(journal,data,evidence)
+            inputs=root/'fixture_inputs.json';inputs.write_text(json.dumps(data),encoding='utf-8')
+            (root/'pyproject.toml').write_text('[tool.research-platform]\n',encoding='utf-8')
+            original_import=builtins.__import__
+            def guarded_import(name,*args,**kwargs):
+                if name.startswith(('company_initiation.forecast_construction','company_initiation.dcf_construction')):
+                    raise AssertionError('Historical command imported a downstream stage: '+name)
+                return original_import(name,*args,**kwargs)
+            argv=['company_initiation','construct-history',data['company'],'--sources',str(archive),
+                  '--years','2024','2025','--as-of','2025-10-01']
+            with patch('company_initiation.__main__.find_project_root',return_value=root), \
+                 patch('company_initiation.historic_construction.workflow.research_company_inputs',return_value=inputs) as research, \
+                 patch('company_initiation.shared_ai.urlopen',side_effect=AssertionError('No network')), \
+                 patch('builtins.__import__',side_effect=guarded_import),patch('builtins.print'):
+                with patch('sys.argv',argv):self.assertEqual(main(),0)
+                first=next((root/'outputs').glob('construct_history_*/record.json'))
+                first_bytes=first.read_bytes();first_record=json.loads(first_bytes)
+                with patch('sys.argv',argv+['--resume',str(first.parent)]):self.assertEqual(main(),0)
+                self.assertEqual(research.call_count,1)
+                self.assertEqual(first.read_bytes(),first_bytes)
+                with patch('sys.argv',argv):self.assertEqual(main(),0)
+                self.assertEqual(research.call_count,2)
+            records=[json.loads(path.read_text(encoding='utf-8')) for path in (root/'outputs').glob('construct_history_*/record.json')]
+            self.assertEqual(len(records),3)
+            self.assertEqual(len({record['budget']['allowance_period_id'] for record in records}),2)
+            self.assertEqual(first_record['status'],'historical_complete_provisional')
+            self.assertEqual(set(first_record['stage_outputs']),{'historical'})
+            for record in records:
+                self.assertEqual(record['completion_scope'],'historical_only')
+                self.assertEqual(record['budget']['remaining_usd'],20)
+                run=Path(record['directory'])
+                validation=json.loads((run/'historical_validation.json').read_text(encoding='utf-8'))
+                self.assertFalse(validation['forecast_started']);self.assertFalse(validation['dcf_started'])
+                self.assertEqual(validation['ai_calls_in_finalization'],0)
+                self.assertFalse((run/'forecast.json').exists());self.assertFalse((run/'forecast_model.xlsx').exists())
+                self.assertFalse((run/'dcf_model.xlsx').exists())
+                book=load_workbook(run/'historical_model.xlsx',data_only=False)
+                try:
+                    self.assertNotIn('Assumptions',book.sheetnames);self.assertNotIn('Valuation',book.sheetnames)
+                    labels=[str(book['Model'].cell(5,col).value) for col in range(4,book['Model'].max_column+1)]
+                    self.assertTrue(labels[0].startswith('2024'))
+                    self.assertFalse(any(label.startswith('2026') for label in labels))
+                finally:book.close()
+            self.assertEqual(len(list((root/'forecasting_engine/company_initiation/logs').glob('*.log'))),3)
+
+    def test_latest_anchor_keeps_current_interim_separate_from_latest_completed_annual(self):
+        from openpyxl import load_workbook
+        from company_initiation.historic_construction.evidence import SourceStore,inventory_local_sources
+        from company_initiation.historic_construction.workflow import _va_history_inputs
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);archive,source,_,periods,data=self.fixture(root)
+            path=archive/source['local_path'];book=load_workbook(path)
+            book.active['I4']='1HFY-2025';book.save(path);book.close()
+            source=next(s for s in inventory_local_sources(archive)['sources'] if s.get('dataset_role')=='company_reported')
+            store=SourceStore(root/'new_parse');store.add_local(source,root=archive);data['sources']={source['id']:source}
+            journal=self.journal(data)
+            _va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,dict(roles=integrated_role_contract()))
+            anchor=data['model_configuration']['historical_anchor']
+            self.assertEqual(anchor['latest_actual_period_id'],'2025-H1')
+            self.assertEqual(anchor['latest_annual_period_id'],'2024-FY')
+            row=journal.artifacts['va_history_bindings.json']['rows'][0]
+            self.assertEqual(row['cells'][0]['period_id'],'2025-H1')
+            self.assertEqual(data['historical']['sales']['values'],{'2024':100.})
+            self.assertFalse(any(o['period_id'] in ('2025-FY','2026-FY') for o in data['observations']))
+
+    def test_historical_finalization_rejects_stale_review_and_changed_originals(self):
+        from company_initiation.historic_construction.workflow import _va_history_inputs,_review_va_history,complete_historical_model
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);archive,source,store,periods,data=self.fixture(root)
+            journal=self.journal(data)
+            evidence=_va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,dict(roles=integrated_role_contract()))
+            inputs=root/'fixture_inputs.json';inputs.write_text(json.dumps(data),encoding='utf-8')
+            with self.assertRaisesRegex(ValueError,'review is incomplete or stale'):
+                complete_historical_model(root,data['company'],archive,inputs)
+            _review_va_history(journal,data,evidence)
+            inputs.write_text(json.dumps(data),encoding='utf-8')
+            raw=archive/source['local_path'];raw.write_bytes(raw.read_bytes()+b'changed')
+            with self.assertRaisesRegex(ValueError,'Source changed'):
+                complete_historical_model(root,data['company'],archive,inputs)
+            records=[json.loads(path.read_text()) for path in (root/'outputs').glob('construct_history_*/record.json')]
+            self.assertEqual(len(records),2);self.assertTrue(all(record['status']=='incomplete' for record in records))
+
+    def test_local_snapshot_warns_about_freshness_without_claiming_online_or_independent_verification(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive,_,_,_,data=self.fixture(Path(temp))
+            checks=freshness_checks(data,archive)
+            self.assertFalse(any(c['status']=='FAIL' for c in checks))
+            self.assertTrue(any(c['name']=='official_release_inventory' and c['status']=='WARNING' for c in checks))
+            self.assertTrue(any(c['name']=='independent_primary_verification' and c['status']=='WARNING' for c in checks))
+            changed=copy.deepcopy(data);changed['model_configuration']['as_of']='2025-10-02'
+            self.assertTrue(any(c['status']=='FAIL' for c in freshness_checks(changed,archive)))
+
+    def test_public_research_entry_uses_va_without_forecast_accounting_notes(self):
+        from company_initiation.shared_ai import OpenAIProvider,DEFAULT_MODEL
+        from company_initiation.shared_budget import construction_command_budget
+        from company_initiation.historic_construction.workflow import research_company_inputs,VA_SOURCE_POLICY
+        from company_initiation.historic_construction.evidence import inventory_local_sources
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);archive,_,_,_,data=self.fixture(root,currency='JPY',year_end='03-31',reorganized=True)
+            unrelated=root/'outputs/construct_unrelated';unrelated.mkdir(parents=True)
+            (unrelated/'record.json').write_text('Unrelated saved work must not be opened',encoding='utf-8')
+            fixture_journal=self.journal(data);stages=[]
+            class Provider(OpenAIProvider):
+                def __init__(self):super().__init__(api_key='SYNTHETIC-OFFLINE-KEY')
+                def complete(self,**kwargs):
+                    payload=kwargs['payload'];stage=payload['stage'];stages.append(stage)
+                    self.last_response=dict(model=DEFAULT_MODEL,usage=dict(input_tokens=100,output_tokens=50,total_tokens=150),output=[])
+                    if stage=='company_va_scope':
+                        ref=payload['va']['native_rows'][0]['source_ref']
+                        result=dict(currency='JPY',fiscal_year_end='03-31',latest_completed_year=2025,
+                            forecast_frequency='half_year',full_statement_frequency='half_year',reporting_basis='reported',
+                            segments=data['segments'],corporate_label='Corporate',primary_hierarchy='Divisions',supplementary_dimensions=[],
+                            revenue_models=[dict(entity_id=s['id'],method='aggregate_organic',definition='Synthetic disclosure',source_refs=[ref]) for s in data['segments']],
+                            driver_map=[],official_indexes=[],source_references=[ref],gaps=[])
+                        result['historical_reporting_context']=dict(declarations=[],entity_versions=[],hierarchies=[])
+                        return {key:result[key] for key in ('currency','fiscal_year_end','full_statement_frequency','reporting_basis','segments','corporate_label','historical_reporting_context')}|dict(source_refs=[ref],questions=[],source_ids=[])
+                    if stage in ('company_va_row_mapping','company_va_history_review'):
+                        return fixture_journal.stage(stage,kwargs['instructions'],payload,kwargs['schema'],lambda a:a)
+                    raise AssertionError('Unexpected legacy discovery/reconstruction stage: '+stage)
+            with patch('company_initiation.historic_construction.workflow.discover_releases',side_effect=AssertionError('No online discovery')), \
+                 patch('company_initiation.historic_construction.workflow._validate_driver_references'), \
+                 patch('urllib.request.urlopen',side_effect=AssertionError('No network')), \
+                 construction_command_budget(root/'outputs',data['company'],20) as budget:
+                inputs=research_company_inputs(root,data['company'],archive,as_of='2025-10-01',years=[2024,2025],provider=Provider())
+            runs=list((root/'outputs').glob('construct_research_*'));self.assertEqual(len(runs),1)
+            run=runs[0];self.assertTrue((run/'historical_model.xlsx').is_file())
+            saved=json.loads(inputs.read_text(encoding='utf-8'))
+            self.assertEqual(saved['model_configuration']['historical_source_policy'],VA_SOURCE_POLICY)
+            self.assertEqual(saved['historical']['sales']['values']['2024'],100.)
+            self.assertFalse(saved['source_freshness']['discovery_performed'])
+            self.assertNotIn('company_year_mapping',stages);self.assertNotIn('company_year_blind',stages)
+            record=json.loads((run/'record.json').read_text(encoding='utf-8'))
+            self.assertEqual(record['status'],'research_complete')
+            self.assertNotIn('company_accounting_structure',stages)
+            self.assertIsNone(record['parent_run'])
+            self.assertEqual(record['configuration']['budget_session_id'],budget['allowance_period_id'])
+            self.assertIn('historical',record['stage_outputs'])
+
+    def test_local_va_update_reuses_public_source_route_without_online_discovery(self):
+        from company_initiation.historic_construction.workflow import update_company_inputs
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);archive,_,_,_,data=self.fixture(root)
+            run=root/'outputs/construct_fixture';run.mkdir(parents=True)
+            (run/'company_model_inputs.json').write_text(json.dumps(data),encoding='utf-8')
+            previous=dict(configuration=dict(company=data['company'],sources=str(archive),start_year=2018,limits=dict(usd=20)))
+            with patch('company_initiation.shared_artifacts.verified_integrated_record',return_value=previous), \
+                 patch('company_initiation.historic_construction.workflow.research_company_inputs',return_value=Path('new_inputs')) as research, \
+                 patch('company_initiation.historic_construction.workflow.discover_releases',side_effect=AssertionError('No network')):
+                result=update_company_inputs(root,run,as_of='2025-10-02')
+            self.assertEqual(result,Path('new_inputs'));self.assertEqual(research.call_args.kwargs['start_year'],2018)
+            self.assertEqual(research.call_args.kwargs['budget_usd'],20)
+
+    def test_explicit_online_update_checks_new_releases_without_historical_backfill(self):
+        from company_initiation.historic_construction.workflow import update_company_inputs
+        from company_initiation.shared_ai import OpenAIProvider
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);archive,_,_,_,data=self.fixture(root)
+            run=root/'outputs/construct_fixture';run.mkdir(parents=True)
+            (run/'company_model_inputs.json').write_text(json.dumps(data),encoding='utf-8')
+            previous=dict(directory=str(run),calls=[],configuration=dict(company=data['company'],sources=str(archive),
+                start_year=2018,limits=dict(usd=20,repairs=2,retries=0,calls=None,generated_tokens=None)))
+            with patch('company_initiation.shared_artifacts.verified_integrated_record',return_value=previous), \
+                 patch('company_initiation.historic_construction.workflow.discover_releases',side_effect=ValueError('Synthetic blocked website')) as discovery, \
+                 patch('urllib.request.urlopen',side_effect=AssertionError('No actual network')):
+                with self.assertRaisesRegex(ValueError,'blocked website'):
+                    update_company_inputs(root,run,as_of='2025-10-02',online=True,provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE-KEY'))
+            self.assertEqual(discovery.call_args.kwargs['historical_years'],())
+
+    def test_vendor_interim_stock_is_retained_but_not_presented_as_supported_quarterly_statement(self):
+        from company_initiation.historic_construction.workflow import _va_history_inputs
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        with tempfile.TemporaryDirectory() as temp:
+            _,source,store,periods,data=self.fixture(Path(temp))
+            data['model_configuration']['full_statement_frequency']='annual'
+            _va_history_inputs(self.journal(data),data,store,data['sources'],[source['id']],periods,dict(roles=integrated_role_contract()))
+            cash=next(o for o in data['observations'] if o['row_id']=='cash' and o['period_id']=='2024-H1')
+            sales=next(o for o in data['observations'] if o['row_id']=='sales' and o['period_id']=='2024-H1')
+            self.assertFalse(cash['eligible']);self.assertTrue(sales['eligible'])
+
+    def test_review_reads_verified_frozen_va_even_when_live_export_is_absent(self):
+        from types import SimpleNamespace
+        from company_initiation.shared_artifacts import freeze_model_sources
+        from company_initiation.historic_construction.workflow import prepare_history_review_context
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);archive,source,_,_,data=self.fixture(root)
+            run=root/'review';folder=run/'sources';folder.mkdir(parents=True)
+            frozen,_=freeze_model_sources(data,archive,folder)
+            (archive/source['local_path']).unlink()
+            with patch('urllib.request.urlopen',side_effect=AssertionError('No network')):
+                context=prepare_history_review_context(SimpleNamespace(directory=run),data,frozen)
+            self.assertTrue(any(u.get('vendor_row',{}).get('section')=='company_reported' for u in context['original_units']))
+            frozen_path=Path(frozen[0]['path']);frozen_path.write_bytes(frozen_path.read_bytes()+b'changed')
+            with self.assertRaisesRegex(ValueError,'source changed'):
+                prepare_history_review_context(SimpleNamespace(directory=run),data,frozen)
+
+    def test_default_cli_researches_anew_even_with_old_inputs_for_the_same_years(self):
+        from company_initiation.__main__ import main,_run
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);old=root/'outputs/construct_old';old.mkdir(parents=True)
+            (root/'pyproject.toml').write_text('[tool.research-platform]\n',encoding='utf-8')
+            archive=root/'archive';archive.mkdir()
+            saved=dict(history_years=list(range(2018,2026)),model_configuration=dict(as_of='2026-10-31'))
+            (old/'company_model_inputs.json').write_text(json.dumps(saved),encoding='utf-8')
+            record=dict(directory=str(old),configuration=dict(company='SYNTHETIC source priority',manifest='same'))
+            (old/'record.json').write_text(json.dumps(record),encoding='utf-8')
+            new=root/'outputs/construct_new';new.mkdir();inputs=new/'company_model_inputs.json';inputs.write_text('{}')
+            (new/'record.json').write_text(json.dumps(dict(status='complete_provisional',usage={},issues=[])))
+            inventory=dict(manifest_sha256='same',source_manifest_sha256='same',sources=[dict(category='visible_alpha',dataset_role='company_reported')])
+            with patch('sys.argv',['company_initiation','construct','SYNTHETIC source priority','--sources',str(archive),'--as-of','2026-10-31']), \
+                 patch('company_initiation.__main__._logged_construct',side_effect=_run), \
+                 patch('company_initiation.__main__.find_project_root',return_value=root), \
+                 patch('company_initiation.historic_construction.evidence.inventory_local_sources',return_value=inventory), \
+                 patch('company_initiation.forecast_construction.integrated.verified_integrated_record',return_value=record), \
+                 patch('company_initiation.historic_construction.workflow.research_company_inputs',return_value=inputs) as research, \
+                 patch('company_initiation.historic_construction.workflow.ensure_company_history_research',return_value=inputs), \
+                 patch('company_initiation.historic_construction.workflow.update_company_inputs') as update, \
+                 patch('company_initiation.forecast_construction.integrated.construct_integrated',return_value=new), \
+                 patch('company_initiation.shared_ai.format_usage',return_value=''), \
+                 patch('company_initiation.shared_ai.format_stage_usage',return_value=''),patch('builtins.print'):
+                self.assertEqual(main(),0)
+            research.assert_called_once();update.assert_not_called()
+            self.assertTrue(research.call_args.kwargs['fresh'])
+            self.assertEqual(research.call_args.kwargs['start_year'],2018)
+
+
+class VAMappingRepairTests(unittest.TestCase):
+    """Typed mapping/patch regressions and local archived-response replays; no API."""
+    fixture=CompanyReportedVAConstructionTests.fixture
+    journal=CompanyReportedVAConstructionTests.journal
+
+    def case(self, **kwargs):
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup)
+        root=Path(temporary.name);archive,source,store,periods,data=self.fixture(root,**kwargs)
+        rows=store.company_reported_rows([source['id']],periods,as_of=data['model_configuration']['as_of'])
+        evidence=store.read_documents([dict(source_id=source['id'],unit_id=next(iter(store._units[source['id']])))],historical_years={p['fiscal_year'] for p in periods})
+        return root,archive,source,store,periods,data,rows,evidence,dict(roles=integrated_role_contract())
+
+    def candidate(self,data,rows):
+        from company_initiation.historic_construction.workflow import _va_schema
+        targets=[dict(row_key=r['row_key'],label=r['label'],source_ref=dict(source_id=r['source_id'],unit_id=r['unit_id'])) for r in rows]
+        schema,_=_va_schema([r['row_key'] for r in rows],['money'])
+        return self.journal(data).stage('company_va_row_mapping','fixture',dict(target_rows=targets),schema,lambda a:a)
+
+    def test_units_are_source_evidenced_and_literal_percent_is_converted_once(self):
+        from company_initiation.historic_construction.evidence import va_unit_options,va_cell_multiplier,excel_fraction_percent
+        for name in ('EURM','EUR_m','EUR millions'):
+            # Arbitrary model-unit spellings are not returned by the AI anymore;
+            # source formats accept documented native conventions only.
+            if name=='EURM':self.assertEqual(va_unit_options(name,'EUR')[0]['unit'],'EURm')
+        self.assertEqual(va_unit_options('\u20acM','EUR')[0]['multiplier'],1)
+        self.assertEqual(va_unit_options('EURAbs','EUR')[1]['unit'],'EUR_per_share')
+        self.assertEqual(va_unit_options('M#','EUR')[0]['unit'],'shares_m')
+        self.assertEqual(va_unit_options('USDM','EUR'),[])
+        option=va_unit_options('%','EUR')[0]
+        for raw,fmt,expected in [('5','0.0"%"',.01),('0.05','0.0%',1.),('5%','General',1.)]:
+            self.assertEqual(va_cell_multiplier(option,dict(source_raw=raw,display_format=fmt)),expected)
+        self.assertFalse(excel_fraction_percent('0.0"%"'));self.assertTrue(excel_fraction_percent('0.0%'))
+
+    def test_missing_rows_are_patchable_but_valid_fields_are_frozen(self):
+        from company_initiation.historic_construction.workflow import _va_assess,_va_schema,_va_patch_contract,_va_apply_patch
+        from company_initiation.shared_runtime import digest
+        _,_,_,store,periods,data,rows,evidence,contract=self.case()
+        original=self.candidate(data,rows);missing=original['decisions'].pop()
+        report=_va_assess(original,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        _,schema=_va_schema([r['row_key'] for r in rows],['money'])
+        rules=_va_patch_contract(original,report,schema)
+        self.assertEqual(len(report['issues']),1)
+        bad=dict(changes=[dict(row_key=original['decisions'][0]['row_key'],expected_digest=digest(original['decisions'][0]),path='versions.0.entity_id',value='corporate')])
+        before=copy.deepcopy(original)
+        with self.assertRaisesRegex(ValueError,'frozen'):_va_apply_patch(original,bad,rules)
+        self.assertEqual(original,before)
+        invalid=copy.deepcopy(missing);invalid['versions'][0]['polarity']='wrong type'
+        with self.assertRaises(ValueError):
+            _va_apply_patch(original,dict(changes=[dict(row_key=missing['row_key'],expected_digest=None,path='$',value=invalid)]),rules)
+        self.assertEqual(original,before)
+        fixed=_va_apply_patch(original,dict(changes=[dict(row_key=missing['row_key'],expected_digest=None,path='$',value=missing)]),rules)
+        self.assertEqual(fixed['decisions'][:len(before['decisions'])],before['decisions'])
+        self.assertFalse(_va_assess(fixed,rows,rows,data,store,data['sources'],periods,contract,evidence)['issues'])
+        with self.assertRaisesRegex(ValueError,'digest'):
+            _va_apply_patch(original,dict(changes=[dict(row_key=missing['row_key'],expected_digest='forged',path='$',value=missing)]),rules)
+
+    def test_group_entity_repairs_cannot_touch_source_definition_or_values(self):
+        from company_initiation.historic_construction.workflow import _va_assess,_va_schema,_va_patch_contract,_va_apply_patch
+        from company_initiation.shared_runtime import digest
+        _,_,_,store,periods,data,rows,evidence,contract=self.case()
+        candidate=self.candidate(data,rows);sales=next(d for d in candidate['decisions'] if d['versions'][0]['row_id']=='sales')
+        sales['versions'][0].update(entity_id='corporate',entity_kind='corporate')
+        report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        _,schema=_va_schema([r['row_key'] for r in rows],['money']);rules=_va_patch_contract(candidate,report,schema)
+        patch=dict(changes=[dict(row_key=sales['row_key'],expected_digest=digest(sales),path='versions.0.'+field,value=value)
+                            for field,value in [('entity_id','group'),('entity_kind','group')]])
+        fixed=_va_apply_patch(candidate,patch,rules)
+        verified=_va_assess(fixed,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertFalse(verified['issues'])
+        self.assertEqual(next(f['value'] for f in verified['facts'] if f['row_id']=='sales' and f['period_id']=='2024-FY'),100)
+        patch['changes'][0]['path']='versions.0.basis'
+        with self.assertRaisesRegex(ValueError,'frozen'):_va_apply_patch(candidate,patch,rules)
+
+    def test_literal_percent_cells_and_native_fraction_cells_materialize_to_same_ratio(self):
+        from openpyxl import load_workbook
+        from company_initiation.historic_construction.evidence import SourceStore,inventory_local_sources
+        from company_initiation.historic_construction.workflow import _va_assess
+        root,archive,source,_,periods,data,_,_,contract=self.case()
+        path=archive/source['local_path'];book=load_workbook(path);sheet=book.active
+        for row,label,value,fmt in [(12,'Literal ratio',5.,'0.0"%"'),(13,'Native fraction ratio',.05,'0.0%')]:
+            sheet.cell(row,4,label);sheet.cell(row,5,'%');sheet.cell(row,6,'Analytics')
+            sheet.cell(row,7,value).number_format=fmt;sheet.cell(row,8,value).number_format=fmt
+        book.save(path);book.close()
+        source=next(s for s in inventory_local_sources(archive)['sources'] if s.get('dataset_role')=='company_reported')
+        store=SourceStore(root/'ratios');store.add_local(source,root=archive);data['sources']={source['id']:source}
+        rows=[r for r in store.company_reported_rows([source['id']],periods,as_of=data['model_configuration']['as_of']) if 'ratio' in r['label']]
+        evidence=store.read_documents([dict(source_id=source['id'],unit_id=next(iter(store._units[source['id']])))],historical_years={2024})
+        candidate=self.candidate(data,rows)
+        for i,d in enumerate(candidate['decisions']):
+            d['versions'][0].update(measure='ratio',metric_type='ratio',financial_role=None,row_id='disclosed_ratio_'+str(i))
+        report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertFalse(report['issues']);self.assertEqual(len(report['facts']),2)
+        self.assertTrue(all(abs(f['value']-.05)<1e-12 for f in report['facts']))
+
+    def test_old_saved_mapping_contract_cannot_reuse_a_review_or_start_paid_work(self):
+        from company_initiation.historic_construction.workflow import ensure_company_history_research
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        inputs=root/'old_inputs.json';inputs.write_text(json.dumps(data),encoding='utf-8')
+        with patch('company_initiation.shared_ai.OpenAIProvider.from_env',side_effect=AssertionError('No provider')):
+            with self.assertRaisesRegex(ValueError,'predate the current'):
+                ensure_company_history_research(root,data['company'],archive,inputs)
+
+    def test_not_assessed_and_essential_exclusions_stay_pending(self):
+        from company_initiation.historic_construction.workflow import _va_assess
+        _,_,_,store,periods,data,rows,evidence,contract=self.case()
+        excluded=dict(decisions=[dict(row_key=r['row_key'],action='exclude',reason_code='presentation_diagnostic',
+            reason='Not assessed',duplicate_of=None,evidence_refs=[dict(source_id=r['source_id'],unit_id=r['unit_id'])]) for r in rows],gaps=[])
+        report=_va_assess(excluded,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertEqual(len(report['issues']),len(rows));self.assertEqual(report['facts'],[])
+        excluded['decisions'][0]['reason']='This is a presentation diagnostic.'
+        self.assertTrue(_va_assess(excluded,rows,rows,data,store,data['sources'],periods,contract,evidence)['issues'])
+
+    def test_definition_intervals_require_citations_and_complete_nonoverlapping_coverage(self):
+        from company_initiation.historic_construction.workflow import _va_assess
+        _,_,_,store,periods,data,rows,evidence,contract=self.case(currency='JPY',year_end='03-31',reorganized=True)
+        candidate=self.candidate(data,rows);item=candidate['decisions'][0];version=item['versions'][0]
+        version['effective_to']='2024-03-31'
+        bad=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertTrue(any('citations' in i['detail'] for i in bad['issues']))
+        version['version_refs']=[dict(source_id=rows[0]['source_id'],unit_id=rows[0]['unit_id'])]
+        self.assertTrue(any('cover every' in i['detail'] for i in _va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)['issues']))
+        successor=copy.deepcopy(version);successor.update(effective_from='2024-04-01',effective_to=None,basis='new reporting definition')
+        item['versions'].append(successor)
+        self.assertFalse(_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)['issues'])
+        successor['effective_from']='2024-03-01'
+        self.assertTrue(_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)['issues'])
+
+    def test_real_journal_passes_candidate_and_merges_only_missing_row_patch(self):
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.shared_budget import BudgetLedger,ledger_path,construction_command_budget
+        from company_initiation.historic_construction.workflow import _va_history_inputs,_va_schema
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        template=self.journal(data);provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE-KEY',max_output_tokens=1000);requests=[]
+        def complete(**kwargs):
+            payload=kwargs['payload'];requests.append(copy.deepcopy(payload))
+            provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=100,output_tokens=100,total_tokens=200),output=[])
+            if payload['stage']=='company_va_core_review':
+                return template.stage(payload['stage'],'fixture',payload,kwargs['schema'],lambda a:a)
+            if payload['stage']=='company_va_row_mapping':
+                result=template.stage('company_va_row_mapping','fixture',payload,kwargs['schema'],lambda a:a)
+                result['decisions'].pop();return result
+            previous=payload['previous_candidate'];self.assertEqual(len(previous['decisions']),2)
+            self.assertEqual(payload['permitted_changes'][0]['expected_digest'],None)
+            original=template.stage('company_va_row_mapping','fixture',payload['context'],
+                _va_schema([r['row_key'] for r in rows],['money'])[0],lambda a:a)
+            missing=next(d for d in original['decisions'] if d['row_key']==payload['permitted_changes'][0]['row_key'])
+            return dict(changes=[dict(row_key=missing['row_key'],expected_digest=None,path='$',value=missing)])
+        with construction_command_budget(root/'outputs',data['company'],20):
+            directory=root/'outputs/construct_fixture';directory.mkdir()
+            ledger=BudgetLedger(ledger_path(root/'outputs',data['company']),data['company'])
+            journal=RunJournal(directory,provider,dict(company=data['company'],limits=dict(usd=20,repairs=2)),ledger=ledger)
+            with patch.object(provider,'complete',side_effect=complete),patch('company_initiation.shared_ai.urlopen',side_effect=AssertionError('No network')):
+                _va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,contract)
+            self.assertEqual(len(requests),2);self.assertEqual(ledger.summary()['total_requests'],2)
+            self.assertEqual(data['historical']['sales']['values']['2024'],100.)
+            self.assertTrue((directory/'va_cohort_0_validated.json').is_file())
+            self.assertEqual(journal.entries[0]['result']['decisions'],requests[1]['previous_candidate']['decisions'])
+            self.assertTrue(all('period_ids' not in v for d in json.loads((directory/'va_cohort_0_validated.json').read_text())['candidate']['decisions'] for v in d.get('versions',[])))
+
+    def test_partial_export_and_explicit_resume_reuse_completed_cohort_and_budget(self):
+        from company_initiation.shared_ai import OpenAIProvider,AIError
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.shared_budget import BudgetLedger,ledger_path,construction_command_budget
+        from company_initiation.historic_construction.workflow import _va_history_inputs
+        from openpyxl import load_workbook
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        cohorts=[rows[:1],rows[1:]]
+        template=self.journal(data);provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE-KEY',max_output_tokens=1000)
+        first_calls=[]
+        def complete(**kwargs):
+            payload=kwargs['payload'];first_calls.append(payload['cohort_index'])
+            provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=100,output_tokens=100,total_tokens=200),output=[])
+            if payload['cohort_index']==1:raise AIError('Synthetic known-usage failure after a completed cohort')
+            return template.stage('company_va_row_mapping','fixture',payload,kwargs['schema'],lambda a:a)
+        with construction_command_budget(root/'outputs',data['company'],20) as budget:
+            first=root/'outputs/construct_first';first.mkdir();ledger=BudgetLedger(ledger_path(root/'outputs',data['company']),data['company'])
+            journal=RunJournal(first,provider,dict(company=data['company'],limits=dict(usd=20,repairs=2)),ledger=ledger)
+            with patch('company_initiation.historic_construction.workflow._va_cohorts',return_value=cohorts),patch.object(provider,'complete',side_effect=complete):
+                with self.assertRaisesRegex(AIError,'known-usage failure'):_va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,contract)
+            self.assertTrue((first/'historical_model_incomplete.xlsx').is_file())
+            book=load_workbook(first/'historical_model_incomplete.xlsx')
+            try:self.assertTrue(book['Model']['B4'].value.startswith('INCOMPLETE:'))
+            finally:book.close()
+            saved=json.loads((first/'va_mapping_progress.json').read_text())
+            self.assertGreater(len(saved['company_inputs']['observations']),0)
+            journal.state['status']='incomplete';journal.save();previous=copy.deepcopy(journal.state);old_bytes=(first/'record.json').read_bytes()
+        resumed_calls=[]
+        def recovered(**kwargs):
+            payload=kwargs['payload']
+            if payload['stage']=='company_va_row_mapping':resumed_calls.append(payload['cohort_index'])
+            provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=100,output_tokens=100,total_tokens=200),output=[])
+            return template.stage(payload['stage'],'fixture',payload,kwargs['schema'],lambda a:a)
+        with construction_command_budget(root/'outputs',data['company'],None,previous=previous) as continued:
+            second=root/'outputs/construct_second';second.mkdir();ledger=BudgetLedger(ledger_path(root/'outputs',data['company']),data['company'])
+            journal=RunJournal(second,provider,dict(company=data['company'],limits=dict(usd=20,repairs=2)),previous=previous,ledger=ledger)
+            with patch('company_initiation.historic_construction.workflow._va_cohorts',return_value=cohorts),patch.object(provider,'complete',side_effect=recovered):
+                _va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,contract)
+            self.assertEqual(resumed_calls,[1]);self.assertEqual(continued['allowance_period_id'],budget['allowance_period_id'])
+            self.assertEqual(ledger.summary()['total_requests'],3)
+        self.assertEqual((first/'record.json').read_bytes(),old_bytes)
+
+    def test_saved_real_response_patterns_replay_locally_without_a_company_build(self):
+        """Read preserved outputs when present; this is replay, not new AI research."""
+        from company_initiation.historic_construction.workflow import _va_assess
+        from company_initiation.historic_construction.evidence import SourceStore
+        from company_initiation.historic_construction.periods import build_periods
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        from company_initiation.shared_project import find_project_root
+        workspace=find_project_root();folders=sorted((workspace/'outputs').glob('construct_research_20261031*'))
+        examined=0
+        for folder in folders:
+            record=json.loads((folder/'record.json').read_text(encoding='utf-8'))
+            calls=[c for c in record['calls'] if c['stage']=='company_va_row_mapping' and 'mappings' in c.get('result',{})]
+            if not calls:continue
+            last=calls[-1];payload=last['request']['payload'];catalogue={r['row_key']:r for r in payload['rows']}
+            with tempfile.TemporaryDirectory() as temp:
+                store=SourceStore(Path(temp)/'sources')
+                descriptors=[source for source in record['sources'] if source.get('category')=='visible_alpha']
+                for source in descriptors:store.restore(source,archive_root=workspace/'outputs')
+                data=dict(company=record['configuration']['company'],currency=payload['currency'],segments=payload['company_scope']['segments'],
+                    model_configuration=dict(as_of='2026-10-31'),sources={s['id']:s for s in descriptors})
+                periods=build_periods(list(range(2018,2027)),payload['fiscal_calendar'])
+                rows=store.company_reported_rows([s['id'] for s in descriptors],periods,as_of='2026-10-31')
+                selected=[r for r in rows if r['row_key'] in catalogue]
+                evidence=store.read_documents([dict(source_id=s['id'],unit_id=next(iter(store._units[s['id']]))) for s in descriptors],historical_years=set(range(2018,2027)))
+                decisions=[]
+                for old in last['result']['mappings']:
+                    row=next(r for r in selected if r['row_key']==old['row_key'])
+                    from company_initiation.historic_construction.evidence import va_unit_options
+                    options=va_unit_options(row['reported_unit'],data['currency'])
+                    if not options:continue
+                    version={k:copy.deepcopy(old[k]) for k in ('row_id','label','entity_id','metric_type','basis','definition_id','scope','restatement','restatement_vintage','classification_basis')}
+                    entity=old['entity_id'];current={s['id'] for s in data['segments']}
+                    version.update(definition_status='source_defined',basis_status='period_defined',entity_kind='group' if entity=='group' else 'corporate' if entity=='corporate' else 'current_segment' if entity in current else 'legacy_segment',
+                        measure=options[0]['measure'],effective_from=None,effective_to=None,version_refs=[],polarity=1)
+                    decisions.append(dict(row_key=old['row_key'],action='map',versions=[version]))
+                if not decisions:continue
+                # Test each saved mapping independently: unit/period mechanics
+                # can be corrected, while the saved bad group entity is rejected.
+                for decision in decisions:
+                    row=next(r for r in selected if r['row_key']==decision['row_key'])
+                    report=_va_assess(dict(decisions=[decision],gaps=[]),[row],rows,data,store,data['sources'],periods,
+                        dict(roles=integrated_role_contract()),evidence)
+                    if decision['versions'][0]['row_id']=='sales' and decision['versions'][0]['entity_id']=='corporate':
+                        self.assertTrue(report['issues'])
+                    if row['label']=='M&A and others impact - Nespresso':
+                        self.assertFalse(report['issues']);self.assertEqual(len(report['facts']),len(row['cells']))
+                        self.assertTrue({'2024-Q2','2024-Q3'}<={f['period_id'] for f in report['facts']})
+                examined+=1
+        if not examined:self.skipTest('Local archived real-response journals are absent; synthetic regressions still run')
+        self.assertEqual(examined,3)
+
+
+class HistoricalRetestFixTests(unittest.TestCase):
+    fixture=CompanyReportedVAConstructionTests.fixture
+    journal=CompanyReportedVAConstructionTests.journal
+    case=VAMappingRepairTests.case
+    candidate=VAMappingRepairTests.candidate
+
+    def test_scientific_numeric_roundtrips_remain_finite_and_exactly_nonzero(self):
+        from company_initiation.historic_construction.evidence import parse_number
+        for raw,expected in [('1e-05',.00001),('-2.607164804e-05',-.00002607164804),('1E+3',1000.),('(1e-5)',-.00001),('1e-3%',.00001)]:
+            self.assertEqual(parse_number(raw),expected)
+        self.assertEqual(parse_number('1,2e-3','comma_decimal'),.0012)
+        for bad in ('1e309','NaN','inf','1e-5junk','1e--5',None,True):
+            with self.subTest(bad=bad),self.assertRaises(ValueError):parse_number(bad)
+
+    def test_source_selection_uses_enum_compact_catalogue_and_bounded_invalid_id_repair(self):
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.workflow import _identity_source_selection
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        directory=root/'selection';directory.mkdir();provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE',max_output_tokens=1000)
+        journal=RunJournal(directory,provider,dict(company=data['company'],limits=dict(usd=20,repairs=2)))
+        catalogue={'real-a':dict(id='real-a',title='Company Reported',category='visible_alpha',dataset_role='company_reported',vendor_profile={'large':'x'*30000}),
+                   'real-b':dict(id='real-b',title='Company disclosure',category='financial_reports')}
+        requests=[]
+        def complete(**kwargs):
+            requests.append(copy.deepcopy(kwargs));provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=100,output_tokens=50,total_tokens=150),output=[])
+            return dict(source_ids=['real-a','local_202?'] if len(requests)==1 else ['real-a','real-b'],reasons=['Synthetic selection'],gaps=[])
+        with patch.object(provider,'complete',side_effect=complete),patch('company_initiation.shared_ai.urlopen',side_effect=AssertionError('No network')):
+            answer=_identity_source_selection(journal,data['company'],'2025-10-01',catalogue,'Select originals')
+        self.assertEqual(answer['source_ids'],['real-a','real-b']);self.assertEqual(len(requests),2)
+        self.assertEqual(requests[0]['schema']['properties']['source_ids']['items']['enum'],['real-a','real-b'])
+        self.assertNotIn('vendor_profile',requests[0]['payload']['catalog'][0])
+        self.assertTrue(requests[1]['payload']['validation_errors'])
+        self.assertEqual(journal.state['usage']['calls'],2)
+        self.assertIn('candidate_result',journal.entries[0]);self.assertNotIn('candidate_result',journal.entries[1])
+
+    def test_parser_failure_has_no_semantic_patch_and_numeric_preflight_is_offline(self):
+        from company_initiation.historic_construction.workflow import _va_assess,_va_numeric_preflight,_va_schema,_va_patch_contract,_va_apply_patch
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.shared_ai import OpenAIProvider
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        preflight=_va_numeric_preflight(store,[source['id']]);self.assertEqual(preflight['status'],'passed');self.assertGreater(preflight['checked_cells'],0)
+        candidate=self.candidate(data,rows);directory=root/'parser';directory.mkdir()
+        provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE',max_output_tokens=1000)
+        journal=RunJournal(directory,provider,dict(company=data['company'],limits=dict(usd=20,repairs=2)))
+        schema,decision_schema=_va_schema([r['row_key'] for r in rows],['money'])
+        def complete(**kwargs):
+            provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=100,output_tokens=50,total_tokens=150),output=[]);return candidate
+        with patch.object(store,'resolve',side_effect=ValueError('Synthetic unsupported source notation')),patch.object(provider,'complete',side_effect=complete) as api:
+            with self.assertRaisesRegex(ValueError,'deterministic validation blocker'):
+                journal.patch_stage('company_va_row_mapping','Fixture',{},schema,
+                    assess=lambda value:_va_assess(value,rows,rows,data,store,data['sources'],periods,contract,evidence),
+                    patch_contract=lambda value,report:_va_patch_contract(value,report,decision_schema),apply_patch=_va_apply_patch)
+        self.assertEqual(api.call_count,1)
+        self.assertTrue(all(c['stage']=='company_va_row_mapping' for c in journal.entries))
+
+    def test_provisional_model_populates_without_changing_calibration_or_deriving_unknown_bases(self):
+        from company_initiation.historic_construction.workflow import _va_assess
+        from company_initiation.historic_construction.model_contract import historical_model,historical_eligibility_inputs
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        candidate=self.candidate(data,rows)
+        for decision in candidate['decisions']:decision['versions'][0]['restatement']='unknown'
+        report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertFalse(report['issues']);data['observations']=report['facts']
+        data['model_configuration']['historical_display_policy']='provisional_vendor_v1';before=copy.deepcopy(data)
+        spec=historical_model(data);sales=next(r for r in spec['rows'] if r['id']=='sales')
+        self.assertEqual(sales['cells']['2024-FY']['value'],100)
+        self.assertEqual(sales['cells']['2024-FY']['status'],'provisional_vendor')
+        self.assertNotIn('2024-H2',sales['cells'])
+        self.assertTrue(all(not o['eligible'] and not o['calibration_eligible'] for o in report['facts']))
+        self.assertTrue(all(not o['eligible'] for o in historical_eligibility_inputs(data)['observations']))
+        self.assertEqual(data,before)
+        unresolved=copy.deepcopy(candidate);unresolved['decisions'][0]['versions'][0]['definition_status']='unresolved'
+        self.assertTrue(_va_assess(unresolved,rows,rows,data,store,data['sources'],periods,contract,evidence)['issues'])
+        vendor=copy.deepcopy(candidate)
+        for decision in vendor['decisions']:decision['versions'][0]['restatement']='vendor_normalized'
+        vendor_facts=_va_assess(vendor,rows,rows,data,store,data['sources'],periods,contract,evidence)['facts']
+        self.assertTrue(all(not f['historical_display_eligible'] for f in vendor_facts))
+
+    def test_provisional_historical_checkpoint_has_model_values_and_source_verification(self):
+        from company_initiation.historic_construction.workflow import _va_assess,_review_va_history,complete_historical_model,VA_MAPPING_CONTRACT
+        from company_initiation.historic_construction.evidence import verify_model_input_sources
+        from openpyxl import load_workbook
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        candidate=self.candidate(data,rows)
+        for decision in candidate['decisions']:decision['versions'][0]['restatement']='unknown'
+        data['observations']=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)['facts']
+        data['model_configuration'].update(historical_display_policy='provisional_vendor_v1',va_mapping_contract=VA_MAPPING_CONTRACT)
+        _review_va_history(self.journal(data),data,evidence)
+        before=copy.deepcopy(data);inputs=root/'prepared_synthetic.json';inputs.write_text(json.dumps(data),encoding='utf-8')
+        output=complete_historical_model(root,data['company'],archive,inputs)
+        record=json.loads((output/'record.json').read_text());self.assertEqual(record['status'],'historical_complete_provisional')
+        self.assertTrue(any(c['name'].startswith('observation:') and c['status']=='PASS' for c in json.loads((output/'source_validation.json').read_text())))
+        book=load_workbook(output/'historical_model.xlsx',data_only=False)
+        try:
+            self.assertIn('PROVISIONAL',book['Model']['B4'].value)
+            self.assertTrue(any(isinstance(c.value,str) and c.value.startswith('=') for row in book['Model'] for c in row))
+            self.assertNotIn('Valuation',book.sheetnames);self.assertNotIn('Assumptions',book.sheetnames)
+        finally:book.close()
+        self.assertEqual(data,before)
+        corrupt=copy.deepcopy(data);corrupt['observations'][0]['value']+=1
+        self.assertTrue(any(c['status']=='FAIL' for c in verify_model_input_sources(corrupt,archive)))
+        self.assertTrue(all(not o['eligible'] and not o['calibration_eligible'] for o in data['observations']))
+
+    def test_verified_duplicate_core_rows_are_excluded_only_with_retained_equivalence(self):
+        from company_initiation.historic_construction.workflow import _va_assess
+        from company_initiation.historic_construction.evidence import SourceStore,inventory_local_sources
+        from openpyxl import load_workbook
+        root,archive,source,_,periods,data,_,_,contract=self.case();path=archive/source['local_path']
+        book=load_workbook(path);sheet=book.active
+        for col in range(4,13):sheet.cell(12,col,sheet.cell(7,col).value)
+        book.save(path);book.close()
+        source=next(s for s in inventory_local_sources(archive)['sources'] if s.get('dataset_role')=='company_reported')
+        store=SourceStore(root/'duplicates');store.add_local(source,root=archive);data['sources']={source['id']:source}
+        rows=store.company_reported_rows([source['id']],periods,as_of=data['model_configuration']['as_of'])
+        evidence=store.read_documents([dict(source_id=source['id'],unit_id=next(iter(store._units[source['id']])))],historical_years={2024})
+        same=[r for r in rows if r['label']=='Group sales'];self.assertEqual(len(same),2)
+        candidate=self.candidate(data,rows);target=same[1];retained=same[0]
+        exclusion=dict(row_key=target['row_key'],action='exclude',reason_code='duplicate',reason='Same consolidated sales definition, entity, period basis and original values in this supplied workbook.',
+            duplicate_of=retained['row_key'],evidence_refs=[dict(source_id=r['source_id'],unit_id=r['unit_id']) for r in same])
+        candidate['decisions']=[exclusion if d['row_key']==target['row_key'] else d for d in candidate['decisions']]
+        report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertFalse(report['issues']);self.assertEqual(sum(f['row_id']=='sales' and f['kind']=='FY' for f in report['facts']),1)
+        target['cells'][0]['source_raw']='different value'
+        self.assertTrue(_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)['issues'])
+
+    def test_export_precision_and_failed_draft_registration_are_separate(self):
+        from company_initiation.historic_construction.model_excel import _export_value_equal
+        self.assertTrue(_export_value_equal(.101,.10099999999999999))
+        self.assertTrue(_export_value_equal(12345.67890123456,12345.678901234567))
+        for actual,expected in [(0.,1e-05),(100.,100.01),('=A1','=A2'),('source_a','source_b'),(False,0),(float('nan'),float('nan'))]:
+            self.assertFalse(_export_value_equal(actual,expected))
+        from company_initiation.historic_construction.workflow import _va_assess,_va_incomplete_output
+        from company_initiation.shared_runtime import RunJournal
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        facts=_va_assess(self.candidate(data,rows),rows,rows,data,store,data['sources'],periods,contract,evidence)['facts'];data['observations']=facts
+        directory=root/'failed_export';directory.mkdir();messages=[]
+        journal=RunJournal(directory,None,dict(company=data['company'],limits=dict(usd=20,repairs=2)),progress=messages.append)
+        with patch('company_initiation.historic_construction.model_excel._export_value_equal',return_value=False) as comparator:
+            with self.assertRaisesRegex(ValueError,'validation failed'):_va_incomplete_output(journal,data,ValueError('Synthetic mapping failure'))
+            first_count=comparator.call_count
+            self.assertIsNone(_va_incomplete_output(journal,data,ValueError('Second handler')))
+            self.assertEqual(comparator.call_count,first_count)
+        output=journal.state['stage_outputs']['historical'];self.assertEqual(output['status'],'failed')
+        self.assertTrue((directory/output['workbook']).is_file())
+        self.assertIn(output['workbook'],journal.state['artifacts']);self.assertIn(output['validation'],journal.state['artifacts'])
+        validation=json.loads((directory/output['validation']).read_text());self.assertEqual(validation['saved_value_and_formula_readback'],'failed')
+        self.assertTrue(any('failed' in m and '.xlsx' in m for m in messages))
+
+    def test_latest_local_failed_workbooks_and_scientific_tokens_replay_offline(self):
+        from company_initiation.shared_project import find_project_root
+        from company_initiation.historic_construction.model_excel import write_historical_output
+        from company_initiation.historic_construction.evidence import parse_number
+        workspace=find_project_root();examined=0
+        for folder_name in ['construct_research_20261031T144355Z_2503b344','construct_research_20261031T144321Z_58bea8c9']:
+            folder=workspace/'outputs'/folder_name
+            if not (folder/'va_mapping_progress.json').exists():continue
+            data=json.loads((folder/'va_mapping_progress.json').read_text(encoding='utf-8'))['company_inputs']
+            with tempfile.TemporaryDirectory() as temp:
+                output=write_historical_output(Path(temp),data,incomplete=True)
+                self.assertEqual(output['status'],'incomplete')
+                report=json.loads((Path(temp)/output['validation']).read_text())
+                self.assertEqual(report['saved_value_and_formula_readback'],'passed')
+            examined+=1
+        if not examined:self.skipTest('Local archived real-data drafts are absent; synthetic precision cases still run')
+        self.assertEqual(examined,2)
+        self.assertEqual(parse_number('1e-05'),.00001);self.assertEqual(parse_number('-2.607164804e-05'),-.00002607164804)
+
+
+class VASemanticReliabilityTests(unittest.TestCase):
+    fixture=CompanyReportedVAConstructionTests.fixture
+    journal=CompanyReportedVAConstructionTests.journal
+    case=VAMappingRepairTests.case
+    candidate=VAMappingRepairTests.candidate
+
+    def test_source_keys_are_canonicalized_but_wrong_typed_temporal_roles_fail(self):
+        from company_initiation.historic_construction.workflow import _va_assess
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        candidate=self.candidate(data,rows);sales=next(d for d in candidate['decisions'] if d['versions'][0]['row_id']=='sales')
+        original=copy.deepcopy(candidate);sales['versions'][0]['row_id']=sales['row_key']
+        report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertFalse(report['issues'])
+        self.assertTrue(any(f['row_id']=='sales' for f in report['facts']))
+        self.assertFalse(any(f['row_id'].startswith('row_') for f in report['facts']))
+        wrong=copy.deepcopy(original);next(d for d in wrong['decisions'] if d['versions'][0]['row_id']=='sales')['versions'][0]['financial_role']='cash'
+        self.assertTrue(_va_assess(wrong,rows,rows,data,store,data['sources'],periods,contract,evidence)['issues'])
+        self.assertEqual(next(r for r in rows if r['label']=='Group sales')['cells'][-1]['source_raw'],'40')
+
+    def test_source_period_metadata_preserves_headers_series_and_distinct_intervals(self):
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case(currency='JPY',year_end='03-31',reorganized=True)
+        sales=next(r for r in rows if r['label']=='Group sales')
+        fiscal=next(c['period_metadata'] for c in sales['cells'] if c['period_id']=='2024-FY')
+        half=next(c['period_metadata'] for c in sales['cells'] if c['period_id']=='2024-H1')
+        self.assertEqual(fiscal['source_period_label'],'FY-2024');self.assertEqual(fiscal['source_series'],'Filings')
+        self.assertEqual((fiscal['start'],fiscal['end']),('2023-04-01','2024-03-31'))
+        self.assertEqual((half['start'],half['end']),('2023-04-01','2023-09-30'))
+        self.assertIn(fiscal['header_ref']['unit_id'],store._units[source['id']])
+        self.assertEqual(sales['source_row_role'],'metric');self.assertIn('navigation',sales['navigation_note'])
+        self.assertFalse(any('E' in c['period_metadata']['source_period_label'] for r in rows for c in r['cells']))
+
+    def test_uncertain_interim_does_not_erase_clear_annual_facts_or_generate_arithmetic(self):
+        from company_initiation.historic_construction.workflow import _va_assess,_va_coverage_gaps
+        from company_initiation.historic_construction.model_contract import historical_model
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        candidate=self.candidate(data,rows)
+        sales=next(d for d in candidate['decisions'] if d['versions'][0]['row_id']=='sales')
+        physical=next(r for r in rows if r['row_key']==sales['row_key'])
+        annual=copy.deepcopy(sales['versions'][0]);annual.update(period_kinds=['FY'],version_refs=[dict(source_id=source['id'],unit_id=physical['unit_id'])],restatement='unknown')
+        interim=copy.deepcopy(annual);interim.update(period_kinds=['H1'],period_basis='unresolved',basis_status='unresolved',basis='Unresolved: interim measurement convention')
+        sales['versions']=[annual,interim]
+        report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertFalse(report['issues']);self.assertFalse(_va_coverage_gaps(data,report['facts'],periods))
+        data['observations']=report['facts'];data['model_configuration']['historical_display_policy']='provisional_vendor_v1'
+        projected=next(r for r in historical_model(data)['rows'] if r['id']=='sales')
+        self.assertEqual(projected['cells']['2024-FY']['value'],100)
+        self.assertNotIn('2024-H1',projected['cells']);self.assertNotIn('2024-H2',projected['cells'])
+
+    def test_flags_cannot_resolve_a_contradictory_basis_explanation(self):
+        from company_initiation.historic_construction.workflow import _va_assess,_va_patch_contract,_va_schema
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        candidate=self.candidate(data,rows);candidate['decisions'][0]['versions'][0]['basis']='Unresolved: original flow duration'
+        report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertTrue(any('must agree' in i['detail'] for i in report['issues']))
+        patch=_va_patch_contract(candidate,report,_va_schema([r['row_key'] for r in rows],['money'])[1])
+        paths={p for item in patch['permitted_changes'] for p in item['paths']}
+        self.assertIn('versions.0.basis',paths);self.assertIn('versions.0.period_basis',paths)
+
+    def test_cited_hierarchy_applies_to_its_own_fiscal_period_without_relabelling(self):
+        from company_initiation.historic_construction.workflow import _va_history_inputs,_va_validate_reporting_context,_va_coverage_gaps
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case(currency='JPY',year_end='03-31',reorganized=True)
+        ref=dict(source_id=source['id'],unit_id=rows[0]['unit_id'])
+        context=dict(declarations=[],entity_versions=[dict(entity_id='legacy',label='Legacy division',entity_kind='legacy_segment',
+            effective_from=None,effective_to='2024-03-31',source_refs=[ref])],hierarchies=[
+                dict(effective_from=None,effective_to='2024-03-31',entity_ids=['legacy'],source_refs=[ref]),
+                dict(effective_from='2024-04-01',effective_to=None,entity_ids=['equipment','services'],source_refs=[ref])])
+        units={source['id']:store._units[source['id']]};_va_validate_reporting_context(context,units,data['segments'])
+        data['model_configuration'].update(va_reporting_context=context,full_statement_frequency='half_year')
+        data['history_years']=[2024]
+        journal=self.journal(data);_va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,contract)
+        self.assertFalse(_va_coverage_gaps(data,data['observations'],periods))
+        self.assertEqual(data['historical']['legacy_sales']['values']['2024'],100)
+        self.assertNotIn('2024',data['historical'].get('equipment_sales',{}).get('values',{}))
+        self.assertNotIn('company_va_core_review',journal.calls)
+        bad=copy.deepcopy(context);bad['hierarchies'][1]['effective_from']='2024-03-31'
+        bad['hierarchies'][1]['entity_ids']=['legacy']
+        with self.assertRaisesRegex(ValueError,'overlap'):_va_validate_reporting_context(bad,units,data['segments'])
+        bad=copy.deepcopy(context);bad['entity_versions'][0]['source_refs'][0]['unit_id']='not_supplied'
+        with self.assertRaisesRegex(ValueError,'original sections'):_va_validate_reporting_context(bad,units,data['segments'])
+
+    def test_prose_only_patch_stops_before_another_paid_request(self):
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.workflow import _va_assess,_va_schema,_va_patch_contract,_va_apply_patch,_va_semantic_fingerprint
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        candidate=self.candidate(data,rows);version=candidate['decisions'][0]['versions'][0]
+        version.update(basis_status='unresolved',period_basis='unresolved',basis='Unresolved: flow convention')
+        schema,decision_schema=_va_schema([r['row_key'] for r in rows],['money'])
+        provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE-KEY');directory=root/'journal';directory.mkdir()
+        journal=RunJournal(directory,provider,dict(limits=dict(usd=20,repairs=2)))
+        def complete(**kwargs):
+            payload=kwargs['payload'];change=payload['permitted_changes'][0]
+            provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=100,output_tokens=50,total_tokens=150),output=[])
+            return dict(changes=[dict(row_key=change['row_key'],expected_digest=change['expected_digest'],
+                path='versions.0.classification_basis',value='Different prose; fiscal convention remains unknown')])
+        with patch.object(provider,'complete',side_effect=complete) as api,patch('company_initiation.shared_ai.urlopen',side_effect=AssertionError('No network')):
+            with self.assertRaisesRegex(ValueError,'no semantic progress'):
+                journal.patch_stage('company_va_row_mapping','fixture',{},schema,initial_candidate=candidate,
+                    assess=lambda a:_va_assess(a,rows,rows,data,store,data['sources'],periods,contract,evidence),
+                    patch_contract=lambda a,r:_va_patch_contract(a,r,decision_schema),apply_patch=_va_apply_patch,
+                    semantic_fingerprint=_va_semantic_fingerprint)
+        self.assertEqual(api.call_count,1);self.assertEqual(journal.state['usage']['calls'],1)
+        self.assertTrue(list(directory.glob('*semantic_stop.json')))
+
+    def test_targeted_resolution_uses_original_context_and_retains_unknown_conclusions(self):
+        from company_initiation.historic_construction.workflow import _va_resolve_evidence
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        journal=self.journal(data);original=journal.stage;seen=[]
+        section=dict(source_id='synthetic_note',unit_id='note:periods',text='SYNTHETIC: reporting definition is not resolved by this note')
+        target=dict(row_key=rows[0]['row_key'],source_ref=dict(source_id=source['id'],unit_id=rows[0]['unit_id']))
+        report=dict(issues=[dict(row_key=target['row_key'],detail='Period convention unknown',paths=['versions.0.basis_status'],kind='financial_evidence')])
+        def stage(name,prompt,payload,schema,validator):
+            seen.append(payload)
+            answer=dict(conclusions=[dict(row_key=target['row_key'],finding_id=payload['questions'][0]['finding_id'],status='unresolved',detail='Original note does not resolve the question',
+                source_refs=[dict(source_id=section['source_id'],unit_id=section['unit_id'])])],summary='Evidence remains insufficient')
+            return validator(answer)
+        journal.stage=stage
+        self.assertIsNone(_va_resolve_evidence(journal,data,[target],report,[],[]));self.assertFalse(seen)
+        result=_va_resolve_evidence(journal,data,[target],report,[section],[])
+        self.assertEqual(result['conclusions']['conclusions'][0]['status'],'unresolved')
+        self.assertEqual(seen[0]['original_sections'],[section]);self.assertFalse(data['observations'])
+        for index in range(3):
+            changed=copy.deepcopy(report);changed['issues'][0]['detail']+=' '+str(index)
+            _va_resolve_evidence(journal,data,[target],changed,[section],[])
+        self.assertEqual(len(seen),3);self.assertEqual(len(journal.state['va_evidence_resolutions']),3)
+
+    def test_single_final_review_retains_native_facts_and_reports_material_definition_error(self):
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.historic_construction.workflow import _va_history_inputs,_review_va_history
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        template=self.journal(data);provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE-KEY');stages=[]
+        directory=root/'journal';directory.mkdir();journal=RunJournal(directory,provider,dict(limits=dict(usd=20,repairs=2)))
+        def complete(**kwargs):
+            payload=kwargs['payload'];stage=payload['stage'];stages.append(stage)
+            provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=100,output_tokens=50,total_tokens=150),output=[])
+            answer=template.stage(stage,'fixture',payload,kwargs['schema'],lambda a:a)
+            if stage=='company_va_row_mapping':
+                next(d for d in answer['decisions'] if d['versions'][0]['row_id']=='sales')['versions'][0]['definition_id']='gross_billings_including_tax'
+                self.assertTrue(payload['period_catalogue'])
+            elif stage=='company_va_history_review':
+                answer['checks'][0].update(status='error',detail='Source Sales is not gross billings including tax')
+                self.assertTrue(payload['history']);self.assertTrue(payload['mapping_plan'])
+            else:self.fail('Unexpected additional review/repair: '+stage)
+            return answer
+        with patch.object(provider,'complete',side_effect=complete),patch('company_initiation.shared_ai.urlopen',side_effect=AssertionError('No network')):
+            _va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,contract)
+            result=_review_va_history(journal,data,evidence)
+        self.assertEqual(stages,['company_va_row_mapping','company_va_history_review'])
+        self.assertEqual(result['status'],'incomplete')
+        self.assertEqual(data['historical']['sales']['values']['2024'],100)
+        self.assertTrue(all(o['definition_id']=='gross_billings_including_tax' for o in data['observations'] if o['row_id']=='sales'))
+        self.assertTrue((directory/'combined_history_review.json').is_file())
+
+    def test_actual_saved_failures_remain_evidence_replays_not_company_builds(self):
+        from company_initiation.historic_construction.workflow import _va_coverage_gaps,_va_assess
+        from company_initiation.historic_construction.evidence import SourceStore
+        from company_initiation.historic_construction.periods import build_periods
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        from company_initiation.shared_project import find_project_root
+        workspace=find_project_root();examined=0
+        for name in ['construct_research_20261031T152303Z_e766b896','construct_research_20261031T152305Z_5745778e','construct_research_20261031T152310Z_163598d3']:
+            run=workspace/'outputs'/name
+            if not (run/'va_mapping_progress.json').is_file():continue
+            record=json.loads((run/'record.json').read_text(encoding='utf-8'))
+            data=json.loads((run/'va_mapping_progress.json').read_text(encoding='utf-8'))['company_inputs']
+            periods=build_periods(list(range(2018,2027)),data['fiscal_calendar'])
+            gaps=_va_coverage_gaps(data,data['observations'],periods)
+            self.assertTrue(gaps)
+            if '5745778e' in name:self.assertIn('dermatological_beauty_sales',{g['row_id'] for g in gaps})
+            else:
+                physical='row_7' if 'e766b896' in name else 'row_22'
+                initial=next(c['result'] for c in record['calls'] if c['stage']=='company_va_row_mapping' and any(d['row_key']==physical for d in c['result']['decisions']))
+                decision=copy.deepcopy(next(d for d in initial['decisions'] if d['row_key']==physical))
+                for v in decision['versions']:v.update(financial_role='sales',period_basis='source_period' if v['basis_status']=='period_defined' else 'unresolved',period_kinds=[])
+                with tempfile.TemporaryDirectory() as temp:
+                    store=SourceStore(Path(temp));descriptor=next(s for s in record['sources'] if s.get('dataset_role')=='company_reported')
+                    store.restore(descriptor,archive_root=workspace/'outputs')
+                    rows=store.company_reported_rows([descriptor['id']],periods,as_of='2026-10-31');row=next(r for r in rows if r['row_key']==physical)
+                    evidence=store.read_documents([dict(source_id=descriptor['id'],unit_id=row['unit_id'])],historical_years=set(range(2018,2027)))
+                    assessed=_va_assess(dict(decisions=[decision],gaps=[]),[row],rows,data,store,{descriptor['id']:descriptor},periods,dict(roles=integrated_role_contract()),evidence)
+                    self.assertFalse(any('Source row_key' in i['detail'] for i in assessed['issues']))
+                    self.assertTrue(all(not f['row_id'].startswith('row_') for f in assessed['facts']))
+            examined+=1
+        if not examined:self.skipTest('Saved company inputs absent; fresh synthetic regressions still run')
+        self.assertEqual(examined,3)
+
+    def test_live_journal_routes_a_basis_gap_to_original_evidence_then_bounded_patch(self):
+        from openpyxl import Workbook
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.shared_budget import construction_command_budget,BudgetLedger,ledger_path
+        from company_initiation.historic_construction.evidence import inventory_local_sources
+        from company_initiation.historic_construction.workflow import _va_history_inputs
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        notes=archive/'financial_reports';notes.mkdir();book=Workbook();book.active['A1']='SYNTHETIC disclosure: annual sales cover the fiscal year; H1 covers the first half.'
+        book.save(notes/'Reporting notes.xlsx');book.close()
+        note=next(s for s in inventory_local_sources(archive)['sources'] if s['category']=='financial_reports')
+        store.add_local(note,root=archive);data['sources'][note['id']]=note
+        supporting=store.read_documents([dict(source_id=note['id'],unit_id=next(iter(store._units[note['id']])))])
+        template=self.journal(data);provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE-KEY');stages=[];seen=[]
+        def complete(**kwargs):
+            payload=kwargs['payload'];stage=payload['stage'];stages.append(stage)
+            provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=100,output_tokens=50,total_tokens=150),output=[])
+            if stage in ('company_va_row_mapping','company_va_core_review'):
+                answer=template.stage(stage,'fixture',payload,kwargs['schema'],lambda a:a)
+                if stage=='company_va_row_mapping':
+                    sales=next(d for d in answer['decisions'] if d['versions'][0]['row_id']=='sales')
+                    sales['versions'][0].update(period_basis='unresolved',basis_status='unresolved',basis='Unresolved: fiscal flow duration',restatement='unknown')
+                return answer
+            if stage=='company_va_evidence_resolution':
+                from company_initiation.historic_construction.workflow import _va_semantic_sections
+                self.assertEqual(payload['original_sections'],_va_semantic_sections(supporting));self.assertTrue(payload['headers'])
+                return dict(conclusions=[dict(row_key=q['row_key'],finding_id=q['finding_id'],status='supported',detail='Original disclosure and headers specify fiscal intervals',
+                    source_refs=[dict(source_id=supporting[0]['source_id'],unit_id=supporting[0]['unit_id'])]) for q in payload['questions']],summary='Supported source intervals')
+            self.assertEqual(stage,'company_va_row_mapping_patch');seen.append(payload)
+            rule=payload['permitted_changes'][0]
+            return dict(changes=[dict(row_key=rule['row_key'],expected_digest=rule['expected_digest'],path='versions.0.'+field,value=value)
+                for field,value in [('basis','Reported fiscal interval specified by the original header and disclosure'),('basis_status','period_defined'),('period_basis','source_period')]])
+        with construction_command_budget(root/'outputs',data['company'],20):
+            directory=root/'outputs/fixture';directory.mkdir()
+            ledger=BudgetLedger(ledger_path(root/'outputs',data['company']),data['company'])
+            journal=RunJournal(directory,provider,dict(company=data['company'],limits=dict(usd=20,repairs=2)),ledger=ledger)
+            with patch.object(provider,'complete',side_effect=complete),patch('company_initiation.shared_ai.urlopen',side_effect=AssertionError('No network')):
+                _va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,contract,supporting_evidence=supporting)
+        self.assertEqual(ledger.summary()['total_requests'],3);self.assertEqual(ledger.summary()['unresolved_reservations_usd'],0)
+        self.assertEqual(stages,['company_va_row_mapping','company_va_evidence_resolution','company_va_row_mapping_patch'])
+        self.assertIn('additional_evidence',seen[0]);self.assertEqual(data['observations'][0]['source_refs'][0]['raw'],100)
+        self.assertFalse(any(o['calibration_eligible'] for o in data['observations'] if o['row_id']=='sales'))
+
+    def test_fresh_quarterly_and_half_year_companies_export_through_the_same_entry(self):
+        from openpyxl import load_workbook
+        from company_initiation.historic_construction.evidence import inventory_local_sources,SourceStore
+        from company_initiation.historic_construction.workflow import _va_history_inputs,_review_va_history,complete_historical_model
+        for currency,end,reorg,cadence in [('USD','12-31',False,'quarterly'),('JPY','03-31',True,'half_year')]:
+            with self.subTest(currency=currency):
+                root,archive,source,store,periods,data,rows,evidence,contract=self.case(currency=currency,year_end=end,reorganized=reorg)
+                data['model_configuration']['full_statement_frequency']=cadence
+                if cadence=='quarterly':
+                    path=archive/source['local_path'];book=load_workbook(path);sheet=book.active
+                    for col,kind,sales,cash in [(13,'1QFY-2024',18,3),(14,'2QFY-2024',22,4),(15,'3QFY-2024',27,6),(16,'4QFY-2024',33,8)]:
+                        sheet.cell(4,col,kind);sheet.cell(5,col,'Filings');sheet.cell(7,col,sales);sheet.cell(8,col,cash);sheet.cell(9,col,sales)
+                    book.save(path);book.close()
+                    source=next(s for s in inventory_local_sources(archive)['sources'] if s.get('dataset_role')=='company_reported')
+                    store=SourceStore(root/'quarterly');store.add_local(source,root=archive);data['sources']={source['id']:source}
+                journal=self.journal(data)
+                evidence=_va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,contract)
+                _review_va_history(journal,data,evidence)
+                inputs=root/'synthetic_inputs.json';inputs.write_text(json.dumps(data),encoding='utf-8')
+                output=complete_historical_model(root,data['company'],archive,inputs)
+                self.assertTrue((output/'historical_model.xlsx').is_file())
+                self.assertEqual(json.loads((output/'record.json').read_text(encoding='utf-8'))['status'],'historical_complete_provisional')
+                validation=json.loads((output/'historical_workbook_validation.json').read_text())
+                self.assertEqual(validation['saved_value_and_formula_readback'],'passed')
+                projection=json.loads((output/'historical_model.json').read_text(encoding='utf-8'))
+                sales_row=next(r for r in projection['rows'] if r['id']=='sales')
+                # Same-date stock aliases do not establish quarterly flow reporting.
+                quarter_ids={p for p in sales_row['cells'] if '-Q' in p}
+                self.assertEqual(bool(quarter_ids),cadence=='quarterly')
+                if reorg:
+                    self.assertEqual(data['historical']['legacy_sales']['values']['2024'],100)
+                    self.assertEqual(data['historical']['equipment_sales']['values']['2025'],70)
+                else:
+                    self.assertEqual(next(o['value'] for o in data['observations'] if o['row_id']=='sales' and o['period_id']=='2024-Q1'),18)
+
+    def test_missing_essential_role_is_repaired_from_source_candidates_before_detail(self):
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.shared_runtime import RunJournal,digest
+        from company_initiation.historic_construction.workflow import _va_history_inputs
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        template=self.journal(data);provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE-KEY');stages=[]
+        directory=root/'journal';directory.mkdir();journal=RunJournal(directory,provider,dict(limits=dict(usd=20,repairs=2)))
+        def complete(**kwargs):
+            payload=kwargs['payload'];stage=payload['stage'];stages.append(stage)
+            provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=100,output_tokens=50,total_tokens=150),output=[])
+            if stage in ('company_va_row_mapping','company_va_core_review'):
+                answer=template.stage(stage,'fixture',payload,kwargs['schema'],lambda a:a)
+                if stage=='company_va_row_mapping':
+                    sales=next(d for d in answer['decisions'] if d['versions'][0]['row_id']=='sales')
+                    sales['versions'][0].update(row_id='reported_turnover',financial_role=None)
+                return answer
+            self.assertEqual(stage,'company_va_core_coverage_patch')
+            self.assertEqual(payload['context']['coverage_gaps'][0]['row_id'],'sales')
+            decision=next(d for d in payload['previous_candidate']['decisions'] if d['versions'][0]['row_id']=='reported_turnover')
+            fixed=copy.deepcopy(decision);fixed['versions'][0].update(row_id='sales',financial_role='sales')
+            return dict(changes=[dict(row_key=decision['row_key'],expected_digest=digest(decision),path='$',value=fixed)])
+        with patch.object(provider,'complete',side_effect=complete),patch('company_initiation.shared_ai.urlopen',side_effect=AssertionError('No network')):
+            _va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,contract)
+        self.assertEqual(stages,['company_va_row_mapping'])
+        self.assertEqual(next(o['value'] for o in data['observations'] if o['row_id']=='reported_turnover' and o['period_id']=='2024-FY'),100)
+        self.assertFalse(data['model_configuration']['historical_coverage_gaps'])
+
+
+class HistoricalRestatementPolicyTests(unittest.TestCase):
+    fixture=CompanyReportedVAConstructionTests.fixture
+    journal=CompanyReportedVAConstructionTests.journal
+    case=VAMappingRepairTests.case
+    candidate=VAMappingRepairTests.candidate
+
+    def refresh(self,root,archive,data):
+        from company_initiation.historic_construction.evidence import inventory_local_sources,SourceStore
+        source=next(s for s in inventory_local_sources(archive)['sources'] if s.get('dataset_role')=='company_reported')
+        store=SourceStore(root/'changed_source');store.add_local(source,root=archive);data['sources']={source['id']:source}
+        return source,store
+
+    def test_unchanged_definition_selects_revised_source_numbers_and_retains_originals(self):
+        from openpyxl import load_workbook
+        from company_initiation.historic_construction.workflow import _va_history_inputs,_review_va_history,complete_historical_model
+        from company_initiation.historic_construction.model_contract import historical_model
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        book=load_workbook(archive/source['local_path']);sheet=book.active
+        for row,label in [(12,'Group sales'),(13,'Manufacturing sales')]:
+            sheet.cell(row,4,label);sheet.cell(row,5,'USDM');sheet.cell(row,6,'Analytics')
+            sheet.cell(row,7,110);sheet.cell(row,8,110);sheet.cell(row,9,45)
+        book.save(archive/source['local_path']);book.close();source,store=self.refresh(root,archive,data)
+        journal=self.journal(data);original=journal.stage
+        def stage(name,prompt,payload,schema,validator):
+            answer=original(name,prompt,payload,schema,lambda a:a)
+            if name=='company_va_row_mapping':
+                for decision in answer['decisions']:
+                    ref=next(r['source_ref'] for r in payload['target_rows'] if r['row_key']==decision['row_key'])
+                    if ref['unit_id'] in ('Reported!R12','Reported!R13'):
+                        decision['versions'][0].update(restatement='restated',restatement_vintage='2025-05-01')
+            return validator(answer)
+        journal.stage=stage
+        evidence=_va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,contract)
+        self.assertEqual(data['historical']['sales']['values']['2024'],110)
+        observations=[o for o in data['observations'] if o['row_id']=='sales' and o['period_id']=='2024-FY']
+        self.assertEqual({o['value'] for o in observations},{100,110})
+        self.assertFalse(next(o for o in observations if o['value']==100)['model_selection_eligible'])
+        spec=historical_model(data)
+        self.assertEqual(next(r for r in spec['rows'] if r['id']=='sales')['cells']['2024-FY']['value'],110)
+        self.assertEqual(next(r for r in spec['rows'] if r['id']=='reporting_current_sales')['cells']['2024-FY']['value'],110)
+        self.assertFalse(any(r['id'].startswith('reporting_historical_') for r in spec['rows']))
+        _review_va_history(journal,data,evidence)
+        inputs=root/'revised_inputs.json';inputs.write_text(json.dumps(data),encoding='utf-8')
+        output=complete_historical_model(root,data['company'],archive,inputs)
+        self.assertEqual(json.loads((output/'record.json').read_text())['status'],'historical_complete_provisional')
+        self.assertEqual(len([o for o in spec['observations'] if o['row_id']=='sales' and o['period_id']=='2024-FY']),2)
+
+    def test_redefined_regions_overlap_comparatives_and_export_separate_linked_totals(self):
+        from openpyxl import load_workbook
+        from company_initiation.historic_construction.workflow import _va_history_inputs,_review_va_history,complete_historical_model,_va_validate_reporting_context
+        from company_initiation.historic_construction.model_contract import historical_model
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case(currency='JPY',year_end='03-31',reorganized=True)
+        book=load_workbook(archive/source['local_path']);sheet=book.active
+        sheet.cell(9,10,110)
+        for row,value in [(10,60),(11,40)]:
+            sheet.cell(row,7,value);sheet.cell(row,8,value)
+        book.save(archive/source['local_path']);book.close();source,store=self.refresh(root,archive,data)
+        ref=dict(source_id=source['id'],unit_id='Reported!R1')
+        context=dict(declarations=[dict(topic='reporting_change',change_kind='redefinition',change_date='2025-04-01',
+            detail='SYNTHETIC reorganisation with published prior-year comparatives on both bases',effective_from='2023-04-01',effective_to=None,source_refs=[ref])],
+            entity_versions=[dict(entity_id='legacy',label='Old division',entity_kind='legacy_segment',effective_from=None,effective_to='2025-03-31',source_refs=[ref]),
+                *[dict(entity_id=s['id'],label=s['label'],entity_kind='current_segment',effective_from='2023-04-01',effective_to=None,source_refs=[ref]) for s in data['segments']]],
+            hierarchies=[dict(effective_from=None,effective_to='2025-03-31',entity_ids=['legacy'],source_refs=[ref]),
+                dict(effective_from='2023-04-01',effective_to=None,entity_ids=['equipment','services'],source_refs=[ref])])
+        _va_validate_reporting_context(context,{source['id']:store._units[source['id']]},data['segments'])
+        data['model_configuration']['va_reporting_context']=context
+        journal=self.journal(data);evidence=_va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,contract)
+        spec=historical_model(data);by_id={r['id']:r for r in spec['rows']}
+        self.assertEqual(by_id['reporting_current_sales']['cells']['2024-FY']['value'],100)
+        self.assertEqual(by_id['reporting_historical_1_sales']['cells']['2024-FY']['value'],100)
+        self.assertEqual(by_id['reporting_current_sales']['cells']['2025-FY']['value'],110)
+        self.assertEqual(by_id['reporting_historical_1_sales']['cells']['2025-FY']['value'],110)
+        ids=[r['id'] for r in spec['rows']]
+        self.assertLess(ids.index('services_sales'),ids.index('legacy_sales'))
+        self.assertEqual(set(by_id['reporting_current_sales']['cells']['2024-FY']['model_bindings'].values()),{'equipment_sales','services_sales'})
+        self.assertEqual(set(by_id['reporting_historical_1_sales']['cells']['2024-FY']['model_bindings'].values()),{'legacy_sales'})
+        _review_va_history(journal,data,evidence);inputs=root/'redefined_inputs.json';inputs.write_text(json.dumps(data),encoding='utf-8')
+        output=complete_historical_model(root,data['company'],archive,inputs)
+        self.assertEqual(json.loads((output/'record.json').read_text())['status'],'historical_complete_provisional')
+        workbook=load_workbook(output/'historical_model.xlsx',data_only=False);sheet=workbook['Model']
+        try:
+            import re
+            totals=[]
+            total_cells=[]
+            for row in sheet:
+                if '— Group sales' in str(row[1].value):
+                    formulas=[c for c in row if c.data_type=='f'];self.assertTrue(formulas)
+                    self.assertTrue(all('Historics' not in c.value for c in formulas))
+                    totals.append(row[0].row)
+                    total_cells.append(formulas[-1].coordinate)
+            self.assertEqual(len(totals),2);self.assertLess(totals[0],totals[1])
+            def evaluate(address):
+                value=sheet[address].value
+                if not isinstance(value,str):return value
+                if 'Historics' in value:return workbook['Historics'][value.rsplit('!',1)[1]].value
+                return sum(evaluate(ref) for ref in re.findall(r'[A-Z]+\d+',value))
+            self.assertEqual(evaluate(total_cells[0]),110);self.assertEqual(evaluate(total_cells[1]),110)
+            dependency=re.findall(r'[A-Z]+\d+',sheet[total_cells[0]].value)[0]
+            original=sheet[dependency].value;sheet[dependency]=evaluate(dependency)+5
+            self.assertEqual(evaluate(total_cells[0]),115);self.assertEqual(evaluate(total_cells[1]),110)
+            sheet[dependency]=original
+        finally:workbook.close()
+
+    def test_revision_vintage_selects_latest_but_different_definitions_and_ties_remain_separate(self):
+        from company_initiation.historic_construction.model_contract import select_revised_observations
+        original=dict(id='original',row_id='a_sales',period_id='2024-FY',entity_id='a',definition_id='net_sales',scope='a',
+            unit='USDm',metric_type='flow',restatement='original',value=100,status='reported',eligible=True,source_refs=[dict(source_id='SYNTHETIC',unit_id='original')])
+        older=dict(original,id='revision_1',value=110,restatement='restated',restatement_vintage='2025-03-01')
+        newer=dict(older,id='revision_2',value=120,restatement_vintage='2025-04-01')
+        output=select_revised_observations([original,older,newer])
+        self.assertEqual([o['id'] for o in output if o.get('model_selection_eligible',True)],['revision_2'])
+        self.assertEqual(len(output),3);self.assertNotIn('superseded_by',original)
+        changed=dict(newer,id='different_definition',definition_id='gross_billings')
+        output=select_revised_observations([original,changed]);self.assertTrue(all(o.get('model_selection_eligible',True) for o in output))
+        tied=dict(newer,id='unranked_revision',value=130)
+        output=select_revised_observations([original,newer,tied]);self.assertTrue(all(o.get('model_selection_eligible',True) for o in output))
+        invalid=dict(newer,id='unverified',status='unverified')
+        self.assertTrue(select_revised_observations([original,invalid])[0].get('model_selection_eligible',True))
+
+    def test_version_set_patch_preserves_unaffected_versions_and_digest_is_schema_constrained(self):
+        from company_initiation.historic_construction.workflow import _va_assess,_va_patch_contract,_va_apply_patch,_va_schema
+        from company_initiation.shared_runtime import digest,validate_shape
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        candidate=self.candidate(data,rows);decision=next(d for d in candidate['decisions'] if d['versions'][0]['row_id']=='sales')
+        row=next(r for r in rows if r['row_key']==decision['row_key']);ref=dict(source_id=source['id'],unit_id=row['unit_id'])
+        annual=copy.deepcopy(decision['versions'][0]);annual.update(period_kinds=['FY'],version_refs=[ref])
+        half=copy.deepcopy(annual);half.update(period_kinds=['H1'],entity_id='invalid_group')
+        decision['versions']=[annual,half]
+        report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        schema,version_schema=_va_schema([r['row_key'] for r in rows],['money'])
+        rule=_va_patch_contract(candidate,report,version_schema)
+        self.assertIn('versions.1',next(r for r in rule['permitted_changes'] if r['row_key']==decision['row_key'])['paths'])
+        replacement=copy.deepcopy(half);replacement['entity_id']='group'
+        patch_data=dict(changes=[dict(row_key=decision['row_key'],expected_digest=digest(decision),path='versions.1',value=replacement)])
+        validate_shape(patch_data,rule['schema']);updated=_va_apply_patch(candidate,patch_data,rule)
+        self.assertFalse(_va_assess(updated,rows,rows,data,store,data['sources'],periods,contract,evidence)['issues'])
+        invalid=copy.deepcopy(patch_data);invalid['changes'][0]['expected_digest']='wrong'
+        with self.assertRaisesRegex(ValueError,'digest'):_va_apply_patch(candidate,invalid,rule)
+        invalid=copy.deepcopy(patch_data);invalid['changes'][0].update(path='versions.0',value=dict(annual,definition_id='changed_valid_definition'))
+        with self.assertRaisesRegex(ValueError,'frozen'):_va_apply_patch(candidate,invalid,rule)
+
+    def test_shared_unchanged_segment_has_linked_presentation_in_each_structure(self):
+        from company_initiation.historic_construction.model_contract import _historical_reporting_blocks
+        cell=lambda n:dict(value=n,status='actual',source_refs=[])
+        data=dict(currency='USD',segments=[dict(id='new',label='New'),dict(id='shared',label='Shared')],observations=[],
+            model_configuration=dict(va_reporting_context=dict(entity_versions=[dict(entity_id='old',label='Old',entity_kind='legacy_segment')],
+                hierarchies=[dict(entity_ids=['old','shared'])])))
+        rows={name:dict(id=name,label='Sales',entity_id=name[:-6],unit='USDm',metric_type='flow',cells={'2024-FY':cell(n)})
+            for name,n in [('new_sales',60),('shared_sales',40),('old_sales',60)]}
+        ordered,checks=_historical_reporting_blocks(data,rows,[dict(id='2024-FY')]);by_id={r['id']:r for r in ordered}
+        old=by_id['reporting_historical_1_sales']['cells']['2024-FY']
+        self.assertEqual(old['value'],100)
+        self.assertIn('reporting_historical_1__shared_sales',old['model_bindings'].values())
+        self.assertEqual(by_id['reporting_historical_1__shared_sales']['cells']['2024-FY']['model_bindings'],dict(source='shared_sales'))
+
+    def test_saved_nestle_resolver_citations_validate_only_for_the_queried_findings(self):
+        from company_initiation.historic_construction.workflow import _va_resolve_evidence
+        from company_initiation.shared_project import find_project_root
+        run=find_project_root()/'outputs/construct_research_20261031T161220Z_f9c12a41'
+        if not (run/'record.json').exists():self.skipTest('Saved live resolver reply absent; synthetic resolver tests still run')
+        record=json.loads((run/'record.json').read_text(encoding='utf-8'));call=next(c for c in record['calls'] if c['stage']=='company_va_evidence_resolution')
+        payload=call['request']['payload'];data=json.loads((run/'va_mapping_progress.json').read_text(encoding='utf-8'))['company_inputs']
+        journal=self.journal(data);seen=[]
+        def stage(name,prompt,p,schema,validator):
+            seen.append(p);old={c['row_key']:c for c in call['result']['conclusions']}
+            result=dict(conclusions=[dict(copy.deepcopy(old[q['row_key']]),finding_id=q['finding_id']) for q in p['questions']],summary='Saved response representation replay; no new financial verdict')
+            return validator(result)
+        journal.stage=stage
+        answer=_va_resolve_evidence(journal,data,payload['rows'],dict(issues=[dict(q,kind='financial_evidence') for q in payload['questions']]),payload['original_sections'],payload['headers'])
+        self.assertEqual(len(answer['conclusions']['conclusions']),6);self.assertEqual(len(seen[0]['rows']),6)
+        manifest={(r['source_id'],r['unit_id']) for r in seen[0]['citation_manifest']}
+        self.assertTrue(all((row['source_ref']['source_id'],row['source_ref']['unit_id']) in manifest for row in seen[0]['rows']))
+        self.assertNotIn('original_sections',answer)
+
+    def test_saved_loreal_document_coverage_is_not_an_entity_start_date(self):
+        from company_initiation.historic_construction.workflow import _va_validate_reporting_context
+        from company_initiation.shared_project import find_project_root
+        run=find_project_root()/'outputs/construct_research_20261031T161225Z_4bcf13ae'
+        if not (run/'record.json').exists():self.skipTest('Saved L Oreal scope absent')
+        record=json.loads((run/'record.json').read_text(encoding='utf-8'))
+        call=next(c for c in record['calls'] if c['stage']=='company_reporting_scope');scope=call['result'];units={}
+        for unit in call['request']['payload']['evidence']:units.setdefault(unit['source_id'],{})[unit['unit_id']]=unit
+        with self.assertRaisesRegex(ValueError,'birth/death'):
+            _va_validate_reporting_context(scope['historical_reporting_context'],units,scope['segments'])
+        supported=copy.deepcopy(scope['historical_reporting_context'])
+        for item in supported['entity_versions']+supported['hierarchies']:item.update(effective_from=None,effective_to=None)
+        _va_validate_reporting_context(supported,units,scope['segments'])
+
+    def test_saved_company_mapping_context_is_compacted_without_building_or_ai(self):
+        from company_initiation.historic_construction.workflow import _va_history_inputs
+        from company_initiation.historic_construction.evidence import SourceStore
+        from company_initiation.historic_construction.periods import build_periods
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        from company_initiation.shared_project import find_project_root
+        workspace=find_project_root();checked=0
+        for suffix in ['161220Z_f9c12a41','161225Z_4bcf13ae','161230Z_a3298f59']:
+            run=workspace/'outputs'/('construct_research_20261031T'+suffix)
+            if not (run/'record.json').exists():continue
+            record=json.loads((run/'record.json').read_text(encoding='utf-8'))
+            original=next(c['request']['payload'] for c in record['calls'] if c['stage']=='company_va_row_mapping')
+            data=json.loads((run/'va_mapping_progress.json').read_text(encoding='utf-8'))['company_inputs']
+            data.update(observations=[],historical={},active_basis_by_period={})
+            with tempfile.TemporaryDirectory() as temp:
+                store=SourceStore(Path(temp));source=next(s for s in record['sources'] if s.get('dataset_role')=='company_reported')
+                store.restore(source,archive_root=workspace/'outputs')
+                catalog={s['id']:s for s in record['sources']};periods=build_periods(data['history_years']+[max(data['history_years'])+1],data['fiscal_calendar'])
+                journal=self.journal(data);captured=[]
+                def capture(name,prompt,payload,schema,**kwargs):
+                    captured.append(payload);raise RuntimeError('Metadata capture only; no mapping call')
+                journal.patch_stage=capture
+                with patch('company_initiation.historic_construction.workflow._va_incomplete_output'),self.assertRaisesRegex(RuntimeError,'Metadata capture only'):
+                    _va_history_inputs(journal,data,store,catalog,[source['id']],periods,dict(roles=integrated_role_contract()),supporting_evidence=original['reporting_evidence'])
+                self.assertEqual(len(captured),1);new=captured[0]
+                self.assertLess(len(new['period_catalogue']),len(original['period_catalogue']))
+                self.assertLess(len(json.dumps(new,ensure_ascii=False)),.7*len(json.dumps(original,ensure_ascii=False)))
+                self.assertTrue(all('numbers' not in unit for unit in new['reporting_evidence']))
+                self.assertTrue(all(key in new['period_catalogue'] for row in new['target_rows'] for key in row['source_period_keys']))
+            checked+=1
+        if not checked:self.skipTest('Saved company request payloads absent')
+        self.assertEqual(checked,3)
+
+
+class LatestHistoricalReliabilityTests(unittest.TestCase):
+    """Offline reproductions of v5 interactions; no new real-company builds."""
+    fixture=CompanyReportedVAConstructionTests.fixture
+    journal=CompanyReportedVAConstructionTests.journal
+    case=VAMappingRepairTests.case
+    candidate=VAMappingRepairTests.candidate
+
+    def saved(self,suffix):
+        from company_initiation.shared_project import find_project_root
+        run=find_project_root()/'outputs'/('construct_research_20261031T'+suffix)
+        if not (run/'record.json').is_file():self.skipTest('Saved latest company evidence absent')
+        record=json.loads((run/'record.json').read_text(encoding='utf-8'))
+        return run,record,json.loads((run/'va_mapping_progress.json').read_text(encoding='utf-8'))['company_inputs']
+
+    def test_repeated_missing_entity_exports_from_actual_nestle_progress(self):
+        from company_initiation.historic_construction.model_contract import historical_model
+        from company_initiation.historic_construction.model_excel import write_historical_output
+        run,record,data=self.saved('171719Z_7ec712c2')
+        original=(run/'company_model_inputs_progress.json').read_bytes()
+        spec=historical_model(data)
+        ids=[r['id'] for r in spec['rows']];self.assertEqual(len(ids),len(set(ids)))
+        missing=[r for r in spec['rows'] if 'legacy_nestle_health_science_gmb_sales' in r['id']]
+        self.assertGreaterEqual(len(missing),2);self.assertTrue(all(not r['cells'] for r in missing))
+        with tempfile.TemporaryDirectory() as temp:
+            written=write_historical_output(Path(temp),data,incomplete=True)
+            validation=json.loads((Path(temp)/written['validation']).read_text(encoding='utf-8'))
+            self.assertEqual(validation['saved_value_and_formula_readback'],'passed')
+            self.assertEqual(validation['saved_layout'],'passed')
+        self.assertEqual((run/'company_model_inputs_progress.json').read_bytes(),original)
+
+    def test_duplicate_targets_are_source_keys_and_canonical_ids_are_python_owned(self):
+        from company_initiation.historic_construction.workflow import _va_schema,_va_assess
+        from company_initiation.shared_runtime import validate_shape
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        schema,_=_va_schema([r['row_key'] for r in rows],['money'])
+        candidate=self.candidate(data,rows)
+        for decision in candidate['decisions']:
+            decision['versions'][0]['row_id']=None
+            decision['versions'][0]['entity_kind']='supplementary'
+        validate_shape(candidate,schema)
+        report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertFalse(report['issues']);self.assertEqual({f['row_id'] for f in report['facts']},{'sales','cash','manufacturing_sales'})
+        self.assertTrue(all(d['versions'][0]['row_id'] is None for d in candidate['decisions']))
+        duplicate=dict(row_key=rows[0]['row_key'],action='exclude',reason_code='duplicate',reason='Same source series',duplicate_of='sales',evidence_refs=[dict(source_id=rows[0]['source_id'],unit_id=rows[0]['unit_id'])])
+        invalid=_va_assess(dict(decisions=[duplicate],gaps=[]),rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertTrue(any('Duplicate exclusion' in i['detail'] for i in invalid['issues']))
+
+    def test_missing_interval_append_preserves_existing_versions_without_copying_them(self):
+        from company_initiation.historic_construction.workflow import _va_assess,_va_patch_contract,_va_apply_patch,_va_schema
+        from company_initiation.shared_runtime import digest,validate_shape
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        candidate=self.candidate(data,rows);decision=next(d for d in candidate['decisions'] if d['versions'][0]['row_id']=='sales')
+        row=next(r for r in rows if r['row_key']==decision['row_key']);ref=dict(source_id=source['id'],unit_id=row['unit_id'])
+        version=decision['versions'][0];version.update(period_kinds=['FY'],version_refs=[ref]);frozen=copy.deepcopy(version)
+        report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        rules=_va_patch_contract(candidate,report,_va_schema([r['row_key'] for r in rows],['money'])[1])
+        paths=rules['permitted_changes'][0]['paths'];self.assertIn('versions.append',paths);self.assertNotIn('versions.0',paths)
+        half=dict(version,period_kinds=['H1'])
+        proposal=dict(changes=[dict(row_key=decision['row_key'],expected_digest=digest(decision),path='versions.append',value=[half])])
+        validate_shape(proposal,rules['schema']);updated=_va_apply_patch(candidate,proposal,rules)
+        self.assertEqual(updated['decisions'][0]['versions'][0],frozen)
+        self.assertFalse(_va_assess(updated,rows,rows,data,store,data['sources'],periods,contract,evidence)['issues'])
+        self.assertEqual(candidate['decisions'][0]['versions'],[frozen])
+
+    def test_actual_danone_note_is_not_silently_added_to_bulk_selection(self):
+        from company_initiation.historic_construction.workflow import _identity_source_selection
+        run,record,data=self.saved('171726Z_e9169866')
+        catalog={s['id']:s for s in json.loads((run/'inventory.json').read_text(encoding='utf-8'))['sources']}
+        original=next(c['result'] for c in record['calls'] if c['stage']=='company_identity_sources')
+        note=next(s for s in catalog.values() if s['local_path']=='financial_reports/2026_reorganisation.pdf')
+        self.assertNotIn(note['id'],original['source_ids'])
+        journal=self.journal(data);journal.stage=lambda n,p,x,s,validator:validator(copy.deepcopy(original))
+        selected=_identity_source_selection(journal,data['company'],'2026-10-31',catalog,'Saved selection replay')
+        self.assertNotIn(note['id'],selected['source_ids'])
+        self.assertEqual(selected['source_ids'],original['source_ids'])
+
+    def test_scope_date_correction_uses_pdf_definitions_but_numbers_stay_in_va(self):
+        from company_initiation.historic_construction.workflow import _va_assess,_va_resolve_evidence
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        note=dict(source_id='synthetic_note',unit_id='page:1',text='SYNTHETIC: new organisation starts 2025-01-01; 2024 comparatives are restated. Table amount 999999.')
+        ref={k:note[k] for k in ('source_id','unit_id')}
+        context=dict(declarations=[dict(topic='reporting_change',change_kind='redefinition',change_date='2025-01-01',
+            detail='Synthetic restatement',effective_from='2024-01-01',effective_to=None,source_refs=[ref])],
+            entity_versions=[dict(entity_id='manufacturing',label='Manufacturing',entity_kind='current_segment',effective_from='2025-01-01',effective_to=None,source_refs=[ref])],
+            hierarchies=[dict(entity_ids=['manufacturing'],effective_from='2025-01-01',effective_to=None,source_refs=[ref])])
+        data['model_configuration'].update(va_reporting_context=context,va_reporting_note_source_ids=['synthetic_note'])
+        candidate=self.candidate(data,rows);report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence+[note])
+        self.assertTrue(any('outside its cited' in i['detail'] for i in report['issues']))
+        revised=copy.deepcopy(context)
+        for item in revised['entity_versions']+revised['hierarchies']:item['effective_from']='2024-01-01'
+        journal=self.journal(data)
+        def resolve(name,prompt,payload,schema,validator):
+            self.assertIn('do not extract restated tables',prompt)
+            return validator(dict(conclusions=[dict(row_key=q['row_key'],finding_id=q['finding_id'],status='supported',detail='The note establishes comparative applicability, not input numbers',source_refs=[ref])
+                for q in payload['questions']],summary='Synthetic scope correction',reporting_context=revised))
+        journal.stage=resolve
+        targets=[dict(row_key=r['row_key'],source_ref=dict(source_id=source['id'],unit_id=r['unit_id'])) for r in rows]
+        _va_resolve_evidence(journal,data,targets,report,[note],[])
+        after=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence+[note])
+        self.assertFalse(after['issues'])
+        self.assertTrue(all(f['source_refs'][0]['source_id']==source['id'] for f in after['facts']))
+        self.assertEqual(next(f['value'] for f in after['facts'] if f['row_id']=='manufacturing_sales' and f['period_id']=='2024-FY'),100)
+        self.assertNotIn(999999,{f['value'] for f in after['facts']})
+        self.assertIn('va_reporting_context_revision.json',journal.artifacts)
+
+    def test_actual_loreal_unresolved_alternate_is_audited_without_forcing_a_definition(self):
+        from company_initiation.historic_construction.evidence import SourceStore
+        from company_initiation.historic_construction.periods import build_periods
+        from company_initiation.historic_construction.model_contract import integrated_role_contract
+        from company_initiation.historic_construction.workflow import _va_assess
+        run,record,data=self.saved('171721Z_591489d0')
+        candidate=json.loads(next(run.glob('*_initial.json')).read_text(encoding='utf-8'))
+        with tempfile.TemporaryDirectory() as temp:
+            store=SourceStore(Path(temp));source=next(s for s in record['sources'] if s.get('dataset_role')=='company_reported')
+            store.restore(source,archive_root=run.parent)
+            periods=build_periods(data['history_years']+[max(data['history_years'])+1],data['fiscal_calendar'])
+            rows=store.company_reported_rows([source['id']],periods,as_of=data['model_configuration']['as_of'])
+            keys={d['row_key'] for d in candidate['decisions']};targets=[r for r in rows if r['row_key'] in keys]
+            evidence=store.read_documents([dict(source_id=source['id'],unit_id=rows[0]['unit_id'])],historical_years=set(data['history_years']))
+            report=_va_assess(candidate,targets,rows,data,store,{source['id']:source},periods,dict(roles=integrated_role_contract()),evidence)
+        unknown=next(q for q in report['quarantined_rows'] if q['row_key']=='row_176')
+        self.assertFalse(unknown['model_selection_eligible']);self.assertTrue(unknown['cells']);self.assertTrue(unknown['supported_alternative_ids'])
+        self.assertFalse(any(i['row_key']=='row_176' for i in report['issues']))
+        # A replay of representation/coverage behaviour does not approve the retained profit definition.
+        self.assertTrue(any('operating' in f['row_id'] for f in report['facts']))
+
+    def test_a_genuinely_missing_essential_concept_stays_blocked(self):
+        from company_initiation.historic_construction.workflow import _va_assess
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        candidate=self.candidate(data,rows)
+        decision=next(d for d in candidate['decisions'] if d['versions'][0]['row_id']=='sales')
+        decision['versions'][0]['definition_status']='unresolved'
+        report=_va_assess(candidate,rows,rows,data,store,data['sources'],periods,contract,evidence)
+        self.assertTrue(any(i.get('kind')=='financial_evidence' for i in report['issues']))
+        self.assertFalse(report['quarantined_rows'])
+
+    def test_fresh_alternate_series_is_reviewed_and_audited_through_historical_finalization(self):
+        from openpyxl import load_workbook
+        from company_initiation.historic_construction.evidence import SourceStore,inventory_local_sources
+        from company_initiation.historic_construction.workflow import _va_history_inputs,_review_va_history,complete_historical_model
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        path=archive/source['local_path'];book=load_workbook(path);sheet=book.active
+        for number,label,annual,half in [(12,'Operating income',80,35),(13,'Operating profit',83,37)]:
+            sheet.cell(number,4,label);sheet.cell(number,5,'USDM');sheet.cell(number,6,'Analytics')
+            sheet.cell(number,7,annual);sheet.cell(number,8,annual);sheet.cell(number,9,half)
+        book.save(path);book.close()
+        source=next(s for s in inventory_local_sources(archive)['sources'] if s.get('dataset_role')=='company_reported')
+        store=SourceStore(root/'alternate');store.add_local(source,root=archive);data['sources']={source['id']:source}
+        journal=self.journal(data);original=journal.stage;reviews=[]
+        def stage(name,prompt,payload,schema,validator):
+            answer=original(name,prompt,payload,schema,lambda a:a)
+            if name=='company_va_row_mapping':
+                labels={r['row_key']:r for r in payload['target_rows']}
+                for i,decision in enumerate(answer['decisions']):
+                    label=labels[decision['row_key']]['label']
+                    if label=='Operating income':
+                        decision['versions'][0].update(row_id=None,financial_role='operating_profit',definition_id='sourced_operating_result')
+                    if label=='Operating profit':
+                        answer['decisions'][i]=dict(row_key=decision['row_key'],action='pending',reason='Conflicting financial definition is unresolved',evidence_refs=[labels[decision['row_key']]['source_ref']])
+            if name in ('company_va_core_review','company_va_history_review'):
+                reviews.append(name);self.assertTrue(payload['quarantined_series'])
+            return validator(answer)
+        journal.stage=stage
+        evidence=_va_history_inputs(journal,data,store,data['sources'],[source['id']],periods,contract)
+        self.assertEqual(data['historical']['operating_profit']['values']['2024'],80)
+        self.assertEqual(len(data['model_configuration']['va_unresolved_series']),1)
+        self.assertTrue(journal.artifacts['va_unresolved_series.json'][0]['cells'])
+        _review_va_history(journal,data,evidence)
+        inputs=root/'reviewed_inputs.json';inputs.write_text(json.dumps(data),encoding='utf-8')
+        output=complete_historical_model(root,data['company'],archive,inputs)
+        self.assertEqual(json.loads((output/'record.json').read_text())['status'],'historical_complete_provisional')
+        self.assertEqual(reviews,['company_va_history_review'])
+        self.assertTrue((output/'va_unresolved_series.json').is_file())
+        self.assertIn('va_unresolved_series.json',json.loads((output/'record.json').read_text())['artifacts'])
+        validation=json.loads((output/'historical_workbook_validation.json').read_text())
+        self.assertTrue(any(c['area']=='unresolved_alternate' and c['status']=='WARNING' for c in validation['checks']))
+
+    def test_unresolved_audit_changes_invalidate_saved_financial_review(self):
+        from company_initiation.historic_construction.workflow import combined_history_fingerprint
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        before=combined_history_fingerprint(data)
+        data['model_configuration']['va_unresolved_series']=[dict(row_key='unresolved',status='unresolved_alternate')]
+        self.assertNotEqual(before,combined_history_fingerprint(data))
+
+    def test_pending_evidence_finding_reaches_resolver_even_without_field_paths(self):
+        from company_initiation.historic_construction.workflow import _va_resolve_evidence
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        row=rows[0];target=dict(row_key=row['row_key'],source_ref=dict(source_id=source['id'],unit_id=row['unit_id']))
+        note=dict(source_id='synthetic',unit_id='definition',text='SYNTHETIC: definition remains unknown')
+        journal=self.journal(data);calls=[]
+        def resolve(name,prompt,payload,schema,validator):
+            calls.append(name)
+            return validator(dict(conclusions=[dict(row_key=target['row_key'],finding_id=payload['questions'][0]['finding_id'],status='unresolved',detail='Insufficient definition evidence',source_refs=[dict(source_id='synthetic',unit_id='definition')])],summary='Unresolved'))
+        journal.stage=resolve
+        result=_va_resolve_evidence(journal,data,[target],dict(issues=[dict(row_key=row['row_key'],detail='Financial definition unknown',paths=['$'],kind='financial_evidence')]),[note],[])
+        self.assertEqual(calls,['company_va_evidence_resolution']);self.assertEqual(result['conclusions']['conclusions'][0]['status'],'unresolved')
+
+    def test_new_evidence_gap_after_patch_is_resolved_before_another_mapping_call(self):
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.shared_runtime import RunJournal,_object,INTEGER
+        temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup);root=Path(temporary.name)
+        provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE-KEY');journal=RunJournal(root,provider,dict(limits=dict(usd=20,repairs=2)))
+        schema=_object(value=INTEGER);ready=False;phases=[]
+        def assess(candidate):
+            return dict(issues=[] if ready else [dict(row_key='row_1',detail='Financial gap' if candidate['value'] else 'Mapping gap',paths=['$'],kind='financial_evidence' if candidate['value'] else 'mapping')])
+        def resolve(report):
+            nonlocal ready
+            phases.append(report['issues'][0]['kind'])
+            if phases[-1]=='financial_evidence':ready=True
+        def complete(**kwargs):
+            provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=100,output_tokens=20,total_tokens=120),output=[])
+            return dict(value=1)
+        with patch.object(provider,'complete',side_effect=complete) as api:
+            result=journal.patch_stage('fixture','fixture',{},schema,initial_candidate=dict(value=0),assess=assess,
+                patch_contract=lambda c,r:dict(schema=schema,permitted_changes=[]),apply_patch=lambda c,p,r:p,resolve_context=resolve)
+        self.assertEqual(phases,['mapping','financial_evidence']);self.assertEqual(api.call_count,1);self.assertEqual(result,dict(value=1))
+
+    def test_reporting_date_schema_uses_full_iso_dates_with_unknown_null(self):
+        import re
+        from company_initiation.historic_construction.workflow import _va_date_schema,_va_validate_reporting_context
+        schema=_va_date_schema();self.assertIn('null',schema['type'])
+        self.assertIsNone(re.fullmatch(schema['pattern'],'2024'));self.assertIsNotNone(re.fullmatch(schema['pattern'],'2024-12-31'))
+        with self.assertRaises(ValueError):
+            _va_validate_reporting_context(dict(declarations=[dict(change_kind='redefinition',change_date='2024',effective_from=None,effective_to=None,source_refs=[])],entity_versions=[],hierarchies=[]),{},[])
+
+
+class SimplifiedHistoricalPipelineTests(unittest.TestCase):
+    fixture=CompanyReportedVAConstructionTests.fixture
+    journal=CompanyReportedVAConstructionTests.journal
+    case=VAMappingRepairTests.case
+
+    def run_native(self,*,currency='USD',year_end='12-31',reorg=False,review_error=False,bulk=False):
+        from company_initiation.shared_ai import OpenAIProvider
+        from company_initiation.historic_construction.workflow import research_company_inputs,complete_historical_model,ensure_company_history_research
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case(currency=currency,year_end=year_end,reorganized=reorg)
+        if bulk:
+            folder=archive/'financial_reports';folder.mkdir()
+            for i in range(36):(folder/f'2016_restatement_{i}.txt').write_text('Irrelevant restated amount 999999\n'*1000,encoding='utf-8')
+        template=self.journal(data);provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE-KEY');calls=[];captured=[]
+        def complete(**kwargs):
+            payload=kwargs['payload'];stage=payload['stage'];calls.append(stage);captured.append(payload)
+            provider.last_response=dict(model='gpt-6-luna',usage=dict(input_tokens=100,output_tokens=40,total_tokens=140),output=[])
+            if stage=='company_va_scope':
+                ref=payload['va']['native_rows'][0]['source_ref']
+                context=dict(declarations=[],entity_versions=[],hierarchies=[])
+                if reorg:
+                    context=dict(declarations=[dict(topic='reporting_change',change_kind='redefinition',change_date='2024-04-01',detail='SYNTHETIC reported reorganisation',effective_from='2024-04-01',effective_to=None,source_refs=[ref])],
+                        entity_versions=[dict(entity_id='legacy',entity_kind='legacy_segment',label='Legacy',effective_from=None,effective_to='2024-03-31',source_refs=[ref])],
+                        hierarchies=[dict(entity_ids=['legacy'],effective_from=None,effective_to='2024-03-31',source_refs=[ref]),
+                            dict(entity_ids=['equipment','services'],effective_from='2024-04-01',effective_to=None,source_refs=[ref])])
+                return dict(currency=currency,fiscal_year_end=year_end,full_statement_frequency='half_year' if reorg else 'quarterly',
+                    reporting_basis='Company reported',segments=data['segments'],corporate_label='Corporate',historical_reporting_context=context,
+                    source_refs=[ref],questions=[],source_ids=[])
+            if stage in ('company_va_row_mapping','company_va_history_review'):
+                answer=template.stage(stage,'SYNTHETIC provider fixture',payload,kwargs['schema'],lambda a:a)
+                if stage=='company_va_history_review' and review_error:answer['checks'][0].update(status='error',detail='SYNTHETIC material definition remains unresolved')
+                return answer
+            raise AssertionError('Historical build dispatched a removed document/forecast/early-review stage: '+stage)
+        with patch.object(provider,'complete',side_effect=complete),patch('company_initiation.shared_ai.urlopen',side_effect=AssertionError('No external network')):
+            inputs=research_company_inputs(root,data['company'],archive,as_of=data['model_configuration']['as_of'],years=data['history_years'],fresh=True,provider=provider)
+        with patch('company_initiation.shared_ai.OpenAIProvider.from_env',side_effect=AssertionError('Historical finalization must not call AI')):
+            checked=ensure_company_history_research(root,data['company'],archive,inputs,as_of=data['model_configuration']['as_of'])
+            output=complete_historical_model(root,data['company'],archive,checked)
+        return root,archive,inputs,output,calls,captured
+
+    def test_full_historical_entry_two_structures_and_no_forecast_or_bulk_document_calls(self):
+        from openpyxl import load_workbook
+        for currency,end,reorg in [('USD','12-31',False),('JPY','03-31',True)]:
+            with self.subTest(currency=currency):
+                root,archive,inputs,output,calls,payloads=self.run_native(currency=currency,year_end=end,reorg=reorg,bulk=True)
+                self.assertEqual(calls,['company_va_scope','company_va_row_mapping','company_va_history_review'])
+                record=json.loads((output/'record.json').read_text(encoding='utf-8'));self.assertEqual(record['status'],'historical_complete_provisional')
+                self.assertEqual(record['stage_outputs']['historical']['status'],'exported')
+                data=json.loads(inputs.read_text(encoding='utf-8'))
+                self.assertEqual(data['driver_map'],[]);self.assertNotIn('financial_contracts',data['model_configuration'])
+                self.assertEqual(data['model_configuration']['forecast_preparation_status'],'pending')
+                self.assertNotIn('999999',json.dumps(payloads[0]));self.assertLess(len(json.dumps(payloads[0])),50000)
+                self.assertEqual(data['historical']['sales']['values']['2024'],100)
+                book=load_workbook(output/'historical_model.xlsx',data_only=False)
+                try:
+                    self.assertIn('VA Source',book.sheetnames);self.assertGreater(book['Model'].max_column,3)
+                    self.assertFalse(any('Forecast' in str(c.value) for row in book['Model'] for c in row))
+                finally:book.close()
+
+    def test_material_review_error_is_recorded_once_and_exports_incomplete_history(self):
+        root,archive,inputs,output,calls,payloads=self.run_native(review_error=True)
+        self.assertEqual(calls.count('company_va_history_review'),1)
+        record=json.loads((output/'record.json').read_text(encoding='utf-8'));self.assertEqual(record['status'],'incomplete')
+        self.assertTrue((output/'historical_model_incomplete.xlsx').is_file())
+        self.assertTrue((inputs.parent/'company_model_inputs.json').is_file())
+
+    def test_latest_loreal_populated_revenue_is_coverage_not_a_pdf_evidence_gap(self):
+        from company_initiation.historic_construction.workflow import _va_coverage_gaps,_va_resolve_evidence
+        from company_initiation.historic_construction.periods import build_periods
+        from company_initiation.shared_project import find_project_root
+        run=find_project_root()/'outputs/construct_research_20261031T175450Z_beebdd62'
+        if not (run/'va_mapping_progress.json').exists():self.skipTest('Latest saved failure unavailable')
+        data=json.loads((run/'va_mapping_progress.json').read_text())['company_inputs']
+        periods=build_periods(data['history_years']+[max(data['history_years'])+1],data['fiscal_calendar'])
+        self.assertFalse(_va_coverage_gaps(data,data['observations'],periods))
+        journal=self.journal(data);journal.stage=lambda *a,**k:self.fail('A financial-role coverage issue must not launch PDF proof')
+        result=_va_resolve_evidence(journal,data,[],dict(issues=[dict(row_key='row_87',kind='reporting_coverage',paths=['$'],detail='Internal binding')]),[dict(source_id='note',unit_id='page:1',text='irrelevant')],[])
+        self.assertIsNone(result)
+
+    def test_schema_limits_fail_before_a_request_or_reservation(self):
+        from company_initiation.shared_runtime import RunJournal
+        from company_initiation.shared_ai import OpenAIProvider,AIError
+        from company_initiation.shared_project import find_project_root
+        run=find_project_root()/'outputs/construct_research_20261031T175450Z_8d1bd543'
+        if not (run/'record.json').exists():self.skipTest('Latest saved failure unavailable')
+        original=json.loads((run/'record.json').read_text(encoding='utf-8'));schema=original['calls'][-1]['request']['schema']
+        with tempfile.TemporaryDirectory() as temp:
+            provider=OpenAIProvider(api_key='SYNTHETIC-OFFLINE-KEY');journal=RunJournal(Path(temp),provider,dict(limits=dict(usd=20,repairs=2)))
+            with patch.object(provider,'complete',side_effect=AssertionError('Invalid schema must not dispatch')) as api:
+                with self.assertRaisesRegex(AIError,'no request reserved or dispatched'):journal.ask('fixture','fixture',{},schema)
+            self.assertFalse(journal.state['calls']);self.assertIsNone(journal.state['pending_call']);self.assertEqual(api.call_count,0)
+
+    def test_targeted_local_context_reads_only_the_requested_original(self):
+        from company_initiation.historic_construction.workflow import _va_local_context
+        root,archive,source,store,periods,data,rows,evidence,contract=self.case()
+        journal=self.journal(data);calls=[]
+        original=dict(source_id='calendar',unit_id='page:1',text='SYNTHETIC fiscal calendar and complete statement attribution',numbers=[])
+        catalog={'calendar':dict(id='calendar',category='financial_reports',format='pdf',title='Calendar note'),
+            'unrelated':dict(id='unrelated',category='financial_reports',format='pdf',title='Unrelated old restatement'),
+            'table':dict(id='table',category='financial_reports',format='xlsx',title='Restated numerical appendix')}
+        def stage(name,prompt,payload,schema,validate):
+            calls.append(name);self.assertEqual({s['id'] for s in payload['catalog']},{'calendar','unrelated'})
+            return validate(dict(source_ids=['calendar'],reason='Resolve fiscal year end'))
+        journal.stage=stage
+        def documents(ids):self.assertEqual(ids,['calendar']);return [original]
+        selected=_va_local_context(journal,data['company'],catalog,documents,['Fiscal year end is unclear'])
+        self.assertEqual(selected,[original]);self.assertEqual(calls,['company_history_sources'])
+
+    def test_latest_nestle_resolver_schema_is_compact_and_keeps_all_selected_sections(self):
+        from company_initiation.historic_construction.workflow import _va_resolve_evidence
+        from company_initiation.shared_project import find_project_root
+        run=find_project_root()/'outputs/construct_research_20261031T175450Z_8d1bd543'
+        if not (run/'record.json').is_file():self.skipTest('Latest saved failure unavailable')
+        record=json.loads((run/'record.json').read_text(encoding='utf-8'))
+        payload=record['calls'][-1]['request']['payload']
+        data=json.loads((run/'company_model_inputs_progress.json').read_text(encoding='utf-8'))
+        journal=self.journal(data);captured=[]
+        def stage(name,prompt,context,schema,validate):
+            captured.append(schema)
+            self.assertEqual(len(context['original_sections']),len(payload['original_sections']))
+            self.assertLess(len(json.dumps(schema)),10000)
+            ref=context['citation_manifest'][0]
+            return validate(dict(conclusions=[dict(row_key=q['row_key'],finding_id=q['finding_id'],status='unresolved',detail='Synthetic replay retains uncertainty',source_refs=[ref]) for q in context['questions']],summary='Offline request-contract replay'))
+        journal.stage=stage
+        result=_va_resolve_evidence(journal,data,payload['rows'],dict(issues=[dict(q,kind='financial_evidence') for q in payload['questions']]),payload['original_sections'],payload['headers'])
+        self.assertTrue(captured);self.assertTrue(result['conclusions']['conclusions'])
+
+    def test_incomplete_history_prevents_forecast_configuration_dispatch(self):
+        from company_initiation.forecast_construction.workflow import prepare_forecast_inputs
+        root,archive,inputs,output,calls,payloads=self.run_native(review_error=True)
+        with patch('company_initiation.shared_ai.OpenAIProvider.from_env',side_effect=AssertionError('No forecast AI for incomplete history')):
+            with self.assertRaisesRegex(ValueError,'requires completed historical construction'):
+                prepare_forecast_inputs(root,json.loads(inputs.read_text(encoding='utf-8'))['company'],archive,inputs)
+        self.assertTrue((output/'historical_model_incomplete.xlsx').is_file())
 
 
 if __name__=='__main__':unittest.main()

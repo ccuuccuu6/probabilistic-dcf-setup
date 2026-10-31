@@ -319,6 +319,27 @@ class FixtureProvider(OpenAIProvider):
 
 
 class JournalTests(unittest.TestCase):
+    def test_progress_exposes_failed_checks_and_artifacts_without_ai(self):
+        messages = []
+        provider = FixtureProvider({})
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            journal = RunJournal(directory, provider, dict(limits=dict(usd=1)), progress=messages.append)
+            with patch.object(provider, 'complete', side_effect=AssertionError('No AI for audit logging')):
+                journal.artifact('validation.json', [dict(status='PASS', name='identity'),
+                                                     dict(status='FAIL', name='source_binding')])
+                journal.state.update(status='incomplete', issues=['Source binding failed'])
+                journal.save()
+                count = len(messages)
+                journal.save()
+            self.assertEqual(len(messages), count)
+            self.assertTrue(any(str(directory / 'validation.json') in message for message in messages))
+            self.assertTrue(any('FAIL=1' in message and 'PASS=1' in message for message in messages))
+            self.assertIn('Unresolved: Source binding failed', messages)
+            saved = json.loads((directory / 'record.json').read_text(encoding='utf-8'))
+            self.assertEqual(saved['status'], 'incomplete')
+            self.assertEqual(saved['calls'], [])
+
     def test_provider_incomplete_status_cannot_be_accepted_even_when_partial_json_is_parseable(self):
         provider=FixtureProvider({})
         def partial(**kwargs):

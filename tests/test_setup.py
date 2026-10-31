@@ -10,6 +10,7 @@ import os
 import re
 import socket
 import ssl
+import sys
 import tempfile
 import threading
 import time
@@ -21,8 +22,8 @@ from uuid import UUID
 
 from openpyxl import Workbook, load_workbook
 
-from company_initiation.shared_project import find_project_root, read_json
-from company_initiation.__main__ import TerminalProgress
+from company_initiation.shared_project import find_project_root, read_json, resolve_data_path
+from company_initiation.__main__ import TerminalProgress, main
 from company_initiation.shared_ai import AIError, OpenAIProvider, aggregate_usage, response_usage
 from company_initiation.historic_construction.evidence import SourceStore, download, parse_number
 from company_initiation.historic_construction.initiation import REVIEW_TOPICS, SECTIONS, _rounding_bound, export_workbook, initiate_company, materialize_and_check
@@ -72,10 +73,10 @@ class ProjectTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.package = self.root / "src" / "company_initiation"
+        self.package = self.root / "forecasting_engine" / "company_initiation"
         self.package.mkdir(parents=True)
         (self.package / "__init__.py").write_bytes(
-            (PROJECT / "src" / "company_initiation" / "__init__.py").read_bytes())
+            (PROJECT / "forecasting_engine" / "company_initiation" / "__init__.py").read_bytes())
         (self.root / "pyproject.toml").write_bytes((PROJECT / "pyproject.toml").read_bytes())
 
     def tearDown(self):
@@ -89,6 +90,39 @@ class ProjectTests(unittest.TestCase):
         (self.package / "__init__.py").unlink()
         with self.assertRaises(ValueError):
             find_project_root(self.root)
+
+    def test_relocated_company_and_shared_data_paths(self):
+        for old, new in (
+            ('local_store/synthetic', 'data_store/company_data/synthetic'),
+            ('local_store/FX/rates.xlsx', 'data_store/FX/rates.xlsx'),
+        ):
+            with self.subTest(old=old):
+                target = self.root / new
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b'preserved original')
+                self.assertEqual(resolve_data_path(self.root, old), target)
+                self.assertEqual(resolve_data_path(self.root, self.root / old), target)
+                self.assertEqual(resolve_data_path(self.root, target), target)
+                if os.name == 'nt':
+                    extended = '\\\\?\\' + str(self.root / old)
+                    self.assertEqual(resolve_data_path(self.root, extended), target)
+
+    def test_relocation_does_not_redirect_existing_or_unrelated_paths(self):
+        original = self.root / 'local_store' / 'synthetic'
+        original.mkdir(parents=True)
+        replacement = self.root / 'data_store' / 'company_data' / 'synthetic'
+        replacement.mkdir(parents=True)
+        self.assertEqual(resolve_data_path(self.root, original), original)
+        other = self.root / 'unrelated' / 'local_store' / 'synthetic'
+        self.assertEqual(resolve_data_path(self.root, other), other)
+        missing = self.root / 'local_store' / 'missing'
+        self.assertEqual(resolve_data_path(self.root, missing), missing)
+
+    def test_relocation_rejects_ambiguous_targets(self):
+        for relative in ('data_store/synthetic', 'data_store/company_data/synthetic'):
+            (self.root / relative).mkdir(parents=True)
+        with self.assertRaisesRegex(ValueError, 'Ambiguous relocated data path'):
+            resolve_data_path(self.root, 'local_store/synthetic')
 
     def test_read_run_record(self):
         path = self.root / "record.json"
@@ -146,6 +180,179 @@ class TerminalProgressTests(unittest.TestCase):
         self.assertNotIn("\r", stream.getvalue())
         self.assertEqual(len(stream.getvalue().splitlines()), 1)
         self.assertIn("completed after", stream.getvalue())
+
+
+class HistoryStartPolicyTests(unittest.TestCase):
+    def test_default_and_explicit_scopes_use_evidenced_latest_fiscal_label(self):
+        from company_initiation.historic_construction.periods import requested_history_years
+        self.assertEqual(requested_history_years(2025),list(range(2018,2026)))
+        self.assertEqual(requested_history_years(2026),list(range(2018,2027)))
+        self.assertEqual(requested_history_years(2025,historical_years=2),[2024,2025])
+        self.assertEqual(requested_history_years(2025,years=[2020,2024]),[2020,2024])
+        self.assertEqual(requested_history_years(2025,start_year=2023),[2023,2024,2025])
+        with self.assertRaisesRegex(ValueError,'later than'):
+            requested_history_years(2017)
+        with self.assertRaisesRegex(ValueError,'incomplete fiscal'):
+            requested_history_years(2025,years=[2026])
+
+    def test_as_of_validation_respects_non_calendar_fiscal_years(self):
+        from company_initiation.historic_construction.periods import requested_history_years
+        self.assertEqual(requested_history_years(2026,as_of='2026-10-25',
+            fiscal_calendar={'fiscal_year_end':'06-30'})[-1],2026)
+        with self.assertRaisesRegex(ValueError,'after the information date'):
+            requested_history_years(2026,as_of='2026-10-25',fiscal_calendar={'fiscal_year_end':'12-31'})
+
+    def test_both_commands_apply_default_and_keep_explicit_overrides(self):
+        for command in ('construct','construct-history','initiate'):
+            for flags,expected in (([],(None,None,2018)),(['--history-years','2'],(None,2,None)),
+                                   (['--years','2024','2025'],([2024,2025],None,None)),(['--start-year','2020'],(None,None,2020))):
+                with self.subTest(command=command,flags=flags), \
+                        patch('sys.argv',['company_initiation',command,'Synthetic','--sources','fixture',*flags]), \
+                        patch('company_initiation.__main__._logged_construct',return_value=0) as logged, \
+                        patch('company_initiation.__main__._run',return_value=0) as dispatch:
+                    self.assertEqual(main(),0)
+                    arguments=(logged if command in {'construct','construct-history'} else dispatch).call_args.args[0]
+                    self.assertEqual((arguments.years,arguments.history_years,arguments.start_year),expected)
+                    self.assertTrue(arguments.fresh)
+                    self.assertEqual(arguments.budget_usd,20.)
+
+    def test_initiation_discovery_requires_all_years_from_requested_start(self):
+        from company_initiation.historic_construction.initiation import validate_discovery
+        company=SyntheticCompany()
+        request=dict(historical_years=None,years=None,start_year=2018,as_of='2026-10-25')
+        with self.assertRaisesRegex(ValueError,'every fiscal year'):
+            validate_discovery(company.discovery,request)
+        request['start_year']=2024
+        validate_discovery(company.discovery,request)
+
+    def test_new_default_does_not_reuse_saved_2016_scope(self):
+        from company_initiation.__main__ import _run
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);old=root/'outputs'/'construct_old';old.mkdir(parents=True)
+            (root/'pyproject.toml').write_text('[tool.research-platform]\n',encoding='utf-8')
+            archive=root/'archive';archive.mkdir()
+            old_data=dict(history_years=list(range(2016,2026)),model_configuration={'as_of':'2026-10-25'})
+            (old/'company_model_inputs.json').write_text(json.dumps(old_data),encoding='utf-8')
+            old_record=dict(directory=str(old),configuration=dict(company='SYNTHETIC history scope',manifest='same'))
+            (old/'record.json').write_text(json.dumps(old_record),encoding='utf-8')
+            new=root/'outputs'/'construct_new';new.mkdir()
+            new_input=new/'company_model_inputs.json';new_input.write_text('{}',encoding='utf-8')
+            (new/'record.json').write_text(json.dumps(dict(status='complete_provisional',usage={},issues=[])),encoding='utf-8')
+            with patch('sys.argv',['company_initiation','construct','SYNTHETIC history scope','--sources',str(archive),'--as-of','2026-10-25']), \
+                    patch('company_initiation.__main__._logged_construct',side_effect=_run), \
+                    patch('company_initiation.__main__.find_project_root',return_value=root), \
+                    patch('company_initiation.historic_construction.evidence.inventory_local_sources',return_value=dict(manifest_sha256='same',source_manifest_sha256='same',sources=[])), \
+                    patch('company_initiation.forecast_construction.integrated.verified_integrated_record',return_value=old_record), \
+                    patch('company_initiation.historic_construction.workflow.research_company_inputs',return_value=new_input) as research, \
+                    patch('company_initiation.historic_construction.workflow.ensure_company_history_research',return_value=new_input) as review, \
+                    patch('company_initiation.historic_construction.workflow.update_company_inputs') as update, \
+                    patch('company_initiation.forecast_construction.integrated.construct_integrated',return_value=new), \
+                    patch('company_initiation.shared_ai.format_usage',return_value=''), \
+                    patch('company_initiation.shared_ai.format_stage_usage',return_value=''),patch('builtins.print'):
+                self.assertEqual(main(),0)
+                self.assertEqual(research.call_args.kwargs['start_year'],2018)
+                self.assertTrue(research.call_args.kwargs['fresh'])
+                self.assertEqual(review.call_args.args[3],new_input)
+                update.assert_not_called()
+                self.assertEqual(json.loads((old/'company_model_inputs.json').read_text())['history_years'],list(range(2016,2026)))
+
+
+class ConstructionAuditLogTests(unittest.TestCase):
+    """Exercise only CLI logging with dispatch mocked; never build a company."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.stdout, self.stderr = io.StringIO(), io.StringIO()
+        self.argv = ["company_initiation", "construct", "Fictional / Example plc", "--sources", "fixture"]
+
+    def invoke(self, operation):
+        with patch("company_initiation.__main__.find_project_root", return_value=self.root), \
+                patch("company_initiation.__main__._run", side_effect=operation) as dispatch, \
+                patch("sys.argv", self.argv), patch("sys.stdout", self.stdout), patch("sys.stderr", self.stderr):
+            result = main()
+            dispatch.assert_called_once()
+            return result
+
+    def logs(self):
+        return sorted((self.root / "forecasting_engine" / "company_initiation" / "logs").glob("*.log"))
+
+    def test_success_captures_timestamped_console_and_safe_options(self):
+        def operation(arguments):
+            print("History exported")
+            print("Provisional evidence warning", file=sys.stderr)
+            return 0
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "synthetic-secret-not-for-the-log"}):
+            self.assertEqual(self.invoke(operation), 0)
+        text = self.logs()[0].read_text(encoding="utf-8")
+        self.assertIn("History exported", self.stdout.getvalue())
+        self.assertIn("Provisional evidence warning", self.stderr.getvalue())
+        self.assertRegex(text, r"\[\d{4}-\d\d-\d\dT.*\+00:00\] \[stdout\] History exported")
+        self.assertIn("[stderr] Provisional evidence warning", text)
+        self.assertIn('"history_years": null', text)
+        self.assertIn('"start_year": 2018', text)
+        self.assertIn("status=completed; exit_code=0; elapsed_seconds=", text)
+        self.assertNotIn("synthetic-secret-not-for-the-log", text)
+
+    def test_nonzero_result_and_partial_output_are_preserved(self):
+        def operation(arguments):
+            print("Forecast checkpoint saved", flush=True)
+            self.assertIn("Forecast checkpoint saved", self.logs()[0].read_text(encoding="utf-8"))
+            print("ERROR: source review incomplete", file=sys.stderr)
+            return 1
+        self.assertEqual(self.invoke(operation), 1)
+        text = self.logs()[0].read_text(encoding="utf-8")
+        self.assertIn("source review incomplete", text)
+        self.assertIn("status=failed; exit_code=1", text)
+
+    def test_unexpected_exception_has_traceback_and_is_not_swallowed(self):
+        def operation(arguments):
+            raise AssertionError("synthetic unexpected failure")
+        with self.assertRaisesRegex(AssertionError, "synthetic unexpected failure"):
+            self.invoke(operation)
+        text = self.logs()[0].read_text(encoding="utf-8")
+        self.assertIn("Traceback (most recent call last)", text)
+        self.assertIn("AssertionError: synthetic unexpected failure", text)
+        self.assertIn("status=failed; exit_code=1", text)
+
+    def test_interrupt_preserves_log_and_returns_130(self):
+        def operation(arguments):
+            print("Source extraction started")
+            raise KeyboardInterrupt
+        self.assertEqual(self.invoke(operation), 130)
+        text = self.logs()[0].read_text(encoding="utf-8")
+        self.assertIn("Source extraction started", text)
+        self.assertIn("status=interrupted; exit_code=130", text)
+
+    def test_repeated_company_invocations_create_distinct_files(self):
+        self.invoke(lambda arguments: 0)
+        original = self.logs()[0].read_bytes()
+        self.invoke(lambda arguments: 0)
+        self.assertEqual(len(self.logs()), 2)
+        self.assertEqual(self.logs()[0].read_bytes(), original)
+        self.assertTrue(all("fictional-example-plc" in path.name for path in self.logs()))
+
+    def test_interactive_timer_stays_live_without_repeated_waiting_log_lines(self):
+        self.stdout = TerminalProgressTests.InteractiveStream()
+        def operation(arguments):
+            with TerminalProgress().call_timer("Call 1: synthetic"):
+                self.assertIn("waiting 00:00", self.stdout.getvalue())
+            return 0
+        self.assertEqual(self.invoke(operation), 0)
+        text = self.logs()[0].read_text(encoding="utf-8")
+        self.assertNotIn("waiting 00:00", text)
+        self.assertNotIn("\r", text)
+        self.assertIn("Call 1: synthetic: completed after", text)
+
+    def test_log_setup_failure_prevents_dispatch(self):
+        (self.root / "forecasting_engine").write_text("blocks log directory", encoding="utf-8")
+        with patch("company_initiation.__main__.find_project_root", return_value=self.root), \
+                patch("company_initiation.__main__._run") as dispatch, patch("sys.argv", self.argv), \
+                patch("sys.stderr", self.stderr):
+            self.assertEqual(main(), 1)
+            dispatch.assert_not_called()
+        self.assertIn("construction has not started", self.stderr.getvalue())
 
 
 class SyntheticCompany:
@@ -710,7 +917,7 @@ class InitiationTests(unittest.TestCase):
         self.assertEqual(record["issues"], [])
         discovery_call = provider.calls[0]
         self.assertEqual(set(discovery_call),
-                         {"stage", "company_query", "historical_years", "years", "as_of"})
+                         {"stage", "company_query", "historical_years", "years", "start_year", "as_of"})
         self.assertEqual(discovery_call["years"], [2024, 2025])
         self.assertEqual(record["request"]["forecast_years"], 3)
         self.assertEqual(record["request"]["max_cost_usd"], 20)
@@ -3444,7 +3651,7 @@ class LocalInitiationTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.archive = self.root / "local_store" / "synthetic"
+        self.archive = self.root / "data_store" / "company_data" / "synthetic"
         reports = self.archive / "financial_reports"
         reports.mkdir(parents=True)
         self.original = reports / "synthetic_2025-fy_financial-statements_pub-2026-02-10.xlsx"
@@ -3538,18 +3745,18 @@ class LocalInitiationTests(unittest.TestCase):
         self.assertTrue(any(check["name"] == "cash_continuity:2025" and check["passed"] for check in record["checks"]))
         self.assertTrue((directory / "model.xlsx").exists())
 
-    def test_default_ten_year_request_does_not_silently_accept_two_year_archive(self):
+    def test_default_2018_request_does_not_silently_accept_two_year_archive(self):
         _, record, provider = self.run_local()
         discovery = next(call for call in provider.calls if call["stage"] == "discover_local")
-        self.assertEqual(discovery.get("request", discovery)["historical_years"], 10)
-        self.assertEqual(record["request"]["historical_years"], 10)
+        self.assertEqual(discovery.get("request", discovery)["start_year"], 2018)
+        self.assertEqual(record["request"]["start_year"], 2018)
         self.assertEqual(record["status"], "incomplete")
-        self.assertIn("historical years", "; ".join(record["issues"]))
+        self.assertIn("requested start year", "; ".join(record["issues"]))
         self.assertFalse(any(call["stage"] == "extract" for call in provider.calls))
 
-    def test_ten_year_local_history_accepts_with_reported_interims_and_separate_history_review(self):
+    def test_default_2018_history_accepts_with_reported_interims_and_separate_history_review(self):
         company = SyntheticCompany().include_interims()
-        earlier = list(range(2016, 2024))
+        earlier = list(range(2018, 2024))
         company.column_periods = [str(year) for year in earlier] + company.column_periods
         earlier_cash_values = {"cash_close": 70, "balance_sheet_cash": 70, "cash_open": 70,
                                "cash_change": 0, "financing": -40, "net_debt": 230}
@@ -3573,12 +3780,12 @@ class LocalInitiationTests(unittest.TestCase):
         self.prepare_company(company)
         directory, record, provider = self.run_local()
         self.assertEqual(record["status"], "accepted", record["issues"])
-        self.assertEqual(record["request"]["historical_years"], 10)
+        self.assertEqual(record["request"]["start_year"], 2018)
         annuals = [period["year"] for period in record["discovery"]["periods"] if period["kind"] == "annual"]
-        self.assertEqual(annuals, list(range(2016, 2026)))
-        self.assertEqual(len(record["historical_scopes"]), 10)
+        self.assertEqual(annuals, list(range(2018, 2026)))
+        self.assertEqual(len(record["historical_scopes"]), 8)
         revenue = next(row for row in record["rows"] if row["id"] == "revenue")
-        self.assertEqual(len(revenue["values"]), 13)
+        self.assertEqual(len(revenue["values"]), 11)
         self.assertEqual(revenue["values"]["2025-9M"], 825.0)
         self.assertEqual(revenue["values"]["2025-Q1"], 220.0)
         self.assertNotIn("2025-Q3", revenue["values"])
@@ -3586,7 +3793,7 @@ class LocalInitiationTests(unittest.TestCase):
         self.assertNotIn("2025-9M", net_debt["values"])
         self.assertIn("2025-H1", net_debt["values"])
         checks = {check["name"]: check for check in record["checks"]}
-        self.assertTrue(all(checks[f"cash_continuity:{year}"]["passed"] for year in range(2017, 2026)))
+        self.assertTrue(all(checks[f"cash_continuity:{year}"]["passed"] for year in range(2019, 2026)))
         historical_review = [call for call in provider.calls if call["stage"] == "history_review"]
         self.assertEqual(len(historical_review), 2)
         self.assertEqual(historical_review[0]["evidence"], [])
@@ -3625,6 +3832,27 @@ class LocalInitiationTests(unittest.TestCase):
                 patch.object(reused, "complete", side_effect=AssertionError("No call may be dispatched")):
             self.run_local(company=company, provider=reused, years=[2025])
 
+    def test_accepted_archive_reuses_after_storage_layout_rename(self):
+        original_relative = self.original.relative_to(self.archive)
+        legacy = self.root / 'local_store' / 'synthetic'
+        legacy.parent.mkdir(parents=True)
+        self.archive.rename(legacy)
+        self.archive = legacy
+        self.original = legacy / original_relative
+        company = self.LocalProvider.scope(self.company, {'2025'})
+        first, record, _ = self.run_local(company=company, years=[2025])
+        self.assertEqual(record['status'], 'accepted', record['issues'])
+        saved = (first / 'record.json').read_bytes()
+        relocated = self.root / 'data_store' / 'company_data' / 'synthetic'
+        self.archive.rename(relocated)
+        self.archive = relocated
+        self.original = relocated / original_relative
+        provider = self.LocalProvider(company)
+        with patch.object(provider, 'complete', side_effect=AssertionError('No new AI calls')):
+            second, _, _ = self.run_local(company=company, provider=provider, years=[2025])
+        self.assertEqual(first, second)
+        self.assertEqual((first / 'record.json').read_bytes(), saved)
+
     def test_preflight_allowance_stops_before_charged_or_pending_request(self):
         class ExpensiveProvider(self.LocalProvider):
             def estimate_request_cost(self, **kwargs):
@@ -3645,7 +3873,7 @@ class LocalInitiationTests(unittest.TestCase):
         company = self.LocalProvider.scope(self.company, {"2025"})
         first, record, _ = self.run_local(company=company, years=[2025])
         self.assertEqual(record["status"], "accepted", record["issues"])
-        moved = self.root / "local_store" / "same_documents_elsewhere"
+        moved = self.root / "data_store" / "company_data" / "same_documents_elsewhere"
         shutil.copytree(self.archive, moved)
         provider = self.LocalProvider(company)
         with self.assertRaisesRegex(ValueError, "Source archive or intake mode differs"), \

@@ -19,7 +19,7 @@ from company_initiation.shared_ai import OpenAIProvider, AIError, DEFAULT_MODEL,
 from company_initiation.historic_construction.initiation import (_object, _array, _enum, TEXT, INTEGER, UNIT_REF, NUMBER_REF, PERIOD, validate_shape, _initiation_lock)
 
 def code_source_paths():
-    """Shared source inventory keyed by stable paths within src, including FX."""
+    """Shared source inventory keyed by package-relative paths, including FX."""
     source_root = Path(__file__).resolve().parent.parent
     return {path.relative_to(source_root).as_posix(): path
             for package in (source_root / 'company_initiation', source_root / 'shared_FX')
@@ -275,6 +275,11 @@ def unit_dimension(unit):
 class RunJournal:
     """One locked cumulative budget, durable pending calls, reusable exact requests."""
     def __init__(self, directory, provider, configuration, progress=None, previous=None, ledger=None):
+        from .shared_budget import current_build_scope,register_build_directory
+        scope=current_build_scope()
+        if scope:
+            configuration['budget_session_id']=scope['period_id']
+            register_build_directory(directory)
         self.directory, self.provider, self.progress = directory, provider, progress
         self.ledger = ledger
         self.configuration = configuration
@@ -304,7 +309,7 @@ class RunJournal:
         if changed:
             detail = ('Application source changed during this process: ' + ', '.join(changed)
                       + '. Completed responses and usage are saved; restart the public command '
-                        'under stable code to resume compatible work.')
+                        'with --resume RUN under stable code to continue compatible work.')
             self.state['status'] = 'incomplete'
             self.state['runtime_code_change'] = dict(changed_files=changed, current_code_identity=current)
             if detail not in self.state['issues']:
@@ -318,15 +323,39 @@ class RunJournal:
             self.state["budget"] = self.ledger.summary()
             self.state["budget_ledger"] = str(self.ledger.path)
         write_json(self.directory / "record.json", self.state)
+        summary = (self.state['status'], tuple(self.state.get('issues', [])))
+        if self.progress and summary != getattr(self, '_logged_summary', None):
+            self.progress(f"Run status: {summary[0]}; audit record: {self.directory / 'record.json'}")
+            for issue in summary[1]:
+                self.progress('Unresolved: ' + str(issue))
+            self._logged_summary = summary
 
     def artifact(self, name, value):
         write_json(self.directory / name, value)
         self.state["artifacts"][name] = hashlib.sha256((self.directory / name).read_bytes()).hexdigest()
         self.save()
+        if self.progress:
+            self.progress('Saved audit artifact: ' + str(self.directory / name))
+            if isinstance(value, list) and value and all(isinstance(item, dict)
+                    and item.get('status') in ('PASS', 'FAIL', 'MISSING', 'WARN', 'WARNING', 'SKIP') for item in value):
+                from collections import Counter
+                self.progress(name + ': ' + ', '.join(f'{status}={count}'
+                    for status, count in sorted(Counter(item['status'] for item in value).items())))
         return value
 
     def ask(self, stage, instructions, payload, schema, attempt=0, _retry=0):
         self.assert_runtime_unchanged()
+        properties=enums=0
+        def count(node):
+            nonlocal properties,enums
+            if isinstance(node,dict):
+                properties+=len(node.get('properties',{}));enums+=len(node.get('enum',[]))
+                for value in node.values():count(value)
+            elif isinstance(node,list):
+                for value in node:count(value)
+        count(schema)
+        if properties>5000 or enums>1000:
+            raise AIError(f'Structured response schema exceeds provider limits ({properties} properties, {enums} enum values); no request reserved or dispatched.')
         role = "extractor" if stage == "construction_map" else "reviewer" if "review" in stage or "blind" in stage or "coverage" in stage else "researcher"
         model, effort = self.provider.route(role, stage) if hasattr(self.provider, "route") else (
             self.provider.metadata()["models"][role], "medium")
@@ -381,7 +410,9 @@ class RunJournal:
                      request=signature, allowance=allowance,max_output_tokens=self.provider.max_output_tokens)
         self.assert_runtime_unchanged()
         if self.ledger is not None:
-            self.ledger.reserve(entry, self.directory)
+            reservation=self.ledger.reserve(entry, self.directory)
+            if reservation.get('allowance_period_id'):
+                entry['allowance_period_id']=reservation['allowance_period_id']
         self.state["pending_call"] = entry
         self.save()
         if self.progress:
@@ -395,7 +426,10 @@ class RunJournal:
                 result = self.provider.complete(role=role, instructions=instructions, payload=dict(payload, stage=stage), schema=schema)
             if response_output_limit(self.provider.last_response):
                 raise AIError('Provider declared max_output_tokens; even parseable partial output is incomplete')
-            validate_shape(result, schema)
+            try:validate_shape(result, schema)
+            except (ValueError,TypeError):
+                entry['candidate_result']=copy.deepcopy(result)
+                raise
             entry["result"] = copy.deepcopy(result)
         except Exception as exc:
             entry["error"] = str(exc)
@@ -443,7 +477,16 @@ class RunJournal:
     def stage(self, stage, prompt, payload, schema, validator=lambda value: value):
         errors, seen = [], set()
         for attempt in range(self.configuration["limits"]["repairs"] + 1):
-            answer = self.ask(stage, prompt, dict(payload, validation_errors=errors), schema, attempt)
+            try:answer = self.ask(stage, prompt, dict(payload, validation_errors=errors), schema, attempt)
+            except (ValueError,TypeError) as exc:
+                if (not self.entries or self.entries[-1].get('stage')!=stage
+                        or self.entries[-1].get('failure_kind')!='response_contract'
+                        or 'candidate_result' not in self.entries[-1]):raise
+                errors=[str(exc)]
+                self.state.setdefault('repairs',[]).append(dict(stage=stage,attempt=attempt,
+                    failure=str(exc),action='Bounded structured-response correction; original response and charge retained'))
+                self.save()
+                continue
             self.artifact(f"{stage}_{digest(payload)[:10]}_attempt_{attempt}.json", answer)
             try:
                 return validator(answer)
@@ -456,6 +499,70 @@ class RunJournal:
                     raise ValueError(f"{stage}: no progress after precise repair feedback") from exc
                 seen.add(digest(answer))
         raise ValueError(f"{stage}: bounded repairs exhausted: {'; '.join(errors)}")
+
+    def patch_stage(self, stage, prompt, payload, schema, *, assess, patch_contract, apply_patch, checkpoint=None,
+                    initial_candidate=None, resolve_context=None, semantic_fingerprint=None):
+        """Validate a candidate and merge only explicitly permitted, bound patches.
+
+        The previous candidate and findings accompany every repair. The caller
+        owns representation-specific fields and merge rules; no response mutates
+        the durable candidate until the entire patch contract is satisfied.
+        """
+        identity=digest(payload)[:10]
+        candidate=copy.deepcopy(initial_candidate) if initial_candidate is not None else self.ask(stage,prompt,payload,schema)
+        validate_shape(candidate,schema)
+        self.artifact(f'{stage}_{identity}_initial.json',candidate)
+        protocol_errors=[];seen=set();semantic_seen=set();resolution=None;resolved_findings=set()
+        for attempt in range(self.configuration['limits']['repairs']+1):
+            report=assess(copy.deepcopy(candidate))
+            self.artifact(f'{stage}_{identity}_validation_{attempt}.json',report)
+            if checkpoint:checkpoint(copy.deepcopy(candidate),copy.deepcopy(report))
+            if not report['issues']:return candidate
+            blockers=[issue for issue in report['issues'] if issue.get('kind') in ('source_parser','source_integrity','implementation')]
+            if blockers:
+                raise ValueError(stage+': deterministic validation blocker; no AI repair dispatched: '+
+                    '; '.join(issue['detail'] for issue in blockers[:8]))
+            if semantic_fingerprint:
+                semantic=semantic_fingerprint(candidate,report)
+                if semantic in semantic_seen and not protocol_errors:
+                    self.artifact(f'{stage}_{identity}_semantic_stop.json',dict(issues=report['issues'],
+                        detail='Financial findings and structured interpretation did not change; no repeated AI patch dispatched.'))
+                    raise ValueError(stage+': no semantic progress; '+ '; '.join(i['detail'] for i in report['issues'][:8]))
+                semantic_seen.add(semantic)
+            if attempt==self.configuration['limits']['repairs']:break
+            evidence_key=digest(report['issues'])
+            if resolve_context and evidence_key not in resolved_findings:
+                resolution=resolve_context(copy.deepcopy(report));resolved_findings.add(evidence_key)
+                after_evidence=assess(copy.deepcopy(candidate))
+                if digest(after_evidence)!=digest(report):
+                    report=after_evidence
+                    self.artifact(f'{stage}_{identity}_validation_{attempt}_after_evidence.json',report)
+                    if checkpoint:checkpoint(copy.deepcopy(candidate),copy.deepcopy(report))
+                    if not report['issues']:return candidate
+            contract=patch_contract(candidate,report)
+            repair_payload=dict(context=payload,previous_candidate=copy.deepcopy(candidate),candidate_digest=digest(candidate),
+                findings=report['issues'],permitted_changes=contract['permitted_changes'],patch_errors=protocol_errors,
+                instruction='Return only permitted changes. Each change binds the unchanged original decision digest. '
+                    'Python preserves all other rows and fields. '+contract.get('repair_instruction','')+'Full-batch replacement is not accepted.')
+            if resolution:repair_payload['additional_evidence']=resolution
+            patch=self.ask(stage+'_patch',prompt+' Repair only the supplied candidate using permitted_changes.',
+                repair_payload,contract['schema'],attempt+1)
+            self.artifact(f'{stage}_{identity}_patch_{attempt+1}.json',patch)
+            try:
+                revised=apply_patch(copy.deepcopy(candidate),patch,contract)
+                if digest(revised)==digest(candidate) or digest(revised) in seen:
+                    raise ValueError('Patch made no progress; unchanged work cannot start another request')
+                seen.add(digest(candidate));candidate=revised;protocol_errors=[]
+            except (ValueError,KeyError,TypeError) as exc:
+                protocol_errors=[str(exc)]
+                self.artifact(f'{stage}_{identity}_rejected_patch_{attempt+1}.json',dict(reason=str(exc),
+                    candidate_digest=digest(candidate),candidate_unchanged=True))
+            self.state.setdefault('repairs',[]).append(dict(stage=stage,attempt=attempt+1,
+                failures=report['issues'],patch_errors=protocol_errors,action='Hash-bound permitted-field patch; other work retained'))
+            self.save()
+        detail='; '.join(issue['detail'] for issue in report['issues'][:8])
+        raise ValueError(stage+': bounded patches exhausted: '+detail+
+            ('; '+protocol_errors[0] if protocol_errors else ''))
 
     def review_stage(self, stage, prompt, payload, schema, *, assess=None, repair_context=None):
         """Bounded evidence-first review; premium routing is local to this task.

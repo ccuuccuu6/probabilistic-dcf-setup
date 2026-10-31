@@ -13,6 +13,40 @@ from ..shared_runtime import check
 _ORDER=('Q1','Q2','Q3','Q4','H1','H2','FY','9M')
 _COMPONENTS={'H1':('Q1','Q2'),'H2':('Q3','Q4'),'FY':('Q1','Q2','Q3','Q4'),'9M':('Q1','Q2','Q3')}
 
+DEFAULT_HISTORY_START_YEAR=2018
+
+
+def requested_history_years(latest_completed_year, *, years=None, historical_years=None,
+                            start_year=None, as_of=None, fiscal_calendar=None):
+    """Select fiscal labels using an evidenced latest annual, never today's year."""
+    if type(latest_completed_year) is not int or not 1 <= latest_completed_year <= 9998:
+        raise ValueError('The latest completed fiscal year must be an integer')
+    if sum(value is not None for value in (years,historical_years,start_year))>1:
+        raise ValueError('Choose explicit years, a history-year count, or a start year')
+    if years is not None:
+        if not isinstance(years,list) or not years or any(type(year) is not int or not 1<=year<=9998 for year in years):
+            raise ValueError('Historical years must be a nonempty list of fiscal years')
+        selected=sorted(set(years))
+    elif historical_years is not None:
+        if type(historical_years) is not int or not 1<=historical_years<=30:
+            raise ValueError('History years must be an integer from 1 to 30')
+        selected=list(range(latest_completed_year-historical_years+1,latest_completed_year+1))
+    else:
+        start_year=DEFAULT_HISTORY_START_YEAR if start_year is None else start_year
+        if type(start_year) is not int or not 1<=start_year<=9998:
+            raise ValueError('History start year must be an integer fiscal year')
+        selected=list(range(start_year,latest_completed_year+1))
+    if not selected or selected[0]<1:
+        raise ValueError('History start year is later than the latest evidenced completed fiscal year')
+    if selected[-1]>latest_completed_year:
+        raise ValueError('Requested completed history includes an incomplete fiscal year')
+    if as_of is not None and fiscal_calendar is not None:
+        latest=next(period for period in build_periods([latest_completed_year],fiscal_calendar) if period['kind']=='FY')
+        if _date(latest['end'])>_date(as_of):
+            raise ValueError('Latest completed fiscal year ends after the information date')
+    return selected
+
+
 def _date(value):
     return value.date() if isinstance(value,datetime) else value if isinstance(value,date) else date.fromisoformat(str(value))
 

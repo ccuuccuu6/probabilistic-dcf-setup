@@ -1,13 +1,15 @@
 """Durable cumulative construction costs, including unresolved request reserves.
 
-Each company retains its own allowance across source folders, models and code
-versions. A shared ownership index prevents charging a paid request twice. Every
+Each terminal build owns an allowance shared by all of its stages and explicit
+continuations. A shared ownership index prevents charging a paid request twice. Every
 POST has one durable reservation; an actual charge replaces that reservation.
+An explicit authorized reset opens a new allowance period without deleting costs.
 """
 from __future__ import annotations
 
 import copy
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from decimal import Decimal
 import errno
@@ -18,10 +20,94 @@ import os
 from pathlib import Path
 import re
 from time import monotonic, sleep
+from threading import get_ident
 import unicodedata
 from uuid import uuid4
 
 from company_initiation.shared_ai import AIError, OpenAIProvider, aggregate_usage, response_usage
+
+_BUILD_SCOPE = ContextVar('company_construction_build_scope', default=None)
+
+
+def current_build_scope(outputs=None, company=None):
+    scope = _BUILD_SCOPE.get()
+    if scope is None:return None
+    if scope.get('owner_thread')!=get_ident():return None
+    if outputs is not None and Path(outputs).resolve()!=scope['outputs']:return None
+    if company is not None and company_key(company)!=scope['company_key']:return None
+    return scope
+
+
+def command_owns_company_lock(outputs, key):
+    scope=current_build_scope(outputs)
+    return bool(scope and scope['company_key']==key and scope.get('lock_owned'))
+
+
+def record_in_build_scope(record):
+    """Only selected-build work may supply implicit within-build continuations."""
+    scope=current_build_scope()
+    if scope is None:return True
+    config=record.get('configuration',{});budget=record.get('budget',{})
+    identity=config.get('budget_session_id') or budget.get('allowance_period_id') or budget.get('lineage_id')
+    return company_key(config.get('company','unknown'))==scope['company_key'] and identity==scope.get('period_id')
+
+
+def build_record_paths(outputs, pattern):
+    """Avoid searching unrelated saved runs in a fresh or selected command."""
+    scope=current_build_scope(outputs)
+    if scope is None:return Path(outputs).glob(pattern)
+    return [path/'record.json' for path in scope['directories']
+            if (path/'record.json').is_file() and (path/'record.json').match(pattern)]
+
+
+def register_build_directory(directory):
+    scope=current_build_scope()
+    if scope is not None:
+        path=Path(directory).resolve()
+        if path.parent!=scope['outputs']:raise ValueError('Build directory is outside its output root')
+        if path not in scope['directories']:scope['directories'].append(path)
+
+
+@contextmanager
+def construction_command_budget(outputs, company, limit, *, previous=None):
+    """A new command opens a budget; explicit continuation selects its old one.
+
+    One OS company lock covers all stages. Nested stage locks in this context
+    share ownership; other processes/threads cannot reset or branch this build.
+    No provider call is made and no previous charge or reservation is deleted.
+    """
+    from .historic_construction.initiation import _initiation_lock
+    outputs=Path(outputs).resolve()
+    if not (previous is not None and limit is None) and (type(limit) not in (int,float) or not math.isfinite(limit) or not 0<limit<=20):
+        raise ValueError('Run budget must be greater than zero and at most $20')
+    with _initiation_lock(outputs,scope=company_key(company)):
+        scope=dict(outputs=outputs,company_key=company_key(company),lock_owned=True,
+                   fresh=previous is None,period_id=None,owner_thread=get_ident(),
+                   directories=[Path(previous['directory']).resolve()] if previous else [])
+        token=_BUILD_SCOPE.set(scope)
+        try:
+            path=ledger_path(outputs,company)
+            old_limit=(json.loads(path.read_text(encoding='utf-8'))['limit_usd'] if path.exists()
+                       else (previous or {}).get('budget',{}).get('limit_usd',limit))
+            if old_limit is None:raise AIError('Saved run has no verifiable budget limit')
+            ledger=BudgetLedger(path,company,old_limit)
+            if previous is None:
+                summary=_open_allowance(ledger,'New terminal construction run: independent budget authorized by the default-run policy',limit)
+                scope['period_id']=summary['allowance_period_id']
+            else:
+                ledger.import_record(previous)
+                saved=previous.get('budget',{})
+                scope['period_id']=(previous.get('configuration',{}).get('budget_session_id')
+                    or saved.get('allowance_period_id') or saved.get('lineage_id'))
+                if not scope['period_id']:raise AIError('Saved run has no verifiable budget identity; explicit continuation cannot open a new budget')
+                with ledger._transaction() as state:
+                    summary=BudgetLedger._totals(state,scope['period_id'])
+                if limit is not None and float(limit)!=summary['limit_usd']:
+                    raise ValueError('Resume must keep the original run budget limit')
+            scope['limit_usd']=summary['limit_usd']
+            yield summary
+        finally:
+            _BUILD_SCOPE.reset(token)
 
 
 def _hash(value):
@@ -44,6 +130,50 @@ def ledger_path(outputs, company):
     outputs=Path(outputs)
     migrate_company_budgets(outputs)
     return outputs / ("construction_company_budget_"+company_key(company)+".json")
+
+
+def reset_company_allowance(outputs, company, *, reason, limit=20.):
+    """Open an explicitly authorized allowance period, retaining all prior costs.
+
+    This administrative operation is never called by construction or resume.
+    Existing run locks prevent resetting a company while a build is active.
+    """
+    from company_initiation.historic_construction.initiation import _initiation_lock
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError('An explicit authorization reason is required to reset an allowance')
+    if isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit) or not 0 < limit <= 20:
+        raise ValueError('New company allowance must be greater than zero and at most $20')
+    outputs = Path(outputs)
+    with _initiation_lock(outputs), _initiation_lock(outputs, scope=company_key(company)):
+        path = ledger_path(outputs, company)
+        # Opening the existing limit avoids an unrelated authorized_limit event.
+        previous_limit = json.loads(path.read_text(encoding='utf-8'))['limit_usd'] if path.exists() else limit
+        ledger = BudgetLedger(path, company, previous_limit)
+        return _open_allowance(ledger,reason,limit)
+
+
+def _open_allowance(ledger, reason, limit):
+    """Retire the default period while keeping it available for explicit resume."""
+    with ledger._transaction() as state:
+        now = ledger._now()
+        previous = state.get('allowance_period') or dict(id=state['lineage_id'], started_at=None,
+            reason='Original cumulative allowance before the first explicit reset')
+        for request in state['requests'].values():
+            request.setdefault('allowance_period_id', ledger._request_period(state, request))
+        old_totals = ledger._totals(state)
+        closed = dict(previous, closed_at=now, limit_usd=state['limit_usd'],
+            request_ids=sorted(cid for cid, request in state['requests'].items()
+                               if request['allowance_period_id'] == previous['id']),
+            totals_at_close={k: v for k, v in old_totals.items()
+                             if k not in ('lifetime', 'allowance_period_id', 'allowance_started_at', 'closed_allowance_periods')})
+        state.setdefault('closed_allowance_periods', []).append(closed)
+        state['allowance_period'] = dict(id=uuid4().hex, started_at=now, reason=reason.strip())
+        state['limit_usd'] = float(limit)
+        state['events'].append(dict(action='authorized_allowance_reset', time=now, reason=reason.strip(),
+            previous_period_id=previous['id'], allowance_period_id=state['allowance_period']['id'],
+            previous_totals=copy.deepcopy(closed['totals_at_close']), limit_usd=float(limit),
+            policy='New spending allowance only; previous charges and unresolved reservations remain in lifetime accounting.'))
+        return ledger._totals(state)
 
 
 def _write_atomic(path, state):
@@ -114,6 +244,8 @@ def _merge_request(requests, request):
                 old['reservation_usd']=request['reservation_usd'];old['allowance']=copy.deepcopy(request['allowance'])
             return
     requests[key]=copy.deepcopy(request)
+    if old and 'allowance_period_id' in old:
+        requests[key]['allowance_period_id'] = old['allowance_period_id']
 
 
 def _register_state(index, path, state):
@@ -292,11 +424,16 @@ class BudgetLedger:
     """
     def __init__(self, path, company, limit=20.):
         self.path, self.company, self.limit = Path(path), company, float(limit)
+        scope=current_build_scope(self.path.parent,company)
+        self.period_id=scope.get('period_id') if scope else None
         if not 0 < self.limit <= 20 or not math.isfinite(self.limit):
             raise ValueError("Cumulative company budget must be greater than zero and at most $20")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._transaction() as state:
-            if state["limit_usd"] != self.limit:
+            if self.period_id and self.period_id!=(state.get('allowance_period') or {}).get('id'):
+                selected=self._totals(state,self.period_id)
+                if selected['limit_usd']!=self.limit:raise ValueError('Resume must keep the original run budget limit')
+            elif state["limit_usd"] != self.limit:
                 state["events"].append(dict(action="authorized_limit", previous=state["limit_usd"],
                                            limit_usd=self.limit, time=self._now()))
                 state["limit_usd"] = self.limit
@@ -331,28 +468,76 @@ class BudgetLedger:
             _write_atomic(_registry_path(self.path.parent),index)
 
     @staticmethod
-    def _totals(state):
+    def _request_period(state, request):
+        """Retain original ownership, including late imports of pre-reset calls."""
+        active = state.get('allowance_period')
+        if active is None:
+            return state['lineage_id']
+        saved = request.get('allowance_period_id')
+        if saved is not None:
+            valid = {active['id']} | {period['id'] for period in state.get('closed_allowance_periods', [])}
+            if saved not in valid:
+                raise AIError('Request references an unknown allowance period')
+            return saved
+        # A previously unseen saved call may be found on a later resume. Its
+        # original dispatch timestamp, not its import time, determines ownership.
+        try:
+            started = datetime.fromisoformat(request['reserved_at'])
+            if started.tzinfo is None:
+                raise ValueError('Missing timezone')
+        except (KeyError, TypeError, ValueError):
+            raise AIError('Cannot assign an imported request to an allowance period without its original dispatch timestamp') from None
+        for period in state.get('closed_allowance_periods', []):
+            if started <= datetime.fromisoformat(period['closed_at']):
+                return period['id']
+        return active['id']
+
+    @staticmethod
+    def _request_totals(requests, *, limit=None):
         settled, reserved, confirmed = Decimal(0), Decimal(0), Decimal(0)
         unresolved = []
-        for key, request in state["requests"].items():
+        for key, request in requests.items():
             if request["status"] == "settled":
                 settled += _money(request["actual_cost_usd"])
                 if request.get('charge_status')=='confirmed':confirmed+=_money(request['actual_cost_usd'])
             else:
                 reserved += _money(request["reservation_usd"])
                 unresolved.append(key)
-        return dict(lineage_id=state["lineage_id"], limit_usd=state["limit_usd"],
-            known_cost_usd=float(settled), unresolved_reservations_usd=float(reserved),
+        result = dict(known_cost_usd=float(settled), unresolved_reservations_usd=float(reserved),
             confirmed_charges_usd=float(confirmed),incurred_estimates_usd=float(settled-confirmed),
             committed_usd=float(settled + reserved),
-            remaining_usd=float(Decimal(str(state["limit_usd"])) - settled - reserved),
-            settled_requests=len(state["requests"]) - len(unresolved),
-            unresolved_requests=unresolved, total_requests=len(state["requests"]),
+            settled_requests=len(requests) - len(unresolved),
+            unresolved_requests=unresolved, total_requests=len(requests),
             actual_cost_complete=not unresolved)
+        if limit is not None:
+            result['remaining_usd'] = float(Decimal(str(limit)) - settled - reserved)
+        return result
+
+    @staticmethod
+    def _totals(state, period_id=None):
+        requests = state['requests']
+        active = state.get('allowance_period')
+        selected=active;limit=state['limit_usd']
+        if period_id is not None and (not active or period_id!=active['id']):
+            if active is None and period_id==state['lineage_id']:selected=None
+            else:
+                selected=next((item for item in state.get('closed_allowance_periods',[]) if item['id']==period_id),None)
+                if selected is None:raise AIError('Saved run references an unknown budget period')
+                limit=selected['limit_usd']
+        if active:
+            requests = {cid: request for cid, request in requests.items()
+                         if BudgetLedger._request_period(state, request) == selected['id']}
+        totals = BudgetLedger._request_totals(requests, limit=limit)
+        totals.update(lineage_id=state['lineage_id'], limit_usd=limit)
+        if selected:
+            totals.update(allowance_period_id=selected['id'], allowance_started_at=selected['started_at'],
+                closed_allowance_periods=len(state.get('closed_allowance_periods', [])),
+                lifetime=BudgetLedger._request_totals(state['requests']))
+        return totals
 
     def summary(self):
         with self._transaction() as state:
-            return self._totals(state)
+            return self._totals(state,self.period_id)
 
     @staticmethod
     def _call_id(entry):
@@ -363,7 +548,7 @@ class BudgetLedger:
 
     @staticmethod
     def _saved_request(entry, run, company):
-        return dict(call_id=entry["call_id"], stage=entry.get("stage"), model=entry.get("model"),
+        result=dict(call_id=entry["call_id"], stage=entry.get("stage"), model=entry.get("model"),
             company=company, company_key=company_key(company),
             signature=entry.get("signature"), source_run=str(run) if run else None,
             client_request_id=entry.get("client_request_id") or
@@ -371,6 +556,8 @@ class BudgetLedger:
             provider_response_id=(entry.get("response") or {}).get("id"),
             reserved_at=entry.get("started_at"), allowance=copy.deepcopy(entry["allowance"]),
             reservation_usd=float(_money(entry["allowance"].get("estimated_cost_usd"))), status="reserved")
+        if entry.get('allowance_period_id'):result['allowance_period_id']=entry['allowance_period_id']
+        return result
 
     def reserve(self, entry, run=None):
         key = self._call_id(entry)
@@ -380,8 +567,10 @@ class BudgetLedger:
         with self._transaction() as state:
             if key in _registry(self.path.parent)['requests']:
                 raise AIError("Request ID already reserved; do not dispatch a second potentially billable attempt")
-            if _money(request["reservation_usd"]) > Decimal(str(self._totals(state)["remaining_usd"])):
+            if _money(request["reservation_usd"]) > Decimal(str(self._totals(state,self.period_id)["remaining_usd"])):
                 raise AIError("Next request plus known charges and unresolved reservations exceeds cumulative budget")
+            if state.get('allowance_period'):
+                request['allowance_period_id'] = self.period_id or state['allowance_period']['id']
             state["requests"][key] = request
             state["events"].append(dict(action="reserve", call_id=key, amount=request["reservation_usd"], time=self._now()))
         return request
@@ -465,6 +654,8 @@ class BudgetLedger:
                 key = entry["call_id"]
                 if key not in state["requests"]:
                     state["requests"][key] = self._saved_request(entry, record.get("directory"), source_company)
+                    if state.get('allowance_period'):
+                        state['requests'][key]['allowance_period_id'] = self._request_period(state, state['requests'][key])
                 elif state["requests"][key].get("signature") != entry.get("signature"):
                     raise AIError("Migrated request ID has conflicting identity")
                 self._settle(state, key, entry.get("usage", {}), entry.get("response"), self._now())
@@ -472,13 +663,13 @@ class BudgetLedger:
             if run and run not in state["imported_runs"]:
                 state["imported_runs"].append(run)
                 state["events"].append(dict(action="import_run", run=run, calls=len(prepared), time=self._now()))
-            return self._totals(state)
+            return self._totals(state,self.period_id)
 
     def recover(self, provider):
         """GET known Response IDs only; never recreates a lost POST."""
         with self._transaction() as state:
             candidates = [(key, copy.deepcopy(value)) for key, value in state["requests"].items()
-                          if value["status"] != "settled"]
+                          if value["status"] != "settled" and (not self.period_id or self._request_period(state,value)==self.period_id)]
         results = []
         for key, request in candidates:
             response_id = request.get("provider_response_id")

@@ -2,7 +2,9 @@
 .env
 .env.*
 local_store/
+data_store/
 outputs/
+forecasting_engine/company_initiation/logs/
 __pycache__/
 *.py[cod]
 *.egg-info/

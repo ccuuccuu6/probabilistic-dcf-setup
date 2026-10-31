@@ -11,6 +11,27 @@ from pathlib import Path
 from uuid import uuid4
 
 
+def save_dcf_output(directory, workbook, inspection, checks):
+    """Preserve the final valuation workbook under its explicit stage filename."""
+    import shutil
+    from company_initiation.shared_runtime import write_json
+    directory, workbook = Path(directory), Path(workbook)
+    target = directory / 'dcf_model.xlsx'
+    shutil.copyfile(workbook, target)
+    write_json(directory / 'dcf_workbook_validation.json', inspection)
+    files = [target.name, 'dcf_workbook_validation.json']
+    audit = workbook.with_suffix('.audit.json')
+    if audit.is_file():
+        copied = target.with_suffix('.audit.json')
+        shutil.copyfile(audit, copied)
+        files.append(copied.name)
+    return dict(workbook=target.name, validation='dcf_workbook_validation.json', files=files,
+        status='incomplete_model' if any(c.get('status') in ('FAIL','MISSING') for c in checks)
+        or inspection.get('valuation_status') == 'incomplete' else 'provisional',
+        scope='History, operating forecasts and DCF',
+        recalculation=inspection.get('recalculation', {'status':'not_run'}))
+
+
 def valuation_snapshot(spec, values, data, *, valuation_date=None, inputs_file=None, previous_inputs=None):
     """Calculate the shared valuation and retain failures as explicit artifacts.
 
@@ -380,7 +401,7 @@ def ensure_valuation_research(root, company, archive, inputs_file, *, budget_usd
     remap company history, edit the input file or require a prepared company map.
     """
     from company_initiation.shared_ai import OpenAIProvider
-    from company_initiation.shared_budget import BudgetLedger, ledger_path, company_key
+    from company_initiation.shared_budget import BudgetLedger, ledger_path, company_key, build_record_paths, record_in_build_scope
     from company_initiation.shared_runtime import RunJournal, digest
     from ..historic_construction.evidence import SourceStore, inventory_local_sources
     from ..historic_construction.initiation import _initiation_lock
@@ -406,9 +427,9 @@ def ensure_valuation_research(root, company, archive, inputs_file, *, budget_usd
         if parent:ledger.import_record(parent)
         previous=parent
         candidates=[]
-        for path in outputs.glob('construct_valuation_research_*/record.json'):
+        for path in build_record_paths(outputs,'construct_valuation_research_*/record.json'):
             saved=json.loads(path.read_text(encoding='utf-8'));config=saved.get('configuration',{})
-            if company_key(config.get('company','unknown'))==company_key(company) and config.get('valuation_input_hash')==identity:
+            if record_in_build_scope(saved) and company_key(config.get('company','unknown'))==company_key(company) and config.get('valuation_input_hash')==identity:
                 candidates.append(saved)
         if candidates:
             previous=verified_integrated_record(max(candidates,key=lambda item:Path(item['directory']).stat().st_mtime_ns)['directory'],outputs)

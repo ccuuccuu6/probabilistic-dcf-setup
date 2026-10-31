@@ -103,3 +103,17 @@ def code_snapshot():
     """Shared immutable source snapshot using the same keys as the fingerprint."""
     from .shared_runtime import code_source_paths
     return {name: path.read_text(encoding='utf-8') for name, path in code_source_paths().items()}
+
+
+def register_stage_output(journal, stage, output):
+    """Durably register an exported checkpoint without granting model acceptance."""
+    directory = Path(journal.directory).resolve()
+    for name in output['files']:
+        path = (directory / name).resolve()
+        if not path.is_relative_to(directory) or not path.is_file():
+            raise ValueError('Stage output is missing or outside its run: ' + name)
+        journal.state['artifacts'][name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    journal.state.setdefault('stage_outputs', {})[stage] = copy.deepcopy(output)
+    journal.save()
+    if getattr(journal, 'progress', None):
+        journal.progress(f"{stage.capitalize()} stage export: {output.get('status')}; workbook: {directory / output['workbook']}")

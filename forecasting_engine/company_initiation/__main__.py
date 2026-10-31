@@ -1,15 +1,96 @@
 """Run with python -m company_initiation from the project directory."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
+import json
+from pathlib import Path
 import platform
+import re
 import shutil
 import sys
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from time import monotonic
+import traceback
+from uuid import uuid4
 
-from company_initiation.shared_project import find_project_root
+from company_initiation.shared_project import find_project_root, resolve_data_path
+
+
+class _AuditStream:
+    """Keep terminal behaviour while immediately persisting timestamped output."""
+
+    def __init__(self, console, log, channel, lock):
+        self.console, self.log, self.channel, self.lock = console, log, channel, lock
+        self.line_start = True
+
+    def __getattr__(self, name):
+        return getattr(self.console, name)
+
+    def write(self, text):
+        length = len(text)
+        self.console.write(text)
+        # Interactive waiting ticks bypass this stream; retain their final result.
+        text = text.replace("\r", "")
+        with self.lock:
+            for part in text.splitlines(keepends=True):
+                if self.line_start:
+                    stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+                    self.log.write(f"[{stamp}] [{self.channel}] ")
+                self.log.write(part)
+                self.line_start = part.endswith("\n")
+            self.log.flush()
+        return length
+
+    def flush(self):
+        self.console.flush()
+        with self.lock:
+            self.log.flush()
+
+
+def _logged_construct(arguments):
+    """Start a durable local audit before dispatching any construction work."""
+    try:
+        directory = find_project_root() / "forecasting_engine" / "company_initiation" / "logs"
+        directory.mkdir(parents=True, exist_ok=True)
+        company = re.sub(r"[^a-z0-9]+", "-", arguments.company.casefold()).strip("-")[:80] or "company"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        path = directory / f"{stamp}_{company}_{uuid4().hex}.log"
+        log = path.open("x", encoding="utf-8")
+    except (OSError, ValueError) as error:
+        print(f"ERROR: Cannot create construction audit log; construction has not started: {error}", file=sys.stderr)
+        return 1
+    started = monotonic()
+    lock = Lock()
+    with log, redirect_stdout(_AuditStream(sys.stdout, log, "stdout", lock)), redirect_stderr(_AuditStream(sys.stderr, log, "stderr", lock)):
+        print(f"Construction audit log: {path}", flush=True)
+        print(f"Session started (UTC): {datetime.now(timezone.utc).isoformat()}", flush=True)
+        # Only public construction options are recorded; never inspect environment settings.
+        option_names = ("command", "company", "sources", "as_of", "valuation_date", "valuation_assumptions",
+                        "historical_vintage", "model_inputs", "resume", "fx_source", "fx_database",
+                        "reference_workbook", "years", "history_years", "start_year", "forecast_years", "budget_usd",
+                        "fresh", "recalculate", "escalation_evidence")
+        options = {name: getattr(arguments, name) for name in option_names if hasattr(arguments, name)}
+        print("Invocation: " + json.dumps(options, ensure_ascii=False, sort_keys=True), flush=True)
+        exit_code = 1
+        try:
+            exit_code = _run(arguments)
+            return exit_code
+        except KeyboardInterrupt:
+            exit_code = 130
+            print("Interrupted. Saved run records and this audit log are preserved.", file=sys.stderr, flush=True)
+            return exit_code
+        except BaseException as error:
+            if isinstance(error, SystemExit):
+                exit_code = error.code if isinstance(error.code, int) else (0 if error.code is None else 1)
+            print("Unexpected construction exception:", file=sys.stderr, flush=True)
+            traceback.print_exc()
+            raise
+        finally:
+            outcome = "completed" if exit_code == 0 else "interrupted" if exit_code == 130 else "failed"
+            print(f"Session ended (UTC): {datetime.now(timezone.utc).isoformat()}; "
+                  f"status={outcome}; exit_code={exit_code}; elapsed_seconds={monotonic() - started:.3f}", flush=True)
 
 
 class TerminalProgress:
@@ -30,8 +111,9 @@ class TerminalProgress:
         def render():
             elapsed = max(0, int(monotonic() - started))
             minutes, seconds = divmod(elapsed, 60)
-            self.stream.write(f"\r{label}: waiting {minutes:02d}:{seconds:02d}")
-            self.stream.flush()
+            console = self.stream.console if isinstance(self.stream, _AuditStream) else self.stream
+            console.write(f"\r{label}: waiting {minutes:02d}:{seconds:02d}")
+            console.flush()
 
         def tick():
             while not stopped.wait(1):
@@ -95,23 +177,28 @@ def main() -> int:
     update.add_argument("run", help="Saved run directory or its name in outputs")
     update.add_argument("--as-of", help="Information date, YYYY-MM-DD; defaults to today")
     construct = commands.add_parser("construct", help="Construct history, company drivers and executable temporary forecasts from local originals")
-    construct.add_argument("company")
-    construct.add_argument("--as-of", help="Model information date, YYYY-MM-DD; defaults to today's date and is saved")
+    construct_history = commands.add_parser("construct-history",
+        help="Run construction through the historical Excel only; no forecast or DCF handoff")
+    for construction_parser in (construct,construct_history):
+        construction_parser.add_argument("company")
+        construction_parser.add_argument("--as-of", help="Model information date, YYYY-MM-DD; defaults to today's date and is saved")
+        construction_parser.add_argument("--historical-vintage", action="store_true", help="Require every source to have verified publication by the as-of date")
+        construction_parser.add_argument("--sources", required=True)
+        construction_parser.add_argument("--model-inputs", help="Explicit saved sourced company research specification")
+        continuation=construction_parser.add_mutually_exclusive_group()
+        continuation.add_argument("--resume",metavar="RUN",help="Continue this saved run using its remaining budget; no automatic resume")
+        continuation.add_argument("--fresh",action="store_true",help="Start a new run and budget (the default)")
+        history=construction_parser.add_mutually_exclusive_group()
+        history.add_argument("--years",nargs="+",type=int)
+        history.add_argument("--history-years",type=int,help="Override with a rolling count of completed fiscal years")
+        history.add_argument("--start-year",type=int,help="First fiscal year, inclusive (default: 2018)")
+        construction_parser.add_argument("--budget-usd",type=float,help="New-run allowance, maximum $20 (default: $20); resume keeps its original cap")
     construct.add_argument("--valuation-date", help="DCF date, YYYY-MM-DD; defaults to the model information date")
     construct.add_argument("--valuation-assumptions", help="Optional typed valuation-v1 overrides; normal construction generates its inputs")
-    construct.add_argument("--historical-vintage", action="store_true", help="Require every source to have verified publication by the as-of date")
-    construct.add_argument("--sources", required=True)
-    construct.add_argument("--model-inputs", help="Saved sourced company research specification for the integrated segment/three-statement workflow")
-    construct.add_argument("--resume", metavar="RUN", help="Explicit verified ancestor for integrated construction recovery; all newer charges remain in the cumulative ledger")
     construct.add_argument("--fx-source", help="Local shared FX workbook; source dates and actual/estimate status are preserved")
     construct.add_argument("--fx-database", help="Shared FX database snapshot, consumed without broker downloads")
     construct.add_argument("--reference-workbook", help="Local analyst workbook used as architecture/presentation reference; never a company numeric input")
-    construction_history = construct.add_mutually_exclusive_group()
-    construction_history.add_argument("--years", nargs="+", type=int)
-    construction_history.add_argument("--history-years", type=int, default=10)
     construct.add_argument("--forecast-years", type=int, default=5)
-    construct.add_argument("--budget-usd", type=float, default=20.)
-    construct.add_argument("--fresh", action="store_true")
     construct.add_argument("--recalculate", action="store_true", help="Use hidden Microsoft Excel if available, compare formula outputs with Python")
     construct.add_argument("--escalation-evidence", help="Stage-specific evidence supporting an explicitly configured non-Luna model")
     api_check = commands.add_parser("api-check", help="Make one small paid API call and show reported token usage")
@@ -122,17 +209,89 @@ def main() -> int:
     history = initiate.add_mutually_exclusive_group()
     history.add_argument("--years", nargs="+", type=int,
                          help="Explicit fiscal years, including reported quarters, halves and YTD")
-    history.add_argument("--history-years", type=int, default=10,
-                         help="Latest fully reported fiscal years evidenced in the archive (default: 10)")
+    history.add_argument("--history-years", type=int,
+                         help="Override with a rolling count of fully reported fiscal years evidenced in the archive")
+    history.add_argument("--start-year", type=int, help="First fiscal year, inclusive (default: 2018)")
     initiate.add_argument("--forecast-years", type=int, default=5, help="Number of empty forecast columns (default: 5)")
-    initiate.add_argument("--budget-usd", type=float, default=20.0,
+    initiate.add_argument("--budget-usd", type=float,
                           help="Stop at this cumulative estimated USD cost (default and maximum: 20); last request can overshoot")
     continuation = initiate.add_mutually_exclusive_group()
-    continuation.add_argument("--resume", metavar="RUN", help="Resume a specific latest matching run directory; default: automatic")
-    continuation.add_argument("--fresh", action="store_true", help="Explicitly start new research instead of reusing saved progress")
+    continuation.add_argument("--resume", metavar="RUN", help="Continue this saved run and its existing budget")
+    continuation.add_argument("--fresh", action="store_true", help="Start new research and budget (the default)")
     arguments = parser.parse_args()
+    if arguments.command in {"construct", "construct-history", "initiate"}:
+        arguments._history_defaulted=all(getattr(arguments,key) is None for key in ("years","history_years","start_year"))
+        if arguments._history_defaulted:
+            from company_initiation.historic_construction.periods import DEFAULT_HISTORY_START_YEAR
+            arguments.start_year=DEFAULT_HISTORY_START_YEAR
+        arguments._budget_defaulted=arguments.budget_usd is None
+        if arguments._budget_defaulted:arguments.budget_usd=20.
+        if arguments.fresh and getattr(arguments,'model_inputs',None):parser.error('--fresh and --model-inputs cannot be combined')
+        arguments.fresh=not bool(arguments.resume or getattr(arguments,'model_inputs',None))
+    return _logged_construct(arguments) if arguments.command in {"construct", "construct-history"} else _run(arguments)
+
+
+def _run(arguments) -> int:
+    """One explicit build/budget scope surrounds every construction stage."""
+    try:
+        root=find_project_root()
+        if arguments.command=='initiate':
+            if arguments.resume:
+                selected=Path(arguments.resume)
+                if not selected.is_absolute() and not selected.exists():selected=root/'outputs'/selected
+                if selected.name=='record.json':selected=selected.parent
+                from .shared_project import read_json
+                saved=read_json(selected/'record.json')['request']
+                arguments.resume=str(selected.resolve())
+                if getattr(arguments,'_history_defaulted',False):
+                    arguments.years=saved.get('years');arguments.history_years=saved.get('historical_years');arguments.start_year=saved.get('start_year')
+                if getattr(arguments,'_budget_defaulted',False):arguments.budget_usd=saved['max_cost_usd']
+            return _dispatch(arguments)
+        if arguments.command not in {'construct','construct-history','update','export','refresh-fx'}:
+            return _dispatch(arguments)
+        from .shared_artifacts import verified_integrated_record
+        from .shared_budget import construction_command_budget
+        selected=getattr(arguments,'resume',None) if arguments.command in {'construct','construct-history'} else arguments.run
+        if not selected and getattr(arguments,'model_inputs',None):
+            candidate=Path(arguments.model_inputs).resolve().parent
+            if (candidate/'record.json').is_file():selected=candidate
+        previous=None
+        if selected:
+            path=Path(selected)
+            if not path.is_absolute() and not path.exists():path=root/'outputs'/path
+            if path.name=='record.json':path=path.parent
+            previous=verified_integrated_record(path,root/'outputs')
+            company=previous['configuration']['company']
+            if arguments.command in {'construct','construct-history'}:
+                from .shared_budget import company_key
+                if company_key(company)!=company_key(arguments.company):raise ValueError('Resume company differs from requested company')
+                if getattr(arguments,'resume',None):arguments.resume=str(path.resolve())
+                saved_inputs=path/'company_model_inputs.json'
+                saved_data=json.loads(saved_inputs.read_text(encoding='utf-8')) if saved_inputs.is_file() else {}
+                if getattr(arguments,'as_of',None) is None:
+                    arguments.as_of=previous['configuration'].get('as_of') or saved_data.get('model_configuration',{}).get('as_of')
+                if getattr(arguments,'_history_defaulted',False):
+                    cfg=previous['configuration']
+                    arguments.years=cfg.get('years');arguments.history_years=cfg.get('historical_years');arguments.start_year=cfg.get('start_year')
+                    if not any(value is not None for value in (arguments.years,arguments.history_years,arguments.start_year)):
+                        arguments.years=saved_data.get('history_years')
+            limit=None if getattr(arguments,'_budget_defaulted',True) else arguments.budget_usd
+        else:
+            company=arguments.company;limit=arguments.budget_usd
+        with construction_command_budget(root/'outputs',company,limit,previous=previous) as budget:
+            arguments.budget_usd=budget['limit_usd']
+            print(('New run budget: ' if previous is None else 'Continuing run budget: ')+json.dumps(budget),flush=True)
+            return _dispatch(arguments)
+    except (ValueError,OSError,KeyError,TypeError,RuntimeError) as error:
+        print(f'ERROR: {error}',file=sys.stderr)
+        return 1
+
+
+def _dispatch(arguments) -> int:
     try:
         root = find_project_root()
+        if getattr(arguments, 'sources', None):
+            arguments.sources = str(resolve_data_path(root, arguments.sources))
         if arguments.command == "doctor":
             if sys.version_info < (3, 11):
                 raise ValueError("Python 3.11 or newer is required")
@@ -206,10 +365,10 @@ def main() -> int:
                 if not parent.is_absolute() and not parent.exists():parent=root/"outputs"/parent
                 config=read_json(parent/"record.json")["configuration"]
                 as_of=arguments.as_of or date.today().isoformat()
-                inputs=update_company_inputs(root,parent,as_of=as_of,progress=TerminalProgress())
-                directory=construct_integrated(root,config['company'],config['sources'],inputs,
+                inputs=update_company_inputs(root,parent,as_of=as_of,progress=TerminalProgress(),online=True)
+                directory=construct_integrated(root,config['company'],resolve_data_path(root,config['sources']),inputs,
                     fx_database=root/defaults['fx-database'] if defaults.get('fx-database') else None,as_of=as_of,
-                    forecast_years=config.get('forecast_years',5),include_valuation=True,progress=TerminalProgress())
+                    forecast_years=config.get('forecast_years',5),budget_usd=arguments.budget_usd,include_valuation=True,progress=TerminalProgress())
             else:
                 directory = offline_export(root, arguments.run, fx_file=fx,
                     fx_database=root/fx_database if fx_database else None,
@@ -218,17 +377,27 @@ def main() -> int:
             print(f"Workbook: {directory / 'model.xlsx'}")
             from company_initiation.shared_project import read_json
             return 0 if read_json(directory / "record.json")["status"] == "complete_provisional" else 1
-        elif arguments.command == "construct":
+        elif arguments.command in {"construct", "construct-history"}:
             from company_initiation.shared_project import read_json
             from company_initiation.shared_ai import format_usage, format_stage_usage
             from pathlib import Path
-            print("Constructing a provisional model from company originals. Python reads source numbers; unknown inputs remain missing.", flush=True)
+            history_only=arguments.command=='construct-history'
+            print("Constructing "+('historical data only' if history_only else 'a provisional model')+
+                  ". Python reads source numbers; unknown inputs remain missing.", flush=True)
             if arguments.model_inputs:
-                from company_initiation.forecast_construction.integrated import construct_integrated
                 from company_initiation.historic_construction.workflow import ensure_company_history_research
-                from company_initiation.dcf_construction.workflow import construct_valuation
+                from company_initiation.historic_construction.periods import requested_history_years
+                supplied=read_json(Path(arguments.model_inputs))
+                requested=requested_history_years(max(supplied['history_years']),years=arguments.years,
+                    historical_years=arguments.history_years,start_year=arguments.start_year)
+                if requested!=supplied['history_years']:
+                    raise ValueError('Saved --model-inputs has a different history scope; omit --model-inputs to research the requested scope, or explicitly select its years')
                 inputs=ensure_company_history_research(root,arguments.company,arguments.sources,arguments.model_inputs,
                     budget_usd=arguments.budget_usd,as_of=arguments.as_of,progress=TerminalProgress())
+                if history_only:
+                    return _historical_result(root,arguments,inputs)
+                from company_initiation.forecast_construction.integrated import construct_integrated
+                from company_initiation.dcf_construction.workflow import construct_valuation
                 directory = construct_integrated(root, arguments.company, arguments.sources, inputs,
                     reference_workbook=arguments.reference_workbook, budget_usd=arguments.budget_usd,
                     forecast_years=arguments.forecast_years, recalculate=arguments.recalculate, progress=TerminalProgress(),
@@ -239,35 +408,33 @@ def main() -> int:
                     valuation_stage=construct_valuation)
             else:
                 from company_initiation.historic_construction.workflow import research_company_inputs, ensure_company_history_research
-                from company_initiation.dcf_construction.workflow import construct_valuation
-                from company_initiation.forecast_construction.integrated import construct_integrated
                 from datetime import date
                 import tomllib
                 from pathlib import Path
                 from company_initiation.historic_construction.evidence import inventory_local_sources, source_inventory_fingerprint, saved_source_inventory_compatibility
                 from company_initiation.historic_construction.workflow import update_company_inputs
-                from company_initiation.shared_budget import company_key
+                from company_initiation.shared_budget import company_key, build_record_paths, record_in_build_scope
                 defaults=tomllib.loads((root/'pyproject.toml').read_text(encoding='utf-8')).get('tool',{}).get('research-platform',{})
                 as_of=arguments.as_of or date.today().isoformat()
                 matching=[]
-                for record_path in (root/'outputs').glob('construct_*/record.json'):
+                for record_path in build_record_paths(root/'outputs','construct_*/record.json'):
                     saved=read_json(record_path)
-                    if company_key(saved.get('configuration',{}).get('company','unknown'))==company_key(arguments.company):matching.append(saved)
+                    if record_in_build_scope(saved) and company_key(saved.get('configuration',{}).get('company','unknown'))==company_key(arguments.company):matching.append(saved)
                 latest=max(matching,key=lambda r:Path(r['directory']).stat().st_mtime_ns) if matching and not arguments.fresh else None
                 if arguments.resume:
                     if arguments.fresh:raise ValueError('--fresh and --resume cannot be combined')
-                    from company_initiation.forecast_construction.integrated import verified_integrated_record
+                    from company_initiation.shared_artifacts import verified_integrated_record
                     selected=Path(arguments.resume)
                     if not selected.is_absolute():selected=root/'outputs'/selected
                     latest=verified_integrated_record(selected,root/'outputs')
                     if company_key(latest['configuration']['company'])!=company_key(arguments.company):
                         raise ValueError('Resume company differs from requested company')
-                    if Path(latest['configuration']['sources']).resolve()!=Path(arguments.sources).resolve():
-                        raise ValueError('Resume source archive differs; use an explicit fresh research run under the same company budget')
+                    if resolve_data_path(root,latest['configuration']['sources'])!=Path(arguments.sources).resolve():
+                        raise ValueError('Resume source archive differs; omit --resume to start a new run with a new budget')
                 inputs=Path(latest['directory'])/'company_model_inputs.json' if latest else None
                 archive_compatibility=None
                 if inputs is not None and inputs.exists():
-                    from company_initiation.forecast_construction.integrated import verified_integrated_record
+                    from company_initiation.shared_artifacts import verified_integrated_record
                     latest=verified_integrated_record(latest['directory'],root/'outputs')
                     saved_data=read_json(inputs)
                     same_date=saved_data.get('model_configuration',{}).get('as_of')==as_of
@@ -279,17 +446,37 @@ def main() -> int:
                     if not same_archive:
                         archive_compatibility=saved_source_inventory_compatibility(latest,current_inventory,root/'outputs')
                         same_archive=archive_compatibility['compatible']
-                    requested=sorted(set(arguments.years)) if arguments.years else None
-                    if requested and requested!=saved_data['history_years']:
-                        raise ValueError('Requested years differ from saved research; use --fresh for a different history scope')
-                    if not same_date or not same_archive:
+                    from company_initiation.historic_construction.periods import requested_history_years
+                    latest_scope_year=max(max(saved_data['history_years']),max(arguments.years or [0]),arguments.start_year or 0)
+                    requested=requested_history_years(latest_scope_year,years=arguments.years,
+                        historical_years=arguments.history_years,start_year=arguments.start_year)
+                    from company_initiation.historic_construction.workflow import VA_SOURCE_POLICY,VA_MAPPING_CONTRACT
+                    va_supplied=any(s.get('category')=='visible_alpha' for s in current_inventory['sources'])
+                    old_source_policy=(va_supplied and (
+                        saved_data.get('model_configuration',{}).get('historical_source_policy')!=VA_SOURCE_POLICY or
+                        saved_data.get('model_configuration',{}).get('va_mapping_contract')!=VA_MAPPING_CONTRACT))
+                    if old_source_policy:
+                        if arguments.resume:raise ValueError('Explicit resume uses the earlier historical source policy; omit --resume to start a new run using company-reported VA')
+                        print('Using company-reported VA as primary history; retaining prior evidence and spending records.',flush=True)
+                        inputs=None
+                        archive_compatibility=None
+                    elif requested!=saved_data['history_years']:
+                        if arguments.resume:raise ValueError('Explicit resume has a different history scope; omit --resume to start a new run with the requested scope')
+                        print('History scope changed; researching the requested fiscal years while retaining prior evidence and spending records.',flush=True)
+                        inputs=None
+                        archive_compatibility=None
+                    elif not same_date or not same_archive:
                         inputs=update_company_inputs(root,latest['directory'],as_of=as_of,progress=TerminalProgress())
-                else:
+                if inputs is None or not inputs.exists():
                     inputs=research_company_inputs(root,arguments.company,arguments.sources,as_of=as_of,
-                        historical_years=arguments.history_years,years=arguments.years,budget_usd=arguments.budget_usd,
-                        historical_vintage=arguments.historical_vintage,fresh=arguments.fresh,progress=TerminalProgress())
+                        historical_years=arguments.history_years,years=arguments.years,start_year=arguments.start_year,budget_usd=arguments.budget_usd,
+                        historical_vintage=arguments.historical_vintage,fresh=arguments.fresh,resume=arguments.resume,progress=TerminalProgress())
                 inputs=ensure_company_history_research(root,arguments.company,arguments.sources,inputs,
                     budget_usd=arguments.budget_usd,as_of=as_of,archive_compatibility=archive_compatibility,progress=TerminalProgress())
+                if history_only:
+                    return _historical_result(root,arguments,inputs)
+                from company_initiation.forecast_construction.integrated import construct_integrated
+                from company_initiation.dcf_construction.workflow import construct_valuation
                 fx=arguments.fx_source
                 if fx and arguments.fx_database:raise ValueError('Choose the shared FX database or the legacy workbook adapter, not both')
                 fx_database=arguments.fx_database or (None if fx else defaults.get('fx-database'))
@@ -307,6 +494,9 @@ def main() -> int:
                 print("Cumulative budget:", record["budget"])
             for issue in record["issues"]:
                 print("Unresolved: " + issue)
+            for stage in ('historical','forecast','dcf'):
+                output=record.get('stage_outputs',{}).get(stage)
+                if output:print(f"{stage.capitalize()} workbook: {directory / output['workbook']}")
             if (directory / "model.xlsx").exists():
                 print(f"Open {directory / 'model.xlsx'}; inspect Model's validation summary and editable Assumptions. Detailed checks and source records are in the adjacent audit files.")
                 print(record.get("summary", {}))
@@ -317,7 +507,7 @@ def main() -> int:
             print("Reading local annual and reported interim sources; no browser search. Forecast columns remain empty.", flush=True)
             print(f"Estimated cost stop: ${arguments.budget_usd:.2f}, with a conservative allowance checked before each request. Actual billing is known afterward.", flush=True)
             directory = initiate_company(root, arguments.company, years=arguments.years,
-                                         historical_years=arguments.history_years, source_directory=arguments.sources,
+                                         historical_years=arguments.history_years, start_year=arguments.start_year, source_directory=arguments.sources,
                                          forecast_years=arguments.forecast_years, max_cost_usd=arguments.budget_usd,
                                          progress=TerminalProgress(), resume=arguments.resume, fresh=arguments.fresh)
             record = read_json(directory / "record.json")
@@ -334,7 +524,7 @@ def main() -> int:
             print(f"Open: {directory / 'model.xlsx'}")
             print("Read 'Start here', 'Checks' and 'AI reviews'. Accepted means these checks passed, not an audit or error-free guarantee.")
     except KeyboardInterrupt:
-        print("Interrupted. Saved initiation progress is preserved; repeat the same command to resume. "
+        print("Interrupted. Saved progress is preserved; use --resume RUN to continue its existing budget. "
               "A request interrupted in flight may have an unknown charge and block further spending.", file=sys.stderr)
         return 130
     except (ValueError, OSError, KeyError, TypeError, RuntimeError) as error:
@@ -343,6 +533,23 @@ def main() -> int:
             print(note, file=sys.stderr)
         return 1
     return 0
+
+
+def _historical_result(root, arguments, inputs):
+    """Finish stage one without importing or dispatching either later stage."""
+    from .historic_construction.workflow import complete_historical_model
+    from .shared_project import read_json
+    from .shared_ai import format_usage,format_stage_usage
+    directory=complete_historical_model(root,arguments.company,arguments.sources,inputs,
+        budget_usd=arguments.budget_usd,progress=TerminalProgress())
+    record=read_json(directory/'record.json')
+    print(f"Status: {record['status']}; outputs: {directory}")
+    print(f"Historical workbook: {directory / 'historical_model.xlsx'}")
+    print(format_usage(record['usage']));print(format_stage_usage(record['usage']))
+    print('Run budget:',record['budget'])
+    for issue in record['issues']:print('Unresolved: '+issue)
+    print('Stopped after historical construction. No forecast or DCF construction was started.')
+    return 0 if record['status']=='historical_complete_provisional' else 1
 
 
 if __name__ == "__main__":
